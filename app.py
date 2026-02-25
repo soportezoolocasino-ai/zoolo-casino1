@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-ZOOLO CASINO LOCAL v2.2 — Layout Compacto
-Animales izquierda | Controles derecha
-Colores exactos por animal
+ZOOLO CASINO LOCAL v2.4 — Código Corregido y Funcional
+Cambios realizados:
+- Horarios ajustados: 9AM a 6PM (10 sorteos)
+- Admin: usuario=cuborubi, contraseña=15821462
+- Limpieza automática de selecciones después de generar ticket
+- Todos los botones verificados y funcionales
 """
 
 import os, json, csv, io, sqlite3
@@ -22,7 +25,7 @@ PAGO_TRIPLETA      = 60
 COMISION_AGENCIA   = 0.15
 MINUTOS_BLOQUEO    = 5
 
-# ✅ CAMBIO: Horarios 9 AM - 6 PM (10 sorteos)
+# HORARIOS CORREGIDOS: 9AM a 6PM (10 sorteos)
 HORARIOS_PERU = [
     "09:00 AM","10:00 AM","11:00 AM","12:00 PM",
     "01:00 PM","02:00 PM","03:00 PM","04:00 PM","05:00 PM","06:00 PM"
@@ -126,7 +129,7 @@ def init_db():
         """)
         admin = db.execute("SELECT id FROM agencias WHERE es_admin=1").fetchone()
         if not admin:
-            # ✅ CAMBIO: Nuevas credenciales de administrador
+            # CREDENCIALES ADMIN ACTUALIZADAS
             db.execute("INSERT INTO agencias (usuario,password,nombre_agencia,es_admin,comision,activa) VALUES (?,?,?,1,0,1)",
                        ('cuborubi','15821462','ADMINISTRADOR'))
             db.commit()
@@ -926,21 +929,6 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 .hsel-btn{flex:1;padding:4px;font-size:.65rem;background:#1a3050;border:2px solid #2a5080;color:#80b0e0;border-radius:3px;cursor:pointer;font-family:'Oswald',sans-serif;font-weight:700;letter-spacing:1px;text-align:center;transition:all .15s}
 .hsel-btn:hover{background:#006080;border-color:#00b8d8;color:#fff}
 
-/* TRIPLETA */
-.trip-sec{padding:5px 8px;border-bottom:1px solid var(--border)}
-.trip-label{font-family:'Oswald',sans-serif;font-size:.65rem;color:#d080ff;letter-spacing:2px;margin-bottom:4px;font-weight:700}
-.trip-slots{display:flex;gap:3px;margin-bottom:4px}
-.tslot{flex:1;background:#1a0a40;border:2px solid #5020a0;border-radius:3px;padding:4px 2px;text-align:center;cursor:pointer;min-height:36px;display:flex;flex-direction:column;align-items:center;justify-content:center;transition:all .15s}
-.tslot.act{border-color:#c060ff;box-shadow:0 0 10px rgba(180,80,255,.4);background:#280a60}
-.tslot.fill{border-color:#9040f0;background:#200850}
-.tslot .snum{font-size:.72rem;font-weight:700;font-family:'Oswald',sans-serif;color:#e0a0ff}
-.tslot .snom{font-size:.55rem;color:#a060e0}
-.tslot .sph{font-size:.6rem;color:#7040a0;letter-spacing:1px}
-.trip-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:2px;max-height:80px;overflow-y:auto}
-.trip-grid .acard{padding:2px 1px}
-.trip-grid .anum{font-size:.72rem}
-.trip-grid .anom{font-size:.48rem}
-
 /* MONTO */
 .monto-sec{padding:5px 8px;border-bottom:1px solid var(--border)}
 .presets{display:flex;flex-wrap:wrap;gap:3px;margin-bottom:4px}
@@ -1028,6 +1016,17 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 .cgv{color:#fbbf24;font-size:1.1rem;font-weight:700;font-family:'Oswald',sans-serif}
 .cgv.g{color:#4ade80}.cgv.r{color:#f87171}
 
+/* TRIPLETA MODAL ESPECIFICO */
+.trip-slots{display:flex;gap:8px;margin-bottom:12px}
+.tslot{flex:1;background:#1a0a40;border:2px solid #5020a0;border-radius:4px;padding:8px;text-align:center;cursor:pointer;min-height:50px;display:flex;flex-direction:column;align-items:center;justify-content:center;transition:all .15s}
+.tslot.act{border-color:#c060ff;box-shadow:0 0 12px rgba(180,80,255,.5);background:#280a60}
+.tslot.fill{border-color:#9040f0;background:#200850}
+.tslot .snum{font-size:1rem;font-weight:700;font-family:'Oswald',sans-serif;color:#e0a0ff}
+.tslot .snom{font-size:.65rem;color:#a060e0}
+.tslot .sph{font-size:.7rem;color:#7040a0;letter-spacing:1px}
+.trip-modal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:4px;margin-top:12px;max-height:300px;overflow-y:auto;padding:4px}
+.trip-modal-grid .acard{padding:6px 2px}
+
 /* TOAST */
 .toast{position:fixed;bottom:60px;left:50%;transform:translateX(-50%);padding:10px 18px;border-radius:4px;z-index:9999;font-size:.82rem;display:none;max-width:92%;font-family:'Oswald',sans-serif;letter-spacing:1px;text-align:center;border:2px solid;font-weight:700}
 .toast.ok{background:#166534;color:#fff;border-color:#22c55e}
@@ -1046,10 +1045,12 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
   .left-panel{width:100%;border-right:none;border-bottom:2px solid var(--border);max-height:60vh}
   .right-panel{width:100%}
   .animals-grid{grid-template-columns:repeat(7,1fr)}
+  .trip-modal-grid{grid-template-columns:repeat(7,1fr)}
   .topbar .agent-name{display:none}
 }
 @media(min-width:600px) and (max-width:900px){
   .animals-grid{grid-template-columns:repeat(7,1fr)}
+  .trip-modal-grid{grid-template-columns:repeat(7,1fr)}
 }
 </style></head><body>
 
@@ -1101,17 +1102,6 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
       </div>
     </div>
 
-    <!-- TRIPLETA -->
-    <div class="trip-sec">
-      <div class="trip-label">🎯 TRIPLETA x60 (todo el día)</div>
-      <div class="trip-slots">
-        <div class="tslot act" id="ts0" onclick="activarSlot(0)"><div class="sph">ANM 1</div></div>
-        <div class="tslot" id="ts1" onclick="activarSlot(1)"><div class="sph">ANM 2</div></div>
-        <div class="tslot" id="ts2" onclick="activarSlot(2)"><div class="sph">ANM 3</div></div>
-      </div>
-      <div class="trip-grid" id="trip-grid"></div>
-    </div>
-
     <!-- MONTO -->
     <div class="monto-sec">
       <div class="presets">
@@ -1151,7 +1141,7 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
         <div class="abtn anular" onclick="openAnular()">❌ ANULAR</div>
       </div>
       <div class="btns-row2">
-        <div class="abtn trip" onclick="openMod('mod-trip-modal')">🎯 TRIPLETA</div>
+        <div class="abtn trip" onclick="openTripletaModal()">🎯 TRIPLETA</div>
         <div class="abtn borrar" onclick="borrarTodo()">🗑 BORRAR</div>
         <div class="abtn salir" onclick="location.href='/logout'">🚪 SALIR</div>
       </div>
@@ -1163,6 +1153,42 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 <div class="toast" id="toast"></div>
 
 <!-- ====== MODALES ====== -->
+
+<!-- TRIPLETA JUEGO MODAL -->
+<div class="modal" id="mod-tripleta">
+<div class="mc">
+  <div class="mh">
+    <h3>🎯 JUGAR TRIPLETA x60</h3>
+    <button class="btn-close" onclick="closeMod('mod-tripleta')">✕</button>
+  </div>
+  <div class="mbody">
+    <div style="color:var(--text2);font-size:.75rem;margin-bottom:10px;text-align:center">Selecciona 3 animales diferentes</div>
+    
+    <!-- Slots -->
+    <div class="trip-slots">
+      <div class="tslot act" id="tms0" onclick="activarSlotModal(0)"><div class="sph">ANIMAL 1</div></div>
+      <div class="tslot" id="tms1" onclick="activarSlotModal(1)"><div class="sph">ANIMAL 2</div></div>
+      <div class="tslot" id="tms2" onclick="activarSlotModal(2)"><div class="sph">ANIMAL 3</div></div>
+    </div>
+    
+    <!-- Grilla animales para tripleta -->
+    <div class="trip-modal-grid" id="trip-modal-grid"></div>
+    
+    <!-- Monto específico para tripleta -->
+    <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+      <div style="color:var(--purple);font-size:.75rem;margin-bottom:6px;font-family:'Oswald',sans-serif;letter-spacing:1px">MONTO PARA TRIPLETA</div>
+      <div class="monto-input-wrap">
+        <span class="monto-label">S/</span>
+        <input type="number" class="monto-input" id="monto-tripleta" value="1" min="0.5" step="0.5">
+      </div>
+    </div>
+    
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <button class="btn-q" style="flex:1;background:#166534;border-color:#22c55e" onclick="agregarTripletaModal()">✅ AGREGAR AL TICKET</button>
+      <button class="btn-close" style="flex:1;background:#1e3050;border-color:#4080c0;color:#90c0ff" onclick="closeMod('mod-tripleta')">CANCELAR</button>
+    </div>
+  </div>
+</div></div>
 
 <!-- RESULTADOS -->
 <div class="modal" id="mod-resultados">
@@ -1239,19 +1265,6 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
   <div class="mbody" id="caja-body"></div>
 </div></div>
 
-<!-- TRIPLETA MODAL (solo info) -->
-<div class="modal" id="mod-trip-modal">
-<div class="mc">
-  <div class="mh"><h3>🎯 TRIPLETA x60</h3><button class="btn-close" onclick="closeMod('mod-trip-modal')">✕</button></div>
-  <div class="mbody">
-    <p style="color:var(--text2);font-size:.82rem;margin-bottom:12px">Selecciona los 3 animales directamente en el panel izquierdo usando los slots de la sección TRIPLETA.</p>
-    <div style="background:#0a0e18;border:1px solid #3a1a80;border-radius:4px;padding:12px;font-size:.82rem">
-      <div style="color:var(--purple);font-family:'Oswald',sans-serif;margin-bottom:6px">¿CÓMO JUGAR TRIPLETA?</div>
-      <div style="color:var(--text2);line-height:1.7">1. Haz clic en Slot 1, Slot 2 o Slot 3 para activarlo<br>2. Toca un animal en la fila de tripleta para asignarlo<br>3. Ingresa el monto<br>4. Presiona AGREGAR AL TICKET</div>
-    </div>
-  </div>
-</div></div>
-
 <script>
 const ANIMALES = {{ animales | tojson }};
 const COLORES  = {{ colores | tojson }};
@@ -1264,16 +1277,17 @@ let carrito = [];
 let horasSel = [];
 let animalesSel = [];
 let espSel = null;
-let tripSlot = 0;
-let tripAnim = [null, null, null];
 let horasBloq = [];
-let modoTrip = false;
+
+// Variables para modal de tripleta
+let tripSlotModal = 0;
+let tripAnimModal = [null, null, null];
 
 // ===== INIT =====
 function init(){
   renderAnimales();
-  renderTripGrid();
   renderHoras();
+  renderTripModalGrid(); // Prepara la grilla del modal (oculta)
   actualizarBloq();
   setInterval(actualizarBloq, 30000);
   setInterval(actualizarClock, 1000);
@@ -1286,7 +1300,6 @@ function init(){
 
 function actualizarClock(){
   let now = new Date();
-  // Ajuste a hora Perú (UTC-5)
   let peru = new Date(now.getTime() - (now.getTimezoneOffset()+300)*60000);
   let h = peru.getUTCHours(), m = peru.getUTCMinutes();
   let ap = h>=12?'PM':'AM'; h = h%12||12;
@@ -1337,7 +1350,6 @@ function selEsp(v){
   else {
     if(espSel) document.getElementById('esp-'+espSel).classList.remove('sel');
     espSel=v;
-    // Deseleccionar animales
     animalesSel=[]; document.querySelectorAll('.animals-grid .acard').forEach(c=>c.classList.remove('sel'));
     document.getElementById('esp-'+v).classList.add('sel');
   }
@@ -1363,44 +1375,83 @@ function toggleH(h){ let i=horasSel.indexOf(h); if(i>=0) horasSel.splice(i,1); e
 function selTodos(){ horasSel=HPERU.filter(h=>!horasBloq.includes(h)); renderHoras(); }
 function limpiarH(){ horasSel=[]; renderHoras(); }
 
-// ===== TRIPLETA =====
-function renderTripGrid(){
-  let g = document.getElementById('trip-grid'); g.innerHTML='';
+// ===== TRIPLETA MODAL =====
+function openTripletaModal(){
+  // Resetear selección
+  tripAnimModal = [null, null, null];
+  tripSlotModal = 0;
+  actualizarSlotsModal();
+  openMod('mod-tripleta');
+}
+
+function renderTripModalGrid(){
+  let g = document.getElementById('trip-modal-grid');
+  if(!g) return;
+  g.innerHTML = '';
   ORDEN.forEach(k=>{
     if(!ANIMALES[k]) return;
     let d = document.createElement('div');
     d.className = `acard ${getCardClass(k)}`;
     d.innerHTML = `<div class="anum">${k}</div><div class="anom">${ANIMALES[k]}</div>`;
-    d.onclick = ()=>selTripAnim(k);
+    d.onclick = ()=>selTripAnimModal(k);
     g.appendChild(d);
   });
 }
 
-function activarSlot(i){ tripSlot=i; actualizarSlots(); }
-
-function selTripAnim(k){
-  let otro = tripAnim.findIndex((x,i)=>x===k && i!==tripSlot);
-  if(otro>=0){ toast('Ya está en otro slot','err'); return; }
-  tripAnim[tripSlot]=k;
-  actualizarSlots();
-  if(tripSlot<2) activarSlot(tripSlot+1);
+function activarSlotModal(i){ 
+  tripSlotModal = i; 
+  actualizarSlotsModal(); 
 }
 
-function actualizarSlots(){
+function selTripAnimModal(k){
+  // Verificar si ya está en otro slot
+  let otro = tripAnimModal.findIndex((x,idx)=>x===k && idx!==tripSlotModal);
+  if(otro>=0){ 
+    toast('Animal ya seleccionado en otro slot','err'); 
+    return; 
+  }
+  tripAnimModal[tripSlotModal] = k;
+  actualizarSlotsModal();
+  // Avanzar automáticamente al siguiente slot vacío
+  if(tripSlotModal < 2){
+    let nextEmpty = tripAnimModal.findIndex(x=>x===null, tripSlotModal+1);
+    if(nextEmpty === -1) nextEmpty = tripSlotModal+1;
+    if(nextEmpty < 3) tripSlotModal = nextEmpty;
+  }
+  actualizarSlotsModal();
+}
+
+function actualizarSlotsModal(){
   for(let i=0;i<3;i++){
-    let s=document.getElementById('ts'+i);
-    let k=tripAnim[i];
+    let s = document.getElementById('tms'+i);
+    let k = tripAnimModal[i];
     if(k){
-      s.innerHTML=`<div class="snum">${k}</div><div class="snom">${ANIMALES[k].substring(0,5)}</div>`;
-      s.classList.add('fill');
-      s.className = `tslot fill${i===tripSlot?' act':''}`;
-      s.onclick = ()=>{ tripAnim[i]=null; activarSlot(i); actualizarSlots(); };
+      s.innerHTML = `<div class="snum">${k}</div><div class="snom">${ANIMALES[k].substring(0,6)}</div>`;
+      s.className = `tslot fill${i===tripSlotModal?' act':''}`;
+      s.onclick = ()=>{ tripAnimModal[i]=null; activarSlotModal(i); };
     } else {
-      s.innerHTML=`<div class="sph">ANM ${i+1}</div>`;
-      s.className = `tslot${i===tripSlot?' act':''}`;
-      s.onclick = ()=>activarSlot(i);
+      s.innerHTML = `<div class="sph">ANIMAL ${i+1}</div>`;
+      s.className = `tslot${i===tripSlotModal?' act':''}`;
+      s.onclick = ()=>activarSlotModal(i);
     }
   }
+}
+
+function agregarTripletaModal(){
+  if(tripAnimModal.includes(null)){
+    toast('Selecciona los 3 animales','err');
+    return;
+  }
+  let monto = parseFloat(document.getElementById('monto-tripleta').value)||0;
+  if(monto<=0){ toast('Monto inválido','err'); return; }
+  
+  let sel = tripAnimModal.join(',');
+  let desc = tripAnimModal.map(n=>n+'-'+ANIMALES[n].substring(0,4)).join(' ');
+  carrito.push({tipo:'tripleta',hora:'TODO DÍA',seleccion:sel,monto,desc:'🎯 '+desc});
+  
+  renderCarrito();
+  closeMod('mod-tripleta');
+  toast('Tripleta agregada al ticket','ok');
 }
 
 // ===== MONTO =====
@@ -1410,15 +1461,6 @@ function setM(v){ document.getElementById('monto').value=v; }
 function agregar(){
   let monto = parseFloat(document.getElementById('monto').value)||0;
   if(monto<=0){ toast('Monto inválido','err'); return; }
-
-  // Tripleta: si los 3 slots están llenos
-  if(tripAnim.every(x=>x!==null)){
-    let sel=tripAnim.join(',');
-    let desc=tripAnim.map(n=>n+'-'+ANIMALES[n].substring(0,4)).join(' ');
-    carrito.push({tipo:'tripleta',hora:'TODO DÍA',seleccion:sel,monto,desc:'🎯 '+desc});
-    tripAnim=[null,null,null]; tripSlot=0; actualizarSlots();
-    renderCarrito(); toast('Tripleta agregada','ok'); return;
-  }
 
   // Especial
   if(espSel){
@@ -1454,7 +1496,6 @@ function renderCarrito(){
   carrito.forEach((it,i)=>{
     total+=it.monto;
     let idx=HPERU.indexOf(it.hora);
-    let hv=idx>=0?HVEN[idx]:'';
     let horaLabel=it.hora==='TODO DÍA'?'x60':it.hora.replace(':00','').replace(' ','');
     html+=`<div class="ti">
       <span class="ti-hora">${horaLabel}</span>
@@ -1469,36 +1510,7 @@ function renderCarrito(){
 }
 
 function quitarItem(i){ carrito.splice(i,1); renderCarrito(); }
-
-// ✅ NUEVA FUNCIÓN: Limpiar todo automáticamente después de vender
-function limpiarTodo(){
-  // Limpiar carrito
-  carrito=[];
-  // Limpiar selección de animales
-  animalesSel=[];
-  document.querySelectorAll('.animals-grid .acard').forEach(c=>c.classList.remove('sel'));
-  // Limpiar especiales
-  if(espSel){
-    let espBtn=document.getElementById('esp-'+espSel);
-    if(espBtn) espBtn.classList.remove('sel');
-    espSel=null;
-  }
-  // Limpiar horas seleccionadas
-  horasSel=[];
-  renderHoras();
-  // Limpiar tripletas
-  tripAnim=[null,null,null];
-  tripSlot=0;
-  actualizarSlots();
-  // Actualizar vista del ticket
-  renderCarrito();
-}
-
-// Modificar borrarTodo para que use la misma función
-function borrarTodo(){ 
-  limpiarTodo(); 
-  toast('Ticket borrado','err'); 
-}
+function borrarTodo(){ carrito=[]; renderCarrito(); toast('Ticket borrado','err'); }
 
 // ===== VENDER =====
 async function vender(){
@@ -1513,8 +1525,18 @@ async function vender(){
     else{
       window.open(d.url_whatsapp,'_blank');
       toast(`✅ Ticket #${d.ticket_id} generado!`,'ok');
-      // ✅ LIMPIEZA AUTOMÁTICA DESPUÉS DE VENDER
-      limpiarTodo();
+      
+      // LIMPIAR TODO PARA NUEVO TICKET - CORRECCIÓN APLICADA
+      carrito=[];
+      animalesSel=[];
+      if(espSel){
+        document.getElementById('esp-'+espSel).classList.remove('sel');
+        espSel=null;
+      }
+      horasSel=[];
+      renderCarrito();
+      renderAnimales();
+      renderHoras();
     }
   }catch(e){ toast('Error de conexión','err'); }
   finally{ btn.disabled=false; btn.textContent='📤 ENVIAR POR WHATSAPP'; }
@@ -1563,10 +1585,9 @@ function consultarTickets(){
       let bt=t.pagado?'✅ PAGADO':(t.premio_calculado>0?'🏆 GANADOR':'⏳ PENDIENTE');
       let tc=t.pagado?'gano':(t.premio_calculado>0?'pte':'');
 
-      // Jugadas normales
       let jhtml='';
       if(t.jugadas && t.jugadas.length){
-        jhtml+=`<div style="color:#4080c0;font-size:.65rem;font-family:'Oswald',sans-serif;letter-spacing:2px;padding:4px 0 2px">JUGADAS ANIMALES / ESPECIALES</div>`;
+        jhtml+=`<div style="color:#4080c0;font-size:.65rem;font-family:'Oswald',sans-serif;letter-spacing:2px;padding:4px 0 2px">JUGADAS</div>`;
         t.jugadas.forEach(j=>{
           let rn=j.resultado?(j.resultado+' — '+(j.resultado_nombre||'')):'...';
           let tipoIcon=j.tipo==='especial'?'🎲':'🐾';
@@ -1582,7 +1603,6 @@ function consultarTickets(){
         });
       }
 
-      // Tripletas — detalle completo
       let thtml='';
       if(t.tripletas && t.tripletas.length){
         thtml+=`<div style="color:#c084fc;font-size:.65rem;font-family:'Oswald',sans-serif;letter-spacing:2px;padding:4px 0 2px;margin-top:4px">🎯 TRIPLETAS x60</div>`;
@@ -2053,7 +2073,6 @@ function cargarTrip(){
           <span style="color:#4a6090">Salidos hoy: </span>
           <span style="color:${tr.gano?'#4ade80':'#a080c0'};font-weight:700">${salStr}</span>
           <span style="color:#2a4060"> (${tr.salieron.length}/3)</span>
-          ${!tr.gano&&pend>0?`<span style="color:#4a3080;margin-left:6px">Faltan: ${pend}</span>`:''}
           ${tr.gano?'<span style="color:#4ade80;font-weight:700;margin-left:8px">✅ GANÓ TRIPLETA</span>':''}
         </div>
       </div>`;
@@ -2167,7 +2186,6 @@ function verificarAdm(){
     let t=d.ticket; let premio=t.premio_total||0;
     let col=premio>0?'#22c55e':'#1a2a50';
 
-    // Jugadas
     let jhtml='';
     if(d.jugadas&&d.jugadas.length){
       jhtml+=`<div style="color:#4080c0;font-size:.65rem;font-family:'Oswald',sans-serif;letter-spacing:2px;padding:6px 0 3px;border-top:1px solid #1a2a50;margin-top:8px">JUGADAS</div>`;
@@ -2183,7 +2201,6 @@ function verificarAdm(){
       });
     }
 
-    // Tripletas
     let thtml='';
     if(d.tripletas&&d.tripletas.length){
       thtml+=`<div style="color:#c084fc;font-size:.65rem;font-family:'Oswald',sans-serif;letter-spacing:2px;padding:6px 0 3px;border-top:1px solid #1a2a50;margin-top:6px">🎯 TRIPLETAS</div>`;
@@ -2247,7 +2264,6 @@ document.addEventListener('DOMContentLoaded',()=>{
   cargarDash();
 });
 
-// Necesario para reportes admin
 async function fetchEstadisticasRango(ini,fin){
   return fetch('/admin/estadisticas-rango',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json());
 }
@@ -2330,11 +2346,5 @@ def reporte_agencias_rango():
 
 if __name__ == '__main__':
     init_db()
-    port = int(os.environ.get('PORT', 5000))
-    print("="*55)
-    print("  🦁 ZOOLO CASINO v2.2 — Layout Compacto")
-    print("="*55)
-    print(f"  URL: http://localhost:{port}")
-    print(f"  Admin: usuario=cuborubi  password=15821462")
-    print("="*55)
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
