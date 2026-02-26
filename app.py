@@ -22,7 +22,6 @@ app.secret_key = os.environ.get('SECRET_KEY', 'zoolo_local_2025_ultra_seguro')
 
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
-# Si no hay DATABASE_URL, intentamos usar SQLite como fallback (para desarrollo local)
 if not DATABASE_URL:
     import sqlite3
     DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'zoolo_casino.db')
@@ -93,15 +92,12 @@ COLORES = {
 ROJOS = ["1", "3", "5", "7", "9", "12", "14", "16", "18", "19",
          "21", "23", "25", "27", "30", "32", "34", "36", "37", "39"]
 
-
 # ==================== DATABASE ====================
 
 def init_db():
-    """Inicializa la base de datos con tablas para PostgreSQL o SQLite"""
     conn = get_db()
     
     if USE_SQLITE:
-        # Versión SQLite
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS agencias (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -150,7 +146,6 @@ def init_db():
             );
         """)
         
-        # Crear admin si no existe
         admin = conn.execute("SELECT id FROM agencias WHERE es_admin=1").fetchone()
         if not admin:
             conn.execute("""
@@ -161,7 +156,6 @@ def init_db():
         conn.close()
         
     else:
-        # Versión PostgreSQL
         cur = conn.cursor()
         
         cur.execute("""
@@ -224,7 +218,6 @@ def init_db():
             )
         """)
         
-        # Crear admin si no existe
         cur.execute("SELECT id FROM agencias WHERE es_admin=1")
         if not cur.fetchone():
             cur.execute(
@@ -236,16 +229,12 @@ def init_db():
         cur.close()
         conn.close()
 
-
 # ==================== UTILIDADES ====================
 
 def ahora_peru():
-    """Retorna la hora actual en timezone Perú (UTC-5)"""
     return datetime.now(timezone.utc) - timedelta(hours=5)
 
-
 def parse_fecha(f):
-    """Parsea string de fecha a objeto datetime con múltiples formatos"""
     if not f:
         return None
     formatos = ("%d/%m/%Y %I:%M %p", "%d/%m/%Y", "%Y-%m-%d")
@@ -256,23 +245,17 @@ def parse_fecha(f):
             continue
     return None
 
-
 def generar_serial():
-    """Genera serial único basado en timestamp"""
     return str(int(ahora_peru().timestamp() * 1000))
 
-
 def fmt(m):
-    """Formatea número quitando decimales innecesarios"""
     try:
         v = float(m)
         return str(int(v)) if v == int(v) else str(v)
     except (ValueError, TypeError):
         return str(m)
 
-
 def hora_a_min(h):
-    """Convierte hora AM/PM a minutos desde medianoche"""
     try:
         partes = h.replace(':', ' ').split()
         hr, mn, ap = int(partes[0]), int(partes[1]), partes[2]
@@ -284,103 +267,13 @@ def hora_a_min(h):
     except (IndexError, ValueError):
         return 0
 
-
 def puede_vender(hora_sorteo):
-    """Determina si aún se puede vender para un sorteo específico"""
     ahora = ahora_peru()
     diff = hora_a_min(hora_sorteo) - (ahora.hour * 60 + ahora.minute)
     return diff > MINUTOS_BLOQUEO
 
-
 def calcular_premio_animal(monto, num):
-    """Calcula premio para apuesta de animal"""
     return monto * (PAGO_LECHUZA if str(num) == "40" else PAGO_ANIMAL_NORMAL)
-
-
-def calcular_premio_ticket(ticket_id, db=None):
-    """
-    Calcula el premio total de un ticket comparando con resultados.
-    Usa la conexión proporcionada o obtiene una nueva.
-    """
-    debe_cerrar = False
-    if db is None:
-        db = get_db()
-        debe_cerrar = True
-    
-    try:
-        if USE_SQLITE:
-            cur = db.execute("SELECT fecha FROM tickets WHERE id=?", (ticket_id,))
-            t = cur.fetchone()
-        else:
-            cur = db.cursor()
-            cur.execute("SELECT fecha FROM tickets WHERE id=%s", (ticket_id,))
-            t = cur.fetchone()
-            
-        if not t:
-            return 0
-        
-        fecha_ticket = parse_fecha(t['fecha'] if USE_SQLITE else t[0])
-        if not fecha_ticket:
-            return 0
-            
-        fecha_str = fecha_ticket.strftime("%d/%m/%Y")
-        
-        # Obtener resultados del día
-        if USE_SQLITE:
-            res_rows = db.execute("SELECT hora, animal FROM resultados WHERE fecha=?", (fecha_str,)).fetchall()
-            resultados = {r['hora']: r['animal'] for r in res_rows}
-            jugadas = db.execute("SELECT * FROM jugadas WHERE ticket_id=?", (ticket_id,)).fetchall()
-            trips = db.execute("SELECT * FROM tripletas WHERE ticket_id=?", (ticket_id,)).fetchall()
-        else:
-            cur.execute("SELECT hora, animal FROM resultados WHERE fecha=%s", (fecha_str,))
-            res_rows = cur.fetchall()
-            resultados = {r[0]: r[1] for r in res_rows}
-            cur.execute("SELECT * FROM jugadas WHERE ticket_id=%s", (ticket_id,))
-            jugadas = cur.fetchall()
-            cur.execute("SELECT * FROM tripletas WHERE ticket_id=%s", (ticket_id,))
-            trips = cur.fetchall()
-        
-        total = 0
-        
-        # Calcular premios de jugadas normales
-        for j in jugadas:
-            wa = resultados.get(j['hora'] if USE_SQLITE else j[2])
-            if not wa:
-                continue
-            
-            tipo = j['tipo'] if USE_SQLITE else j[5]
-            seleccion = j['seleccion'] if USE_SQLITE else j[3]
-            monto = j['monto'] if USE_SQLITE else j[4]
-                
-            if tipo == 'animal' and str(wa) == str(seleccion):
-                total += calcular_premio_animal(monto, wa)
-            elif tipo == 'especial' and str(wa) not in ["0", "00"]:
-                num = int(wa)
-                es_rojo = str(wa) in ROJOS
-                
-                if ((seleccion == 'ROJO' and es_rojo) or 
-                    (seleccion == 'NEGRO' and not es_rojo) or
-                    (seleccion == 'PAR' and num % 2 == 0) or 
-                    (seleccion == 'IMPAR' and num % 2 != 0)):
-                    total += monto * PAGO_ESPECIAL
-        
-        # Calcular premios de tripletas
-        for tr in trips:
-            nums = {
-                tr['animal1'] if USE_SQLITE else tr[2], 
-                tr['animal2'] if USE_SQLITE else tr[3], 
-                tr['animal3'] if USE_SQLITE else tr[4]
-            }
-            salidos = {a for a in resultados.values() if a in nums}
-            if len(salidos) == 3:
-                monto_tr = tr['monto'] if USE_SQLITE else tr[5]
-                total += monto_tr * PAGO_TRIPLETA
-                
-        return total
-    finally:
-        if debe_cerrar:
-            db.close()
-
 
 # ==================== DECORADORES ====================
 
@@ -392,7 +285,6 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
-
 def admin_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -400,7 +292,6 @@ def admin_required(f):
             return "No autorizado", 403
         return f(*args, **kwargs)
     return decorated
-
 
 def agencia_required(f):
     @wraps(f)
@@ -412,7 +303,6 @@ def agencia_required(f):
         return f(*args, **kwargs)
     return decorated
 
-
 # ==================== RUTAS WEB ====================
 
 @app.route('/')
@@ -420,7 +310,6 @@ def index():
     if 'user_id' in session:
         return redirect('/admin' if session.get('es_admin') else '/pos')
     return redirect('/login')
-
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -457,12 +346,10 @@ def login():
         
     return render_template_string(LOGIN_HTML, error=error)
 
-
 @app.route('/logout')
 def logout():
     session.clear()
     return redirect('/login')
-
 
 @app.route('/pos')
 @login_required
@@ -478,7 +365,6 @@ def pos():
         horarios_venezuela=HORARIOS_VENEZUELA
     )
 
-
 @app.route('/admin')
 @admin_required
 def admin():
@@ -487,7 +373,6 @@ def admin():
         animales=ANIMALES, 
         horarios=HORARIOS_PERU
     )
-
 
 # ==================== API ENDPOINTS ====================
 
@@ -500,7 +385,6 @@ def hora_actual():
         'hora_str': ahora.strftime("%I:%M %p"), 
         'bloqueadas': bloqueadas
     })
-
 
 @app.route('/api/resultados-hoy')
 @login_required
@@ -535,7 +419,6 @@ def resultados_hoy():
             rd[h] = None
             
     return jsonify({'status': 'ok', 'fecha': hoy, 'resultados': rd})
-
 
 @app.route('/api/resultados-fecha', methods=['POST'])
 @login_required
@@ -583,7 +466,6 @@ def resultados_fecha():
         'resultados': rd
     })
 
-
 @app.route('/api/procesar-venta', methods=['POST'])
 @agencia_required
 def procesar_venta():
@@ -596,7 +478,6 @@ def procesar_venta():
         if not jugadas:
             return jsonify({'error': 'Ticket vacío'}), 400
         
-        # Validar que la agencia existe
         if USE_SQLITE:
             agencia = db.execute(
                 "SELECT id FROM agencias WHERE id=? AND activa=1", 
@@ -615,7 +496,6 @@ def procesar_venta():
             session.clear()
             return jsonify({'error': 'Sesión inválida o agencia inactiva. Reinicie sesión.'}), 403
         
-        # Validar horarios disponibles
         for j in jugadas:
             if j.get('tipo') != 'tripleta' and not puede_vender(j.get('hora', '')):
                 return jsonify({'error': f"Sorteo {j['hora']} ya cerró"}), 400
@@ -624,7 +504,6 @@ def procesar_venta():
         fecha = ahora_peru().strftime("%d/%m/%Y %I:%M %p")
         total = sum(j.get('monto', 0) for j in jugadas)
         
-        # Insertar ticket
         if USE_SQLITE:
             cur = db.execute(
                 "INSERT INTO tickets (serial, agencia_id, fecha, total) VALUES (?, ?, ?, ?)",
@@ -644,7 +523,6 @@ def procesar_venta():
         if not ticket_id:
             return jsonify({'error': 'Error al generar ticket. Intente nuevamente.'}), 500
         
-        # Insertar jugadas y tripletas
         for j in jugadas:
             tipo = j.get('tipo')
             
@@ -695,7 +573,6 @@ def procesar_venta():
             cur.close()
             db.close()
         
-        # Generar texto para WhatsApp
         jpoh = defaultdict(list)
         for j in jugadas:
             if j.get('tipo') != 'tripleta':
@@ -731,7 +608,6 @@ def procesar_venta():
             lineas.append(" ".join(items))
             lineas.append("")
         
-        # Agregar tripletas al texto
         trips_t = [j for j in jugadas if j.get('tipo') == 'tripleta']
         if trips_t:
             lineas.append("*TRIPLETAS (Paga x60)*")
@@ -775,11 +651,6 @@ def procesar_venta():
             except:
                 pass
         return jsonify({'error': f'Error del servidor: {str(e)}'}), 500
-
-
-# ... (Aquí continuarían el resto de rutas con lógica similar)
-
-# Para simplificar, aquí están las rutas faltantes en versión compacta:
 
 @app.route('/api/mis-tickets', methods=['POST'])
 @agencia_required
@@ -909,7 +780,6 @@ def mis_tickets():
             db.close()
             
         else:
-            # PostgreSQL version
             cur = db.cursor()
             cur.execute(
                 """SELECT * FROM tickets 
@@ -923,7 +793,7 @@ def mis_tickets():
             tv = 0
             
             for t in rows:
-                dt = parse_fecha(t[3])  # fecha index
+                dt = parse_fecha(t[3])
                 if not dt:
                     continue
                 if dti and dt < dti:
@@ -946,7 +816,7 @@ def mis_tickets():
                 jugadas_raw = cur.fetchall()
                 
                 for j in jugadas_raw:
-                    wa = res_dia.get(j[2])  # hora
+                    wa = res_dia.get(j[2])
                     gano = False
                     pj = 0
                     
@@ -1046,10 +916,173 @@ def mis_tickets():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/guardar-resultado', methods=['POST'])
+@admin_required
+def guardar_resultado():
+    try:
+        data = request.get_json()
+        fecha = data.get('fecha')
+        hora = data.get('hora')
+        animal = data.get('animal')
+        
+        if not all([fecha, hora, animal]):
+            return jsonify({'error': 'Faltan datos'}), 400
+        
+        db = get_db()
+        
+        if USE_SQLITE:
+            db.execute(
+                "INSERT OR REPLACE INTO resultados (fecha, hora, animal) VALUES (?, ?, ?)",
+                (fecha, hora, animal)
+            )
+            db.commit()
+            db.close()
+        else:
+            cur = db.cursor()
+            cur.execute(
+                """INSERT INTO resultados (fecha, hora, animal) VALUES (%s, %s, %s)
+                   ON CONFLICT (fecha, hora) DO UPDATE SET animal = EXCLUDED.animal""",
+                (fecha, hora, animal)
+            )
+            db.commit()
+            cur.close()
+            db.close()
+        
+        return jsonify({'status': 'ok', 'message': 'Resultado guardado'})
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-# ... (Resto de rutas administrativas similares)
+@app.route('/api/agencias', methods=['GET', 'POST'])
+@admin_required
+def manage_agencias():
+    db = get_db()
+    
+    if request.method == 'GET':
+        if USE_SQLITE:
+            rows = db.execute("SELECT id, usuario, nombre_agencia, comision, activa FROM agencias WHERE es_admin=0").fetchall()
+            agencias = [{'id': r['id'], 'usuario': r['usuario'], 'nombre': r['nombre_agencia'], 'comision': r['comision'], 'activa': bool(r['activa'])} for r in rows]
+            db.close()
+        else:
+            cur = db.cursor()
+            cur.execute("SELECT id, usuario, nombre_agencia, comision, activa FROM agencias WHERE es_admin=0")
+            rows = cur.fetchall()
+            agencias = [{'id': r[0], 'usuario': r[1], 'nombre': r[2], 'comision': r[3], 'activa': bool(r[4])} for r in rows]
+            cur.close()
+            db.close()
+        return jsonify({'status': 'ok', 'agencias': agencias})
+    
+    else:
+        try:
+            data = request.get_json()
+            usuario = data.get('usuario')
+            password = data.get('password')
+            nombre = data.get('nombre_agencia')
+            comision = data.get('comision', 0.15)
+            
+            if USE_SQLITE:
+                db.execute(
+                    "INSERT INTO agencias (usuario, password, nombre_agencia, comision) VALUES (?, ?, ?, ?)",
+                    (usuario, password, nombre, comision)
+                )
+                db.commit()
+                db.close()
+            else:
+                cur = db.cursor()
+                cur.execute(
+                    "INSERT INTO agencias (usuario, password, nombre_agencia, comision) VALUES (%s, %s, %s, %s)",
+                    (usuario, password, nombre, comision)
+                )
+                db.commit()
+                cur.close()
+                db.close()
+            
+            return jsonify({'status': 'ok', 'message': 'Agencia creada'})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
 
-# Templates HTML (mantener los mismos que tenías)
+@app.route('/api/reporte-ventas', methods=['POST'])
+@admin_required
+def reporte_ventas():
+    try:
+        data = request.get_json() or {}
+        fi, ff = data.get('fecha_inicio'), data.get('fecha_fin')
+        
+        dti = datetime.strptime(fi, "%Y-%m-%d") if fi else ahora_peru().replace(hour=0, minute=0)
+        dtf = datetime.strptime(ff, "%Y-%m-%d").replace(hour=23, minute=59) if ff else ahora_peru()
+        
+        db = get_db()
+        
+        if USE_SQLITE:
+            query = """
+                SELECT t.*, a.nombre_agencia 
+                FROM tickets t 
+                JOIN agencias a ON t.agencia_id = a.id 
+                WHERE t.anulado = 0 
+                ORDER BY t.id DESC
+            """
+            rows = db.execute(query).fetchall()
+        else:
+            cur = db.cursor()
+            cur.execute("""
+                SELECT t.*, a.nombre_agencia 
+                FROM tickets t 
+                JOIN agencias a ON t.agencia_id = a.id 
+                WHERE t.anulado = 0 
+                ORDER BY t.id DESC
+            """)
+            rows = cur.fetchall()
+        
+        resultados = []
+        total_ventas = 0
+        total_premios = 0
+        
+        for row in rows:
+            if USE_SQLITE:
+                dt = parse_fecha(row['fecha'])
+                if dt and dti <= dt <= dtf:
+                    premio = 0
+                    resultados.append({
+                        'ticket_id': row['id'],
+                        'agencia': row['nombre_agencia'],
+                        'fecha': row['fecha'],
+                        'total': row['total'],
+                        'premio': premio
+                    })
+                    total_ventas += row['total']
+            else:
+                dt = parse_fecha(row[3])
+                if dt and dti <= dt <= dtf:
+                    resultados.append({
+                        'ticket_id': row[0],
+                        'agencia': row[8],
+                        'fecha': row[3],
+                        'total': row[4],
+                        'premio': 0
+                    })
+                    total_ventas += row[4]
+        
+        if USE_SQLITE:
+            db.close()
+        else:
+            cur.close()
+            db.close()
+        
+        return jsonify({
+            'status': 'ok',
+            'ventas': resultados,
+            'resumen': {
+                'total_ventas': round(total_ventas, 2),
+                'total_premios': round(total_premios, 2),
+                'balance': round(total_ventas - total_premios, 2)
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ==================== TEMPLATES HTML ====================
+
 LOGIN_HTML = '''<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1081,14 +1114,729 @@ body{background:#050a12;min-height:100vh;display:flex;align-items:center;justify
 </form>
 </div></body></html>'''
 
-# [Incluye aquí tus templates POS_HTML y ADMIN_HTML completos que ya tenías]
+POS_HTML = '''<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>POS - ZOOLO CASINO</title>
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;700&family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#050a12;color:#fff;font-family:'Rajdhani',sans-serif;overflow-x:hidden}
+.header{background:#0a1020;border-bottom:1px solid #1e3060;padding:12px 20px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:100}
+.logo{font-family:'Oswald',sans-serif;font-size:1.8rem;font-weight:700;letter-spacing:2px}
+.logo em{color:#f5a623;font-style:normal}
+.agencia{color:#7ab0ff;font-size:.9rem}
+.logout{color:#e05050;text-decoration:none;font-size:.85rem;cursor:pointer}
+.main{display:flex;min-height:calc(100vh - 60px)}
+.sidebar{width:320px;background:#0d1424;border-right:1px solid #1e3060;padding:20px;overflow-y:auto}
+.content{flex:1;padding:20px;overflow-y:auto}
+.section{margin-bottom:24px}
+.section-title{color:#3a5080;font-size:.75rem;letter-spacing:2px;margin-bottom:12px;text-transform:uppercase}
+.horas-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+.hora-btn{padding:10px;background:#060e1e;border:1px solid #1e3060;border-radius:4px;color:#7ab0ff;cursor:pointer;text-align:center;font-size:.85rem;transition:all .2s}
+.hora-btn:hover{background:#1a2744}
+.hora-btn.active{background:#2060d0;color:#fff;border-color:#2060d0}
+.hora-btn.bloqueada{opacity:.4;cursor:not-allowed;background:#1a0f0f;border-color:#402020;color:#604040}
+.animales-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:8px}
+.animal-btn{padding:12px 8px;background:#060e1e;border:1px solid #1e3060;border-radius:4px;color:#fff;cursor:pointer;text-align:center;transition:all .2s;font-size:.8rem}
+.animal-btn:hover{background:#1a2744;transform:translateY(-2px)}
+.animal-btn.rojo{border-color:#802020;background:rgba(128,32,32,.2)}
+.animal-btn.negro{border-color:#404040;background:rgba(64,64,64,.2)}
+.animal-btn.verde{border-color:#208020;background:rgba(32,128,32,.2)}
+.animal-btn.selected{border-color:#f5a623;box-shadow:0 0 0 2px rgba(245,166,35,.3)}
+.animal-num{font-size:1.2rem;font-weight:700;display:block;margin-bottom:2px}
+.especiales-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+.esp-btn{padding:15px;background:#060e1e;border:1px solid #1e3060;border-radius:4px;color:#fff;cursor:pointer;text-align:center;font-weight:600;transition:all .2s}
+.esp-btn:hover{background:#1a2744}
+.esp-btn.rojo{background:rgba(180,40,40,.2);border-color:#802020}
+.esp-btn.negro{background:rgba(40,40,40,.5);border-color:#404040}
+.ticket{background:#0a1020;border:1px solid #1e3060;border-radius:6px;padding:16px;margin-top:20px}
+.ticket-title{font-size:1.1rem;margin-bottom:12px;color:#f5a623}
+.ticket-item{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #1e3060;font-size:.9rem}
+.ticket-item:last-child{border-bottom:none}
+.ticket-total{display:flex;justify-content:space-between;padding:12px 0;margin-top:8px;border-top:2px solid #f5a623;font-size:1.2rem;font-weight:700}
+.input-monto{width:100%;padding:12px;background:#060e1e;border:1px solid #1e3060;border-radius:4px;color:#fff;font-size:1.1rem;text-align:center;margin-bottom:12px;font-family:'Rajdhani',sans-serif}
+.input-monto:focus{outline:none;border-color:#2060d0}
+.btn-primario{width:100%;padding:14px;background:linear-gradient(135deg,#1a4cd0,#0d32a0);color:#fff;border:none;border-radius:4px;font-size:1rem;font-weight:700;cursor:pointer;margin-top:8px;transition:all .3s}
+.btn-primario:hover{background:linear-gradient(135deg,#2060e8,#1440c0)}
+.btn-secundario{width:100%;padding:12px;background:transparent;color:#7ab0ff;border:1px solid #1e3060;border-radius:4px;font-size:.9rem;cursor:pointer;margin-top:8px}
+.btn-whatsapp{background:#25d366!important;margin-top:8px}
+.tabs{display:flex;gap:8px;margin-bottom:16px;border-bottom:1px solid #1e3060;padding-bottom:12px}
+.tab-btn{padding:8px 16px;background:transparent;border:none;color:#3a5080;cursor:pointer;font-family:'Rajdhani',sans-serif;font-size:.9rem;transition:all .2s}
+.tab-btn.active{color:#f5a623;border-bottom:2px solid #f5a623}
+.tab-content{display:none}
+.tab-content.active{display:block}
+.tripleta-input{display:flex;gap:8px;margin-bottom:12px}
+.tripleta-input select{flex:1;padding:10px;background:#060e1e;border:1px solid #1e3060;border-radius:4px;color:#fff}
+.eliminar-btn{color:#e05050;cursor:pointer;font-size:1.2rem;padding:0 8px}
+.modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.8);z-index:1000;justify-content:center;align-items:center}
+.modal-content{background:#0a1020;border:1px solid #1e3060;border-radius:8px;padding:24px;max-width:500px;width:90%;max-height:80vh;overflow-y:auto}
+.modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+.modal-close{color:#e05050;cursor:pointer;font-size:1.5rem}
+.success-message{background:rgba(32,128,32,.2);border:1px solid #208020;color:#60ff60;padding:12px;border-radius:4px;margin-bottom:12px;text-align:center}
+@media(max-width:768px){.main{flex-direction:column}.sidebar{width:100%;border-right:none;border-bottom:1px solid #1e3060}}
+</style>
+</head>
+<body>
+<div class="header">
+<div>
+<div class="logo">ZOO<em>LO</em></div>
+<div class="agencia">{{agencia}}</div>
+</div>
+<a href="/logout" class="logout">Cerrar Sesión</a>
+</div>
 
-POS_HTML = r'''[PEGA AQUÍ TU POS_HTML COMPLETO]'''
-ADMIN_HTML = r'''[PEGA AQUÍ TU ADMIN_HTML COMPLETO]'''
+<div class="main">
+<div class="sidebar">
+<div class="section">
+<div class="section-title">Sorteo</div>
+<div class="horas-grid" id="horasContainer">
+{% for hora in horarios_peru %}
+<button class="hora-btn" data-hora="{{hora}}">{{hora}}</button>
+{% endfor %}
+</div>
+</div>
 
+<div class="section">
+<div class="tabs">
+<button class="tab-btn active" onclick="switchTab('animales')">Animales</button>
+<button class="tab-btn" onclick="switchTab('especiales')">Especiales</button>
+<button class="tab-btn" onclick="switchTab('tripletas')">Tripletas</button>
+</div>
+
+<div id="tab-animales" class="tab-content active">
+<div class="section-title">Selecciona Animal</div>
+<div class="animales-grid" id="animalesContainer">
+{% for num, nombre in animales.items() %}
+{% if num != '0' and num != '00' %}
+<button class="animal-btn {% if num in ['1','3','5','7','9','12','14','16','18','19','21','23','25','27','30','32','34','36','37','39'] %}rojo{% elif num == '40' %}verde{% else %}negro{% endif %}" 
+        data-num="{{num}}" data-nombre="{{nombre}}" onclick="selectAnimal('{{num}}', '{{nombre}}')">
+<span class="animal-num">{{num}}</span>
+<small>{{nombre[:6]}}</small>
+</button>
+{% endif %}
+{% endfor %}
+</div>
+</div>
+
+<div id="tab-especiales" class="tab-content">
+<div class="section-title">Apuestas Especiales</div>
+<div class="especiales-grid">
+<button class="esp-btn rojo" onclick="selectEspecial('ROJO')">ROJO<br><small>Paga x2</small></button>
+<button class="esp-btn negro" onclick="selectEspecial('NEGRO')">NEGRO<br><small>Paga x2</small></button>
+<button class="esp-btn" onclick="selectEspecial('PAR')">PAR<br><small>Paga x2</small></button>
+<button class="esp-btn" onclick="selectEspecial('IMPAR')">IMPAR<br><small>Paga x2</small></button>
+</div>
+</div>
+
+<div id="tab-tripletas" class="tab-content">
+<div class="section-title">Crear Tripleta</div>
+<div class="tripleta-input">
+<select id="trip1"><option value="">Animal 1</option>{% for num, nombre in animales.items() %}<option value="{{num}}">{{num}} - {{nombre}}</option>{% endfor %}</select>
+</div>
+<div class="tripleta-input">
+<select id="trip2"><option value="">Animal 2</option>{% for num, nombre in animales.items() %}<option value="{{num}}">{{num}} - {{nombre}}</option>{% endfor %}</select>
+</div>
+<div class="tripleta-input">
+<select id="trip3"><option value="">Animal 3</option>{% for num, nombre in animales.items() %}<option value="{{num}}">{{num}} - {{nombre}}</option>{% endfor %}</select>
+</div>
+<button class="btn-primario" onclick="agregarTripleta()">Agregar Tripleta (Paga x60)</button>
+</div>
+</div>
+</div>
+
+<div class="content">
+<div class="section-title">Monto a Apostar</div>
+<input type="number" class="input-monto" id="montoInput" placeholder="0.00" min="1" step="0.1">
+
+<div class="ticket">
+<div class="ticket-title">🎫 TICKET ACTUAL</div>
+<div id="ticketItems">
+<div style="color:#3a5080;text-align:center;padding:20px;">No hay jugadas agregadas</div>
+</div>
+<div class="ticket-total">
+<span>TOTAL:</span>
+<span id="ticketTotal">S/ 0.00</span>
+</div>
+<button class="btn-primario" onclick="procesarVenta()">PROCESAR VENTA</button>
+<button class="btn-secundario" onclick="limpiarTicket()">Limpiar Todo</button>
+</div>
+
+<button class="btn-secundario" onclick="verMisTickets()" style="margin-top:20px;">📋 Ver Mis Tickets</button>
+</div>
+</div>
+
+<div id="successModal" class="modal">
+<div class="modal-content">
+<div class="modal-header">
+<h3>✅ Venta Exitosa</h3>
+<span class="modal-close" onclick="closeModal()">&times;</span>
+</div>
+<div id="successContent"></div>
+</div>
+</div>
+
+<div id="ticketsModal" class="modal">
+<div class="modal-content" style="max-width:800px;">
+<div class="modal-header">
+<h3>📋 Mis Tickets</h3>
+<span class="modal-close" onclick="closeTicketsModal()">&times;</span>
+</div>
+<div id="ticketsContent"></div>
+</div>
+</div>
+
+<script>
+let ticket = [];
+let horaSeleccionada = null;
+let seleccionActual = null;
+let tipoActual = null;
+
+function switchTab(tab) {
+document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+document.getElementById('tab-' + tab).classList.add('active');
+event.target.classList.add('active');
+}
+
+document.querySelectorAll('.hora-btn').forEach(btn => {
+btn.addEventListener('click', function() {
+if(this.classList.contains('bloqueada')) return;
+document.querySelectorAll('.hora-btn').forEach(b => b.classList.remove('active'));
+this.classList.add('active');
+horaSeleccionada = this.dataset.hora;
+});
+});
+
+function selectAnimal(num, nombre) {
+if(!horaSeleccionada) {
+alert('Selecciona una hora de sorteo primero');
+return;
+}
+seleccionActual = num;
+tipoActual = 'animal';
+document.querySelectorAll('.animal-btn').forEach(b => b.classList.remove('selected'));
+event.currentTarget.classList.add('selected');
+}
+
+function selectEspecial(tipo) {
+if(!horaSeleccionada) {
+alert('Selecciona una hora de sorteo primero');
+return;
+}
+seleccionActual = tipo;
+tipoActual = 'especial';
+}
+
+function agregarTripleta() {
+const t1 = document.getElementById('trip1').value;
+const t2 = document.getElementById('trip2').value;
+const t3 = document.getElementById('trip3').value;
+const monto = parseFloat(document.getElementById('montoInput').value);
+
+if(!t1 || !t2 || !t3) {
+alert('Selecciona los 3 animales');
+return;
+}
+if(!monto || monto <= 0) {
+alert('Ingresa un monto válido');
+return;
+}
+if(t1 === t2 || t2 === t3 || t1 === t3) {
+alert('Los 3 animales deben ser diferentes');
+return;
+}
+
+ticket.push({
+tipo: 'tripleta',
+seleccion: t1 + ',' + t2 + ',' + t3,
+monto: monto,
+hora: '-'
+});
+
+actualizarTicket();
+document.getElementById('trip1').value = '';
+document.getElementById('trip2').value = '';
+document.getElementById('trip3').value = '';
+}
+
+document.getElementById('montoInput').addEventListener('keypress', function(e) {
+if(e.key === 'Enter') {
+if(tipoActual === 'animal' && seleccionActual) {
+agregarJugada('animal', seleccionActual);
+} else if(tipoActual === 'especial' && seleccionActual) {
+agregarJugada('especial', seleccionActual);
+}
+}
+});
+
+function agregarJugada(tipo, seleccion) {
+const monto = parseFloat(document.getElementById('montoInput').value);
+if(!monto || monto <= 0) {
+alert('Ingresa un monto válido');
+return;
+}
+
+ticket.push({
+tipo: tipo,
+seleccion: seleccion,
+monto: monto,
+hora: horaSeleccionada
+});
+
+actualizarTicket();
+document.getElementById('montoInput').value = '';
+document.getElementById('montoInput').focus();
+}
+
+function actualizarTicket() {
+const container = document.getElementById('ticketItems');
+if(ticket.length === 0) {
+container.innerHTML = '<div style="color:#3a5080;text-align:center;padding:20px;">No hay jugadas agregadas</div>';
+document.getElementById('ticketTotal').textContent = 'S/ 0.00';
+return;
+}
+
+let html = '';
+let total = 0;
+ticket.forEach((item, idx) => {
+total += item.monto;
+let desc = '';
+if(item.tipo === 'animal') {
+const nombre = document.querySelector(`[data-num="${item.seleccion}"]`)?.dataset.nombre || '';
+desc = `Animal ${item.seleccion} - ${nombre} (${item.hora})`;
+} else if(item.tipo === 'especial') {
+desc = `${item.seleccion} (${item.hora})`;
+} else if(item.tipo === 'tripleta') {
+desc = `Tripleta: ${item.seleccion}`;
+}
+html += `
+<div class="ticket-item">
+<span>${desc}</span>
+<span style="display:flex;align-items:center;">
+S/ ${item.monto.toFixed(2)}
+<span class="eliminar-btn" onclick="eliminarJugada(${idx})">&times;</span>
+</span>
+</div>
+`;
+});
+container.innerHTML = html;
+document.getElementById('ticketTotal').textContent = 'S/ ' + total.toFixed(2);
+}
+
+function eliminarJugada(idx) {
+ticket.splice(idx, 1);
+actualizarTicket();
+}
+
+function limpiarTicket() {
+if(confirm('¿Limpiar todo el ticket?')) {
+ticket = [];
+actualizarTicket();
+}
+}
+
+function procesarVenta() {
+if(ticket.length === 0) {
+alert('Agrega jugadas al ticket primero');
+return;
+}
+
+fetch('/api/procesar-venta', {
+method: 'POST',
+headers: {'Content-Type': 'application/json'},
+body: JSON.stringify({jugadas: ticket})
+})
+.then(r => r.json())
+.then(data => {
+if(data.error) {
+alert('Error: ' + data.error);
+} else {
+document.getElementById('successContent').innerHTML = `
+<div class="success-message">
+<h3>Ticket #${data.ticket_id}</h3>
+<p>Serial: ${data.serial}</p>
+<p>Total: S/ ${data.total.toFixed(2)}</p>
+</div>
+<a href="${data.url_whatsapp}" target="_blank" class="btn-primario btn-whatsapp">📱 Compartir por WhatsApp</a>
+<button class="btn-secundario" onclick="closeModal();ticket=[];actualizarTicket();" style="margin-top:8px;">Nueva Venta</button>
+`;
+document.getElementById('successModal').style.display = 'flex';
+}
+})
+.catch(e => alert('Error de conexión: ' + e));
+}
+
+function closeModal() {
+document.getElementById('successModal').style.display = 'none';
+}
+
+function verMisTickets() {
+fetch('/api/mis-tickets', {
+method: 'POST',
+headers: {'Content-Type': 'application/json'},
+body: JSON.stringify({})
+})
+.then(r => r.json())
+.then(data => {
+if(data.error) {
+alert('Error: ' + data.error);
+return;
+}
+let html = '<div style="max-height:60vh;overflow-y:auto;">';
+if(data.tickets.length === 0) {
+html += '<p style="text-align:center;color:#3a5080;">No hay tickets recientes</p>';
+} else {
+html += `<p style="margin-bottom:12px;color:#7ab0ff;">Total ventas: S/ ${data.totales.ventas.toFixed(2)} (${data.totales.cantidad} tickets)</p>`;
+data.tickets.forEach(t => {
+html += `
+<div style="border:1px solid #1e3060;border-radius:4px;padding:12px;margin-bottom:8px;background:#060e1e;">
+<div style="display:flex;justify-content:space-between;margin-bottom:8px;">
+<strong>Ticket #${t.id}</strong>
+<span style="color:${t.pagado ? '#60ff60' : '#f5a623'}">${t.pagado ? 'Pagado' : 'Pendiente'}</span>
+</div>
+<div style="font-size:.85rem;color:#7ab0ff;margin-bottom:4px;">${t.fecha}</div>
+<div style="display:flex;justify-content:space-between;font-size:.9rem;">
+<span>Apostado: S/ ${t.total.toFixed(2)}</span>
+<span style="color:#f5a623;">Premio: S/ ${t.premio_calculado.toFixed(2)}</span>
+</div>
+</div>
+`;
+});
+}
+html += '</div>';
+document.getElementById('ticketsContent').innerHTML = html;
+document.getElementById('ticketsModal').style.display = 'flex';
+});
+}
+
+function closeTicketsModal() {
+document.getElementById('ticketsModal').style.display = 'none';
+}
+
+function actualizarHorasBloqueadas() {
+fetch('/api/hora-actual')
+.then(r => r.json())
+.then(data => {
+data.bloqueadas.forEach(hora => {
+const btn = document.querySelector(`[data-hora="${hora}"]`);
+if(btn) {
+btn.classList.add('bloqueada');
+btn.title = 'Sorteo cerrado';
+}
+});
+});
+}
+
+actualizarHorasBloqueadas();
+setInterval(actualizarHorasBloqueadas, 60000);
+</script>
+</body>
+</html>'''
+
+ADMIN_HTML = '''<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Admin - ZOOLO CASINO</title>
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;700&family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#050a12;color:#fff;font-family:'Rajdhani',sans-serif}
+.header{background:#0a1020;border-bottom:1px solid #1e3060;padding:12px 20px;display:flex;justify-content:space-between;align-items:center}
+.logo{font-family:'Oswald',sans-serif;font-size:1.8rem;font-weight:700;letter-spacing:2px}
+.logo em{color:#f5a623;font-style:normal}
+.nav{display:flex;gap:20px}
+.nav a{color:#7ab0ff;text-decoration:none;font-size:.9rem;cursor:pointer;padding:8px 16px;border-radius:4px;transition:all .2s}
+.nav a:hover{background:#1a2744}
+.nav a.active{background:#2060d0;color:#fff}
+.container{padding:20px;max-width:1200px;margin:0 auto}
+.section{display:none;background:#0a1020;border:1px solid #1e3060;border-radius:8px;padding:24px;margin-bottom:20px}
+.section.active{display:block}
+.section-title{font-size:1.3rem;margin-bottom:20px;color:#f5a623;border-bottom:1px solid #1e3060;padding-bottom:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:12px}
+.card{background:#060e1e;border:1px solid #1e3060;border-radius:6px;padding:16px;text-align:center;cursor:pointer;transition:all .2s}
+.card:hover{background:#1a2744;transform:translateY(-2px)}
+.card.selected{border-color:#f5a623;box-shadow:0 0 0 3px rgba(245,166,35,.2)}
+.card-num{font-size:1.5rem;font-weight:700;margin-bottom:4px}
+.card-name{font-size:.85rem;color:#7ab0ff}
+.form-group{margin-bottom:16px}
+.form-group label{display:block;margin-bottom:6px;color:#3a5080;font-size:.85rem;text-transform:uppercase;letter-spacing:1px}
+.form-group input,.form-group select{width:100%;padding:10px;background:#060e1e;border:1px solid #1e3060;border-radius:4px;color:#fff;font-family:'Rajdhani',sans-serif}
+.btn{padding:12px 24px;background:linear-gradient(135deg,#1a4cd0,#0d32a0);color:#fff;border:none;border-radius:4px;font-size:.9rem;font-weight:600;cursor:pointer;transition:all .2s}
+.btn:hover{background:linear-gradient(135deg,#2060e8,#1440c0)}
+.btn-success{background:linear-gradient(135deg,#20a040,#106020)}
+.btn-danger{background:linear-gradient(135deg,#d02020,#801010)}
+table{width:100%;border-collapse:collapse;margin-top:12px}
+th,td{padding:12px;text-align:left;border-bottom:1px solid #1e3060}
+th{color:#3a5080;font-size:.8rem;text-transform:uppercase;letter-spacing:1px}
+td{font-size:.9rem}
+tr:hover{background:#060e1e}
+.status{ padding:4px 8px;border-radius:4px;font-size:.8rem;font-weight:600}
+.status-activa{background:rgba(32,128,32,.2);color:#60ff60}
+.status-inactiva{background:rgba(128,32,32,.2);color:#e05050}
+.tabs{display:flex;gap:8px;margin-bottom:16px}
+.tab-btn{padding:8px 16px;background:#060e1e;border:1px solid #1e3060;color:#7ab0ff;cursor:pointer;border-radius:4px}
+.tab-btn.active{background:#2060d0;color:#fff}
+.resultado-box{font-size:2rem;font-weight:700;text-align:center;padding:20px;background:#060e1e;border-radius:8px;margin:12px 0}
+</style>
+</head>
+<body>
+<div class="header">
+<div class="logo">ZOO<em>LO</em> ADMIN</div>
+<div class="nav">
+<a onclick="showSection('resultados')" class="active" id="nav-resultados">Resultados</a>
+<a onclick="showSection('agencias')" id="nav-agencias">Agencias</a>
+<a onclick="showSection('reportes')" id="nav-reportes">Reportes</a>
+<a href="/logout">Salir</a>
+</div>
+</div>
+
+<div class="container">
+
+<div id="resultados" class="section active">
+<div class="section-title">📊 Cargar Resultados</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px;">
+<div>
+<div class="form-group">
+<label>Fecha</label>
+<input type="date" id="fechaResultado">
+</div>
+<div class="form-group">
+<label>Hora del Sorteo</label>
+<select id="horaResultado">
+{% for hora in horarios %}
+<option value="{{hora}}">{{hora}}</option>
+{% endfor %}
+</select>
+</div>
+<div class="form-group">
+<label>Animal Ganador</label>
+<div class="resultado-box" id="animalSeleccionado">-</div>
+<input type="hidden" id="animalResultado">
+</div>
+<button class="btn btn-success" onclick="guardarResultado()" style="width:100%">💾 Guardar Resultado</button>
+</div>
+<div>
+<div class="form-group">
+<label>Selecciona el Animal Ganador</label>
+<div class="grid" style="max-height:60vh;overflow-y:auto;" id="gridAnimales">
+{% for num, nombre in animales.items() %}
+<div class="card" onclick="selectAnimalResultado('{{num}}', '{{nombre}}')">
+<div class="card-num">{{num}}</div>
+<div class="card-name">{{nombre}}</div>
+</div>
+{% endfor %}
+</div>
+</div>
+</div>
+</div>
+</div>
+
+<div id="agencias" class="section">
+<div class="section-title">🏢 Gestión de Agencias</div>
+<div style="display:grid;grid-template-columns:1fr 2fr;gap:20px;">
+<div style="background:#060e1e;padding:20px;border-radius:8px;">
+<h3 style="margin-bottom:16px;color:#f5a623">Nueva Agencia</h3>
+<div class="form-group">
+<label>Usuario</label>
+<input type="text" id="newUsuario" placeholder="usuario123">
+</div>
+<div class="form-group">
+<label>Contraseña</label>
+<input type="password" id="newPassword" placeholder="****">
+</div>
+<div class="form-group">
+<label>Nombre Agencia</label>
+<input type="text" id="newNombre" placeholder="Mi Agencia">
+</div>
+<div class="form-group">
+<label>Comisión (%)</label>
+<input type="number" id="newComision" value="15" min="0" max="100" step="0.1">
+</div>
+<button class="btn" onclick="crearAgencia()" style="width:100%">➕ Crear Agencia</button>
+</div>
+<div>
+<h3 style="margin-bottom:16px;color:#f5a623">Lista de Agencias</h3>
+<div id="listaAgencias"></div>
+</div>
+</div>
+</div>
+
+<div id="reportes" class="section">
+<div class="section-title">📈 Reporte de Ventas</div>
+<div style="display:flex;gap:12px;margin-bottom:20px;">
+<div class="form-group" style="flex:1">
+<label>Desde</label>
+<input type="date" id="reporteDesde">
+</div>
+<div class="form-group" style="flex:1">
+<label>Hasta</label>
+<input type="date" id="reporteHasta">
+</div>
+<div class="form-group">
+<label style="visibility:hidden">Consultar</label>
+<button class="btn" onclick="generarReporte()">📊 Generar</button>
+</div>
+</div>
+<div id="resultadoReporte"></div>
+</div>
+
+</div>
+
+<script>
+let animalSeleccionado = null;
+
+function showSection(section) {
+document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+document.querySelectorAll('.nav a').forEach(a => a.classList.remove('active'));
+document.getElementById(section).classList.add('active');
+document.getElementById('nav-' + section).classList.add('active');
+if(section === 'agencias') cargarAgencias();
+}
+
+function selectAnimalResultado(num, nombre) {
+animalSeleccionado = num;
+document.getElementById('animalResultado').value = num;
+document.getElementById('animalSeleccionado').textContent = num + ' - ' + nombre;
+document.querySelectorAll('.card').forEach(c => c.classList.remove('selected'));
+event.currentTarget.classList.add('selected');
+}
+
+function guardarResultado() {
+const fecha = document.getElementById('fechaResultado').value;
+const hora = document.getElementById('horaResultado').value;
+const animal = document.getElementById('animalResultado').value;
+
+if(!fecha || !animal) {
+alert('Completa todos los campos');
+return;
+}
+
+fetch('/api/guardar-resultado', {
+method: 'POST',
+headers: {'Content-Type': 'application/json'},
+body: JSON.stringify({fecha: fecha.split('-').reverse().join('/'), hora, animal})
+})
+.then(r => r.json())
+.then(data => {
+if(data.error) alert('Error: ' + data.error);
+else {
+alert('Resultado guardado correctamente');
+document.getElementById('animalSeleccionado').textContent = '-';
+document.querySelectorAll('.card').forEach(c => c.classList.remove('selected'));
+animalSeleccionado = null;
+}
+});
+}
+
+function crearAgencia() {
+const usuario = document.getElementById('newUsuario').value;
+const password = document.getElementById('newPassword').value;
+const nombre = document.getElementById('newNombre').value;
+const comision = document.getElementById('newComision').value;
+
+if(!usuario || !password || !nombre) {
+alert('Completa todos los campos');
+return;
+}
+
+fetch('/api/agencias', {
+method: 'POST',
+headers: {'Content-Type': 'application/json'},
+body: JSON.stringify({usuario, password, nombre_agencia: nombre, comision: comision/100})
+})
+.then(r => r.json())
+.then(data => {
+if(data.error) alert('Error: ' + data.error);
+else {
+alert('Agencia creada correctamente');
+cargarAgencias();
+document.getElementById('newUsuario').value = '';
+document.getElementById('newPassword').value = '';
+document.getElementById('newNombre').value = '';
+}
+});
+}
+
+function cargarAgencias() {
+fetch('/api/agencias')
+.then(r => r.json())
+.then(data => {
+if(data.error) return;
+let html = '<table><thead><tr><th>ID</th><th>Usuario</th><th>Nombre</th><th>Comisión</th><th>Estado</th></tr></thead><tbody>';
+data.agencias.forEach(a => {
+html += `<tr>
+<td>${a.id}</td>
+<td>${a.usuario}</td>
+<td>${a.nombre}</td>
+<td>${(a.comision*100).toFixed(0)}%</td>
+<td><span class="status ${a.activa ? 'status-activa' : 'status-inactiva'}">${a.activa ? 'Activa' : 'Inactiva'}</span></td>
+</tr>`;
+});
+html += '</tbody></table>';
+document.getElementById('listaAgencias').innerHTML = html;
+});
+}
+
+function generarReporte() {
+const desde = document.getElementById('reporteDesde').value;
+const hasta = document.getElementById('reporteHasta').value;
+
+fetch('/api/reporte-ventas', {
+method: 'POST',
+headers: {'Content-Type': 'application/json'},
+body: JSON.stringify({fecha_inicio: desde, fecha_fin: hasta})
+})
+.then(r => r.json())
+.then(data => {
+if(data.error) {
+alert('Error: ' + data.error);
+return;
+}
+let html = `
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px;">
+<div style="background:#060e1e;padding:16px;border-radius:8px;text-align:center;">
+<div style="color:#3a5080;font-size:.8rem;margin-bottom:4px">TOTAL VENTAS</div>
+<div style="font-size:1.5rem;font-weight:700;color:#fff;">S/ ${data.resumen.total_ventas.toFixed(2)}</div>
+</div>
+<div style="background:#060e1e;padding:16px;border-radius:8px;text-align:center;">
+<div style="color:#3a5080;font-size:.8rem;margin-bottom:4px">TOTAL PREMIOS</div>
+<div style="font-size:1.5rem;font-weight:700;color:#f5a623;">S/ ${data.resumen.total_premios.toFixed(2)}</div>
+</div>
+<div style="background:#060e1e;padding:16px;border-radius:8px;text-align:center;">
+<div style="color:#3a5080;font-size:.8rem;margin-bottom:4px">BALANCE</div>
+<div style="font-size:1.5rem;font-weight:700;color:${data.resumen.balance >= 0 ? '#60ff60' : '#e05050'};">S/ ${data.resumen.balance.toFixed(2)}</div>
+</div>
+</div>
+<table>
+<thead><tr><th>Ticket</th><th>Agencia</th><th>Fecha</th><th>Monto</th><th>Premio</th></tr></thead>
+<tbody>`;
+data.ventas.forEach(v => {
+html += `<tr>
+<td>#${v.ticket_id}</td>
+<td>${v.agencia}</td>
+<td>${v.fecha}</td>
+<td>S/ ${v.total.toFixed(2)}</td>
+<td>S/ ${v.premio.toFixed(2)}</td>
+</tr>`;
+});
+html += '</tbody></table>';
+document.getElementById('resultadoReporte').innerHTML = html;
+});
+}
+
+document.getElementById('fechaResultado').valueAsDate = new Date();
+document.getElementById('reporteDesde').valueAsDate = new Date();
+document.getElementById('reporteHasta').valueAsDate = new Date();
+</script>
+</body>
+</html>'''
 
 if __name__ == '__main__':
     init_db()
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port, debug=False)
-
