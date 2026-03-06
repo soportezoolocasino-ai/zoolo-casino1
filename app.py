@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-ZOOLO CASINO LOCAL v2.4 — Código Corregido y Funcional
-Cambios realizados:
-- Horarios ajustados: 9AM a 6PM (10 sorteos)
-- Admin: usuario=cuborubi, contraseña=15821462
-- Limpieza automática de selecciones después de generar ticket
-- Todos los botones verificados y funcionales
+ZOOLO CASINO LOCAL v3.0 — Código Optimizado
+- Tripleta válida solo día actual (9am-6pm)
+- Cierre a 2 minutos del sorteo
+- Jugada manual por texto (pegar números)
+- Repetir ticket por serial editable
 """
 
-import os, json, csv, io, sqlite3
+import os, json, csv, io, sqlite3, re
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from flask import Flask, render_template_string, request, session, redirect, jsonify, Response
 from collections import defaultdict
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'zoolo_local_2025_ultra_seguro')
+app.secret_key = os.environ.get('SECRET_KEY', 'zoolo_local_2025_seguro')
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'zoolo_casino.db')
 
 PAGO_ANIMAL_NORMAL = 35
@@ -23,9 +22,9 @@ PAGO_LECHUZA       = 70
 PAGO_ESPECIAL      = 2
 PAGO_TRIPLETA      = 60
 COMISION_AGENCIA   = 0.15
-MINUTOS_BLOQUEO    = 5
+MINUTOS_BLOQUEO    = 2  # CAMBIO: 5 -> 2 minutos
 
-# HORARIOS CORREGIDOS: 9AM a 6PM (10 sorteos)
+# Horarios: 9AM a 6PM (10 sorteos)
 HORARIOS_PERU = [
     "09:00 AM","10:00 AM","11:00 AM","12:00 PM",
     "01:00 PM","02:00 PM","03:00 PM","04:00 PM","05:00 PM","06:00 PM"
@@ -46,7 +45,6 @@ ANIMALES = {
     "36":"Culebra","37":"Aviapa","38":"Conejo","39":"Tortuga","40":"Lechuza"
 }
 
-# Color exacto por animal: verde=00,0 | rojo=1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36,37,39 | negro=resto | lechuza=40
 COLORES = {
     "00":"verde","0":"verde",
     "1":"rojo","3":"rojo","5":"rojo","7":"rojo","9":"rojo",
@@ -129,7 +127,6 @@ def init_db():
         """)
         admin = db.execute("SELECT id FROM agencias WHERE es_admin=1").fetchone()
         if not admin:
-            # CREDENCIALES ADMIN ACTUALIZADAS
             db.execute("INSERT INTO agencias (usuario,password,nombre_agencia,es_admin,comision,activa) VALUES (?,?,?,1,0,1)",
                        ('cuborubi','15821462','ADMINISTRADOR'))
             db.commit()
@@ -183,6 +180,7 @@ def calcular_premio_ticket(ticket_id, db=None):
         res_rows = db.execute("SELECT hora, animal FROM resultados WHERE fecha=?", (fecha_str,)).fetchall()
         resultados = {r['hora']: r['animal'] for r in res_rows}
         total = 0
+        
         jugadas = db.execute("SELECT * FROM jugadas WHERE ticket_id=?", (ticket_id,)).fetchall()
         for j in jugadas:
             wa = resultados.get(j['hora'])
@@ -196,6 +194,7 @@ def calcular_premio_ticket(ticket_id, db=None):
                    (sel=='PAR' and num%2==0) or \
                    (sel=='IMPAR' and num%2!=0):
                     total += j['monto'] * PAGO_ESPECIAL
+        
         trips = db.execute("SELECT * FROM tripletas WHERE ticket_id=?", (ticket_id,)).fetchall()
         for tr in trips:
             nums = {tr['animal1'], tr['animal2'], tr['animal3']}
@@ -253,7 +252,8 @@ def login():
 
 @app.route('/logout')
 def logout():
-    session.clear(); return redirect('/login')
+    session.clear()
+    return redirect('/login')
 
 @app.route('/pos')
 @login_required
@@ -312,16 +312,21 @@ def procesar_venta():
         data = request.get_json()
         jugadas = data.get('jugadas', [])
         if not jugadas: return jsonify({'error':'Ticket vacío'}),400
+        
+        # Validar horarios bloqueados
         for j in jugadas:
             if j['tipo']!='tripleta' and not puede_vender(j['hora']):
-                return jsonify({'error':f"Sorteo {j['hora']} ya cerró"}),400
+                return jsonify({'error':f"Sorteo {j['hora']} ya cerró (2 min antes)"}),400
+        
         serial = generar_serial()
         fecha  = ahora_peru().strftime("%d/%m/%Y %I:%M %p")
         total  = sum(j['monto'] for j in jugadas)
+        
         with get_db() as db:
             cur = db.execute("INSERT INTO tickets (serial,agencia_id,fecha,total) VALUES (?,?,?,?)",
                 (serial, session['user_id'], fecha, total))
             ticket_id = cur.lastrowid
+            
             for j in jugadas:
                 if j['tipo']=='tripleta':
                     nums = j['seleccion'].split(',')
@@ -331,13 +336,19 @@ def procesar_venta():
                     db.execute("INSERT INTO jugadas (ticket_id,hora,seleccion,monto,tipo) VALUES (?,?,?,?,?)",
                         (ticket_id, j['hora'], j['seleccion'], j['monto'], j['tipo']))
             db.commit()
+        
+        # Generar texto para WhatsApp
         jpoh = defaultdict(list)
         for j in jugadas:
             if j['tipo']!='tripleta': jpoh[j['hora']].append(j)
+        
         lineas = [f"*{session['nombre_agencia']}*",
                   f"*TICKET:* #{ticket_id}",
-                  f"*SERIAL:* {serial}", fecha,
+                  f"*SERIAL:* {serial}", 
+                  fecha,
                   "------------------------",""]
+        
+        # Animales normales y especiales
         for hp in HORARIOS_PERU:
             if hp not in jpoh: continue
             idx = HORARIOS_PERU.index(hp)
@@ -352,20 +363,91 @@ def procesar_venta():
                     items.append(f"{n}{j['seleccion']}x{fmt(j['monto'])}")
                 else:
                     items.append(f"{j['seleccion'][0:3]}x{fmt(j['monto'])}")
-            lineas.append(" ".join(items)); lineas.append("")
+            lineas.append(" ".join(items))
+            lineas.append("")
+        
+        # Tripletas en el ticket
         trips_t = [j for j in jugadas if j['tipo']=='tripleta']
         if trips_t:
             lineas.append("*TRIPLETAS (Paga x60)*")
             for t in trips_t:
                 nums = t['seleccion'].split(',')
                 ns   = [ANIMALES.get(n,'')[0:3].upper() for n in nums]
-                lineas.append(f"{'-'.join(ns)} x60 S/{fmt(t['monto'])}")
+                # Mostrar números jugados explícitamente
+                nums_str = "-".join(nums)
+                lineas.append(f"🎯 {nums_str} ({'-'.join(ns)}) x60 S/{fmt(t['monto'])}")
             lineas.append("")
-        lineas += ["------------------------",f"*TOTAL: S/{fmt(total)}*","","Buena Suerte! 🍀","El ticket vence a los 3 dias"]
+        
+        lineas += ["------------------------",
+                   f"*TOTAL: S/{fmt(total)}*",
+                   "",
+                   "Buena Suerte! 🍀",
+                   "El ticket vence a los 3 dias"]
+        
         import urllib.parse
         texto = "\n".join(lineas)
         url_wa = f"https://wa.me/?text={urllib.parse.quote(texto)}"
-        return jsonify({'status':'ok','serial':serial,'ticket_id':ticket_id,'total':total,'url_whatsapp':url_wa})
+        
+        return jsonify({
+            'status':'ok',
+            'serial':serial,
+            'ticket_id':ticket_id,
+            'total':total,
+            'url_whatsapp':url_wa
+        })
+    except Exception as e:
+        return jsonify({'error':str(e)}),500
+
+@app.route('/api/repetir-ticket', methods=['POST'])
+@agencia_required
+def repetir_ticket():
+    """Obtiene datos de un ticket por serial para repetirlo"""
+    try:
+        serial = request.json.get('serial')
+        if not serial:
+            return jsonify({'error':'Serial requerido'}),400
+        
+        with get_db() as db:
+            t = db.execute("SELECT * FROM tickets WHERE serial=? AND agencia_id=?", 
+                          (serial, session['user_id'])).fetchone()
+            if not t:
+                return jsonify({'error':'Ticket no encontrado'}),404
+            
+            # Obtener jugadas
+            jugadas = db.execute("SELECT * FROM jugadas WHERE ticket_id=?", (t['id'],)).fetchall()
+            tripletas = db.execute("SELECT * FROM tripletas WHERE ticket_id=?", (t['id'],)).fetchall()
+            
+            jugadas_list = []
+            for j in jugadas:
+                jugadas_list.append({
+                    'tipo': j['tipo'],
+                    'hora': j['hora'],
+                    'seleccion': j['seleccion'],
+                    'monto': j['monto'],
+                    'nombre': ANIMALES.get(j['seleccion'], j['seleccion']) if j['tipo']=='animal' else j['seleccion']
+                })
+            
+            trips_list = []
+            for tr in tripletas:
+                trips_list.append({
+                    'tipo': 'tripleta',
+                    'animal1': tr['animal1'],
+                    'animal2': tr['animal2'],
+                    'animal3': tr['animal3'],
+                    'monto': tr['monto'],
+                    'seleccion': f"{tr['animal1']},{tr['animal2']},{tr['animal3']}"
+                })
+            
+            return jsonify({
+                'status': 'ok',
+                'ticket_original': {
+                    'serial': t['serial'],
+                    'fecha': t['fecha'],
+                    'total': t['total']
+                },
+                'jugadas': jugadas_list + trips_list
+            })
+            
     except Exception as e:
         return jsonify({'error':str(e)}),500
 
@@ -377,10 +459,13 @@ def mis_tickets():
         fi = data.get('fecha_inicio'); ff = data.get('fecha_fin'); est = data.get('estado','todos')
         dti = datetime.strptime(fi,"%Y-%m-%d") if fi else None
         dtf = datetime.strptime(ff,"%Y-%m-%d").replace(hour=23,minute=59) if ff else None
+        
         with get_db() as db:
-            rows = db.execute("SELECT * FROM tickets WHERE agencia_id=? AND anulado=0 ORDER BY id DESC LIMIT 500",(session['user_id'],)).fetchall()
+            rows = db.execute("SELECT * FROM tickets WHERE agencia_id=? AND anulado=0 ORDER BY id DESC LIMIT 500",
+                            (session['user_id'],)).fetchall()
             resultado_cache = {}
             tickets_out = []
+            
             for t in rows:
                 dt = parse_fecha(t['fecha'])
                 if not dt: continue
@@ -388,15 +473,19 @@ def mis_tickets():
                 if dtf and dt>dtf: continue
                 if est=='pagados' and not t['pagado']: continue
                 if est=='pendientes' and t['pagado']: continue
+                
                 fecha_str = dt.strftime("%d/%m/%Y")
                 if fecha_str not in resultado_cache:
                     rr = db.execute("SELECT hora,animal FROM resultados WHERE fecha=?",(fecha_str,)).fetchall()
                     resultado_cache[fecha_str] = {r['hora']:r['animal'] for r in rr}
+                
                 res_dia = resultado_cache[fecha_str]
                 jugadas_raw = db.execute("SELECT * FROM jugadas WHERE ticket_id=?",(t['id'],)).fetchall()
                 tripletas_raw = db.execute("SELECT * FROM tripletas WHERE ticket_id=?",(t['id'],)).fetchall()
+                
                 premio_total = 0
                 jugadas_det = []
+                
                 for j in jugadas_raw:
                     wa = res_dia.get(j['hora']); gano=False; pj=0
                     if wa:
@@ -404,30 +493,49 @@ def mis_tickets():
                             pj=calcular_premio_animal(j['monto'],wa); gano=True
                         elif j['tipo']=='especial' and str(wa) not in ["0","00"]:
                             sel,num=j['seleccion'],int(wa)
-                            if (sel=='ROJO' and str(wa) in ROJOS) or (sel=='NEGRO' and str(wa) not in ROJOS) or (sel=='PAR' and num%2==0) or (sel=='IMPAR' and num%2!=0):
+                            if (sel=='ROJO' and str(wa) in ROJOS) or \
+                               (sel=='NEGRO' and str(wa) not in ROJOS) or \
+                               (sel=='PAR' and num%2==0) or \
+                               (sel=='IMPAR' and num%2!=0):
                                 pj=j['monto']*PAGO_ESPECIAL; gano=True
                     if gano: premio_total+=pj
-                    jugadas_det.append({'tipo':j['tipo'],'hora':j['hora'],'seleccion':j['seleccion'],
+                    jugadas_det.append({
+                        'tipo':j['tipo'],'hora':j['hora'],'seleccion':j['seleccion'],
                         'nombre':ANIMALES.get(j['seleccion'],j['seleccion']) if j['tipo']=='animal' else j['seleccion'],
                         'monto':j['monto'],'resultado':wa,
                         'resultado_nombre':ANIMALES.get(str(wa),str(wa)) if wa else None,
-                        'gano':gano,'premio':round(pj,2)})
+                        'gano':gano,'premio':round(pj,2)
+                    })
+                
                 trips_det = []
                 for tr in tripletas_raw:
                     nums={tr['animal1'],tr['animal2'],tr['animal3']}
                     salidos=list(dict.fromkeys([a for a in res_dia.values() if a in nums]))
                     gano_t=len(salidos)==3; pt=tr['monto']*PAGO_TRIPLETA if gano_t else 0
                     if gano_t: premio_total+=pt
-                    trips_det.append({'animal1':tr['animal1'],'nombre1':ANIMALES.get(tr['animal1'],tr['animal1']),
+                    trips_det.append({
+                        'animal1':tr['animal1'],'nombre1':ANIMALES.get(tr['animal1'],tr['animal1']),
                         'animal2':tr['animal2'],'nombre2':ANIMALES.get(tr['animal2'],tr['animal2']),
                         'animal3':tr['animal3'],'nombre3':ANIMALES.get(tr['animal3'],tr['animal3']),
-                        'monto':tr['monto'],'salieron':salidos,'gano':gano_t,'premio':round(pt,2),'pagado':bool(tr['pagado'])})
+                        'monto':tr['monto'],'salieron':salidos,'gano':gano_t,'premio':round(pt,2),
+                        'pagado':bool(tr['pagado'])
+                    })
+                
                 if est=='por_pagar' and (t['pagado'] or premio_total==0): continue
-                tickets_out.append({'id':t['id'],'serial':t['serial'],'fecha':t['fecha'],
-                    'total':t['total'],'pagado':bool(t['pagado']),'premio_calculado':round(premio_total,2),
-                    'jugadas':jugadas_det,'tripletas':trips_det})
+                
+                tickets_out.append({
+                    'id':t['id'],'serial':t['serial'],'fecha':t['fecha'],
+                    'total':t['total'],'pagado':bool(t['pagado']),
+                    'premio_calculado':round(premio_total,2),
+                    'jugadas':jugadas_det,'tripletas':trips_det
+                })
+        
         tv = sum(t['total'] for t in tickets_out)
-        return jsonify({'status':'ok','tickets':tickets_out,'totales':{'cantidad':len(tickets_out),'ventas':round(tv,2)}})
+        return jsonify({
+            'status':'ok',
+            'tickets':tickets_out,
+            'totales':{'cantidad':len(tickets_out),'ventas':round(tv,2)}
+        })
     except Exception as e:
         return jsonify({'error':str(e)}),500
 
@@ -437,11 +545,14 @@ def consultar_ticket_detalle():
     try:
         serial = (request.get_json() or {}).get('serial')
         if not serial: return jsonify({'error':'Serial requerido'}),400
+        
         with get_db() as db:
             if session.get('es_admin'):
                 t = db.execute("SELECT * FROM tickets WHERE serial=?",(serial,)).fetchone()
             else:
-                t = db.execute("SELECT * FROM tickets WHERE serial=? AND agencia_id=?",(serial,session['user_id'])).fetchone()
+                t = db.execute("SELECT * FROM tickets WHERE serial=? AND agencia_id=?",
+                              (serial,session['user_id'])).fetchone()
+            
             if not t: return jsonify({'error':'Ticket no encontrado'})
             t = dict(t)
             fecha_str = parse_fecha(t['fecha']).strftime("%d/%m/%Y")
@@ -449,6 +560,7 @@ def consultar_ticket_detalle():
             res_dia = {r['hora']:r['animal'] for r in res_rows}
             jugadas_raw = db.execute("SELECT * FROM jugadas WHERE ticket_id=?",(t['id'],)).fetchall()
             tripletas_raw = db.execute("SELECT * FROM tripletas WHERE ticket_id=?",(t['id'],)).fetchall()
+        
         premio_total=0; jdet=[]
         for j in jugadas_raw:
             wa=res_dia.get(j['hora']); gano=False; pj=0
@@ -457,28 +569,44 @@ def consultar_ticket_detalle():
                     pj=calcular_premio_animal(j['monto'],wa); gano=True
                 elif j['tipo']=='especial' and str(wa) not in ["0","00"]:
                     sel,num=j['seleccion'],int(wa)
-                    if (sel=='ROJO' and str(wa) in ROJOS) or (sel=='NEGRO' and str(wa) not in ROJOS) or (sel=='PAR' and num%2==0) or (sel=='IMPAR' and num%2!=0):
+                    if (sel=='ROJO' and str(wa) in ROJOS) or \
+                       (sel=='NEGRO' and str(wa) not in ROJOS) or \
+                       (sel=='PAR' and num%2==0) or \
+                       (sel=='IMPAR' and num%2!=0):
                         pj=j['monto']*PAGO_ESPECIAL; gano=True
             if gano: premio_total+=pj
-            jdet.append({'tipo':j['tipo'],'hora':j['hora'],'seleccion':j['seleccion'],
+            jdet.append({
+                'tipo':j['tipo'],'hora':j['hora'],'seleccion':j['seleccion'],
                 'nombre_seleccion':ANIMALES.get(j['seleccion'],j['seleccion']) if j['tipo']=='animal' else j['seleccion'],
                 'monto':j['monto'],'resultado':wa,
                 'resultado_nombre':ANIMALES.get(str(wa),str(wa)) if wa else None,
-                'gano':gano,'premio':round(pj,2)})
+                'gano':gano,'premio':round(pj,2)
+            })
+        
         tdet=[]
         for tr in tripletas_raw:
             nums={tr['animal1'],tr['animal2'],tr['animal3']}
             salidos=list(dict.fromkeys([a for a in res_dia.values() if a in nums]))
             gano_t=len(salidos)==3; pt=tr['monto']*PAGO_TRIPLETA if gano_t else 0
             if gano_t: premio_total+=pt
-            tdet.append({'tipo':'tripleta','animal1':tr['animal1'],'nombre1':ANIMALES.get(tr['animal1'],''),
+            tdet.append({
+                'tipo':'tripleta',
+                'animal1':tr['animal1'],'nombre1':ANIMALES.get(tr['animal1'],''),
                 'animal2':tr['animal2'],'nombre2':ANIMALES.get(tr['animal2'],''),
                 'animal3':tr['animal3'],'nombre3':ANIMALES.get(tr['animal3'],''),
-                'monto':tr['monto'],'salieron':salidos,'gano':gano_t,'premio':round(pt,2),'pagado':bool(tr['pagado'])})
-        return jsonify({'status':'ok',
-            'ticket':{'id':t['id'],'serial':t['serial'],'fecha':t['fecha'],
-                'total_apostado':t['total'],'pagado':bool(t['pagado']),'anulado':bool(t['anulado']),'premio_total':round(premio_total,2)},
-            'jugadas':jdet,'tripletas':tdet})
+                'monto':tr['monto'],'salieron':salidos,'gano':gano_t,
+                'premio':round(pt,2),'pagado':bool(tr['pagado'])
+            })
+        
+        return jsonify({
+            'status':'ok',
+            'ticket':{
+                'id':t['id'],'serial':t['serial'],'fecha':t['fecha'],
+                'total_apostado':t['total'],'pagado':bool(t['pagado']),
+                'anulado':bool(t['anulado']),'premio_total':round(premio_total,2)
+            },
+            'jugadas':jdet,'tripletas':tdet
+        })
     except Exception as e:
         return jsonify({'error':str(e)}),500
 
@@ -524,19 +652,33 @@ def anular_ticket():
         with get_db() as db:
             t = db.execute("SELECT * FROM tickets WHERE serial=?",(serial,)).fetchone()
             if not t: return jsonify({'error':'Ticket no existe'})
+            
+            # Verificar permisos
             if not session.get('es_admin') and t['agencia_id']!=session['user_id']:
                 return jsonify({'error':'No autorizado'})
-            if t['pagado']: return jsonify({'error':'Ya pagado, no se puede anular'})
+            
+            if t['pagado']: 
+                return jsonify({'error':'Ya pagado, no se puede anular'})
+            
+            if t['anulado']:
+                return jsonify({'error':'Ticket ya estaba anulado'})
+            
+            # Verificar tiempo solo para agencias (admin puede anular siempre)
             if not session.get('es_admin'):
                 dt = parse_fecha(t['fecha'])
                 if dt and (ahora_peru()-dt).total_seconds()/60 > 5:
                     return jsonify({'error':'Solo puede anular dentro de 5 minutos'})
+                
+                # Verificar que sorteos no hayan cerrado
                 jugs = db.execute("SELECT hora FROM jugadas WHERE ticket_id=?",(t['id'],)).fetchall()
                 for j in jugs:
                     if not puede_vender(j['hora']):
-                        return jsonify({'error':f"Sorteo {j['hora']} ya cerró"})
+                        return jsonify({'error':f"Sorteo {j['hora']} ya cerró (2 min antes)"})
+            
+            # Anular ticket
             db.execute("UPDATE tickets SET anulado=1 WHERE id=?",(t['id'],))
             db.commit()
+            
         return jsonify({'status':'ok','mensaje':'Ticket anulado correctamente'})
     except Exception as e:
         return jsonify({'error':str(e)}),500
@@ -547,18 +689,28 @@ def caja_agencia():
     try:
         hoy = ahora_peru().strftime("%d/%m/%Y")
         with get_db() as db:
-            tickets = db.execute("SELECT * FROM tickets WHERE agencia_id=? AND anulado=0 AND fecha LIKE ?",(session['user_id'], hoy+'%')).fetchall()
+            tickets = db.execute("SELECT * FROM tickets WHERE agencia_id=? AND anulado=0 AND fecha LIKE ?",
+                                (session['user_id'], hoy+'%')).fetchall()
             ag = db.execute("SELECT comision FROM agencias WHERE id=?",(session['user_id'],)).fetchone()
             com_pct = ag['comision'] if ag else COMISION_AGENCIA
+            
             ventas=0; premios_pagados=0; pendientes=0
             for t in tickets:
                 ventas += t['total']
                 p = calcular_premio_ticket(t['id'],db)
-                if t['pagado']: premios_pagados+=p
-                elif p>0: pendientes+=1
-        return jsonify({'ventas':round(ventas,2),'premios':round(premios_pagados,2),
-            'comision':round(ventas*com_pct,2),'balance':round(ventas-premios_pagados-ventas*com_pct,2),
-            'tickets_pendientes':pendientes,'total_tickets':len(tickets)})
+                if t['pagado']: 
+                    premios_pagados+=p
+                elif p>0: 
+                    pendientes+=1
+        
+        return jsonify({
+            'ventas':round(ventas,2),
+            'premios':round(premios_pagados,2),
+            'comision':round(ventas*com_pct,2),
+            'balance':round(ventas-premios_pagados-ventas*com_pct,2),
+            'tickets_pendientes':pendientes,
+            'total_tickets':len(tickets)
+        })
     except Exception as e:
         return jsonify({'error':str(e)}),500
 
@@ -569,32 +721,59 @@ def caja_historico():
         data = request.get_json()
         fi,ff = data.get('fecha_inicio'), data.get('fecha_fin')
         if not fi or not ff: return jsonify({'error':'Fechas requeridas'}),400
+        
         dti = datetime.strptime(fi,"%Y-%m-%d")
         dtf = datetime.strptime(ff,"%Y-%m-%d").replace(hour=23,minute=59)
+        
         with get_db() as db:
             ag = db.execute("SELECT comision FROM agencias WHERE id=?",(session['user_id'],)).fetchone()
             com_pct = ag['comision'] if ag else COMISION_AGENCIA
-            tickets = db.execute("SELECT * FROM tickets WHERE agencia_id=? AND anulado=0 ORDER BY id DESC LIMIT 2000",(session['user_id'],)).fetchall()
+            tickets = db.execute("SELECT * FROM tickets WHERE agencia_id=? AND anulado=0 ORDER BY id DESC LIMIT 2000",
+                                (session['user_id'],)).fetchall()
+        
         dias={}; tv=0; tp=0
         for t in tickets:
             dt=parse_fecha(t['fecha'])
             if not dt or dt<dti or dt>dtf: continue
             dk=dt.strftime("%d/%m/%Y")
-            if dk not in dias: dias[dk]={'ventas':0,'tickets':0,'premios':0}
-            dias[dk]['ventas']+=t['total']; dias[dk]['tickets']+=1; tv+=t['total']
-            with get_db() as db2: p=calcular_premio_ticket(t['id'],db2)
-            if t['pagado']: dias[dk]['premios']+=p; tp+=p
+            if dk not in dias: 
+                dias[dk]={'ventas':0,'tickets':0,'premios':0}
+            dias[dk]['ventas']+=t['total']
+            dias[dk]['tickets']+=1
+            tv+=t['total']
+            with get_db() as db2: 
+                p=calcular_premio_ticket(t['id'],db2)
+            if t['pagado']: 
+                dias[dk]['premios']+=p
+                tp+=p
+        
         resumen=[]
         for dk in sorted(dias.keys()):
-            d=dias[dk]; cd=d['ventas']*com_pct
-            resumen.append({'fecha':dk,'tickets':d['tickets'],'ventas':round(d['ventas'],2),
-                'premios':round(d['premios'],2),'comision':round(cd,2),'balance':round(d['ventas']-d['premios']-cd,2)})
+            d=dias[dk]
+            cd=d['ventas']*com_pct
+            resumen.append({
+                'fecha':dk,
+                'tickets':d['tickets'],
+                'ventas':round(d['ventas'],2),
+                'premios':round(d['premios'],2),
+                'comision':round(cd,2),
+                'balance':round(d['ventas']-d['premios']-cd,2)
+            })
+        
         tc=tv*com_pct
-        return jsonify({'resumen_por_dia':resumen,
-            'totales':{'ventas':round(tv,2),'premios':round(tp,2),'comision':round(tc,2),'balance':round(tv-tp-tc,2)}})
+        return jsonify({
+            'resumen_por_dia':resumen,
+            'totales':{
+                'ventas':round(tv,2),
+                'premios':round(tp,2),
+                'comision':round(tc,2),
+                'balance':round(tv-tp-tc,2)
+            }
+        })
     except Exception as e:
         return jsonify({'error':str(e)}),500
 
+# ========== ADMIN ROUTES ==========
 @app.route('/admin/guardar-resultado', methods=['POST'])
 @admin_required
 def guardar_resultado():
@@ -602,16 +781,30 @@ def guardar_resultado():
         hora = request.form.get('hora','').strip()
         animal = request.form.get('animal','').strip()
         fi = request.form.get('fecha','').strip()
-        if animal not in ANIMALES: return jsonify({'error':f'Animal inválido'}),400
+        
+        if animal not in ANIMALES: 
+            return jsonify({'error':'Animal inválido'}),400
+        
         if fi:
-            try: fecha = datetime.strptime(fi,"%Y-%m-%d").strftime("%d/%m/%Y")
-            except: fecha = ahora_peru().strftime("%d/%m/%Y")
+            try: 
+                fecha = datetime.strptime(fi,"%Y-%m-%d").strftime("%d/%m/%Y")
+            except: 
+                fecha = ahora_peru().strftime("%d/%m/%Y")
         else:
             fecha = ahora_peru().strftime("%d/%m/%Y")
+        
         with get_db() as db:
-            db.execute("INSERT INTO resultados (fecha,hora,animal) VALUES (?,?,?) ON CONFLICT(fecha,hora) DO UPDATE SET animal=excluded.animal",(fecha, hora, animal))
+            db.execute("""
+                INSERT INTO resultados (fecha,hora,animal) VALUES (?,?,?) 
+                ON CONFLICT(fecha,hora) DO UPDATE SET animal=excluded.animal
+            """,(fecha, hora, animal))
             db.commit()
-        return jsonify({'status':'ok','mensaje':f'Resultado: {hora} = {animal} ({ANIMALES[animal]})','fecha':fecha})
+        
+        return jsonify({
+            'status':'ok',
+            'mensaje':f'Resultado: {hora} = {animal} ({ANIMALES[animal]})',
+            'fecha':fecha
+        })
     except Exception as e:
         return jsonify({'error':str(e)}),500
 
@@ -620,13 +813,18 @@ def guardar_resultado():
 def resultados_fecha_admin():
     data = request.get_json() or {}
     fs = data.get('fecha')
-    try: fecha_str = datetime.strptime(fs,"%Y-%m-%d").strftime("%d/%m/%Y")
-    except: fecha_str = ahora_peru().strftime("%d/%m/%Y")
+    try: 
+        fecha_str = datetime.strptime(fs,"%Y-%m-%d").strftime("%d/%m/%Y")
+    except: 
+        fecha_str = ahora_peru().strftime("%d/%m/%Y")
+    
     with get_db() as db:
         rows = db.execute("SELECT hora,animal FROM resultados WHERE fecha=?",(fecha_str,)).fetchall()
+    
     rd={r['hora']:{'animal':r['animal'],'nombre':ANIMALES.get(r['animal'],'?')} for r in rows}
     for h in HORARIOS_PERU:
         if h not in rd: rd[h]=None
+    
     return jsonify({'status':'ok','fecha_consulta':fecha_str,'resultados':rd})
 
 @app.route('/admin/lista-agencias')
@@ -643,12 +841,20 @@ def crear_agencia():
         u = request.form.get('usuario','').strip().lower()
         p = request.form.get('password','').strip()
         n = request.form.get('nombre','').strip()
-        if not u or not p or not n: return jsonify({'error':'Complete todos los campos'}),400
+        
+        if not u or not p or not n: 
+            return jsonify({'error':'Complete todos los campos'}),400
+        
         with get_db() as db:
             ex = db.execute("SELECT id FROM agencias WHERE usuario=?",(u,)).fetchone()
-            if ex: return jsonify({'error':'Usuario ya existe'}),400
-            db.execute("INSERT INTO agencias (usuario,password,nombre_agencia,es_admin,comision,activa) VALUES (?,?,?,0,?,1)",(u,p,n,COMISION_AGENCIA))
+            if ex: 
+                return jsonify({'error':'Usuario ya existe'}),400
+            db.execute("""
+                INSERT INTO agencias (usuario,password,nombre_agencia,es_admin,comision,activa) 
+                VALUES (?,?,?,0,?,1)
+            """,(u,p,n,COMISION_AGENCIA))
             db.commit()
+        
         return jsonify({'status':'ok','mensaje':f'Agencia {n} creada'})
     except Exception as e:
         return jsonify({'error':str(e)}),500
@@ -659,6 +865,7 @@ def editar_agencia():
     try:
         data = request.get_json() or {}
         aid = data.get('id')
+        
         with get_db() as db:
             if 'password' in data and data['password']:
                 db.execute("UPDATE agencias SET password=? WHERE id=? AND es_admin=0",(data['password'],aid))
@@ -667,6 +874,7 @@ def editar_agencia():
             if 'activa' in data:
                 db.execute("UPDATE agencias SET activa=? WHERE id=? AND es_admin=0",(1 if data['activa'] else 0,aid))
             db.commit()
+        
         return jsonify({'status':'ok'})
     except Exception as e:
         return jsonify({'error':str(e)}),500
@@ -679,18 +887,37 @@ def reporte_agencias():
         with get_db() as db:
             ags = db.execute("SELECT * FROM agencias WHERE es_admin=0").fetchall()
             tickets = db.execute("SELECT * FROM tickets WHERE anulado=0 AND fecha LIKE ?",(hoy+'%',)).fetchall()
+        
         data=[]; tv=tp=tc=0
         for ag in ags:
             mts=[t for t in tickets if t['agencia_id']==ag['id']]
             ventas=sum(t['total'] for t in mts); pp=0
             for t in mts:
-                with get_db() as db2: p=calcular_premio_ticket(t['id'],db2)
-                if t['pagado']: pp+=p
+                with get_db() as db2: 
+                    p=calcular_premio_ticket(t['id'],db2)
+                if t['pagado']: 
+                    pp+=p
             com=ventas*ag['comision']
-            data.append({'nombre':ag['nombre_agencia'],'usuario':ag['usuario'],'ventas':round(ventas,2),
-                'premios_pagados':round(pp,2),'comision':round(com,2),'balance':round(ventas-pp-com,2),'tickets':len(mts)})
+            data.append({
+                'nombre':ag['nombre_agencia'],
+                'usuario':ag['usuario'],
+                'ventas':round(ventas,2),
+                'premios_pagados':round(pp,2),
+                'comision':round(com,2),
+                'balance':round(ventas-pp-com,2),
+                'tickets':len(mts)
+            })
             tv+=ventas; tp+=pp; tc+=com
-        return jsonify({'agencias':data,'global':{'ventas':round(tv,2),'pagos':round(tp,2),'comisiones':round(tc,2),'balance':round(tv-tp-tc,2)}})
+        
+        return jsonify({
+            'agencias':data,
+            'global':{
+                'ventas':round(tv,2),
+                'pagos':round(tp,2),
+                'comisiones':round(tc,2),
+                'balance':round(tv-tp-tc,2)
+            }
+        })
     except Exception as e:
         return jsonify({'error':str(e)}),500
 
@@ -699,28 +926,58 @@ def reporte_agencias():
 def riesgo():
     try:
         hoy=ahora_peru().strftime("%d/%m/%Y")
-        now=ahora_peru(); am=now.hour*60+now.minute
+        now=ahora_peru(); 
+        am=now.hour*60+now.minute
+        
+        # Encontrar sorteo objetivo (próximo a cerrar en 2 min o actual)
         sorteo=None
         for h in HORARIOS_PERU:
             m=hora_a_min(h)
-            if am>=m and am<m+60: sorteo=h; break
+            # Si estamos dentro de la hora o menos de 2 min antes
+            if am >= m-2 and am < m+60:
+                sorteo=h
+                break
+        
         if not sorteo:
+            # Buscar próximo sorteo
             for h in HORARIOS_PERU:
-                if (hora_a_min(h)-am)>MINUTOS_BLOQUEO: sorteo=h; break
-        if not sorteo: sorteo=HORARIOS_PERU[-1]
+                if (hora_a_min(h)-am) > MINUTOS_BLOQUEO:
+                    sorteo=h
+                    break
+        
+        if not sorteo: 
+            sorteo=HORARIOS_PERU[-1]
+        
         with get_db() as db:
             tickets=db.execute("SELECT id FROM tickets WHERE anulado=0 AND fecha LIKE ?",(hoy+'%',)).fetchall()
+        
         apuestas={}; total=0
         for t in tickets:
             with get_db() as db:
-                jugs=db.execute("SELECT * FROM jugadas WHERE ticket_id=? AND tipo='animal' AND hora=?",(t['id'],sorteo)).fetchall()
+                jugs=db.execute("""
+                    SELECT * FROM jugadas 
+                    WHERE ticket_id=? AND tipo='animal' AND hora=?
+                """,(t['id'],sorteo)).fetchall()
             for j in jugs:
-                apuestas[j['seleccion']]=apuestas.get(j['seleccion'],0)+j['monto']; total+=j['monto']
+                apuestas[j['seleccion']]=apuestas.get(j['seleccion'],0)+j['monto']
+                total+=j['monto']
+        
         riesgo_d={}
         for sel,monto in sorted(apuestas.items(),key=lambda x:x[1],reverse=True):
             mult=PAGO_LECHUZA if sel=="40" else PAGO_ANIMAL_NORMAL
-            riesgo_d[f"{sel} - {ANIMALES.get(sel,sel)}"]={'apostado':round(monto,2),'pagaria':round(monto*mult,2),'es_lechuza':sel=="40",'porcentaje':round(monto/total*100,1) if total>0 else 0}
-        return jsonify({'riesgo':riesgo_d,'sorteo_objetivo':sorteo,'total_apostado':round(total,2)})
+            riesgo_d[f"{sel} - {ANIMALES.get(sel,sel)}"]={
+                'apostado':round(monto,2),
+                'pagaria':round(monto*mult,2),
+                'es_lechuza':sel=="40",
+                'porcentaje':round(monto/total*100,1) if total>0 else 0
+            }
+        
+        return jsonify({
+            'riesgo':riesgo_d,
+            'sorteo_objetivo':sorteo,
+            'total_apostado':round(total,2),
+            'minutos_cierre': MINUTOS_BLOQUEO
+        })
     except Exception as e:
         return jsonify({'error':str(e)}),500
 
@@ -730,21 +987,42 @@ def tripletas_hoy():
     try:
         hoy=ahora_peru().strftime("%d/%m/%Y")
         with get_db() as db:
-            trips=db.execute("SELECT tr.*,tk.serial,tk.agencia_id FROM tripletas tr JOIN tickets tk ON tr.ticket_id=tk.id WHERE tr.fecha=?",(hoy,)).fetchall()
+            trips=db.execute("""
+                SELECT tr.*,tk.serial,tk.agencia_id 
+                FROM tripletas tr 
+                JOIN tickets tk ON tr.ticket_id=tk.id 
+                WHERE tr.fecha=?
+            """,(hoy,)).fetchall()
             res_rows=db.execute("SELECT hora,animal FROM resultados WHERE fecha=?",(hoy,)).fetchall()
             res_dia={r['hora']:r['animal'] for r in res_rows}
             ags={ag['id']:ag['nombre_agencia'] for ag in db.execute("SELECT id,nombre_agencia FROM agencias").fetchall()}
+        
         out=[]; ganadoras=0
         for tr in trips:
             nums={tr['animal1'],tr['animal2'],tr['animal3']}
             salidos=list(dict.fromkeys([a for a in res_dia.values() if a in nums]))
             gano=len(salidos)==3
-            if gano: ganadoras+=1
-            out.append({'id':tr['id'],'serial':tr['serial'],'agencia':ags.get(tr['agencia_id'],'?'),
+            if gano: 
+                ganadoras+=1
+            out.append({
+                'id':tr['id'],
+                'serial':tr['serial'],
+                'agencia':ags.get(tr['agencia_id'],'?'),
                 'animal1':tr['animal1'],'animal2':tr['animal2'],'animal3':tr['animal3'],
                 'nombres':[ANIMALES.get(tr['animal1'],''),ANIMALES.get(tr['animal2'],''),ANIMALES.get(tr['animal3'],'')],
-                'monto':tr['monto'],'premio':tr['monto']*PAGO_TRIPLETA if gano else 0,'gano':gano,'salieron':salidos,'pagado':bool(tr['pagado'])})
-        return jsonify({'tripletas':out,'total':len(out),'ganadoras':ganadoras,'total_premios':sum(x['premio'] for x in out)})
+                'monto':tr['monto'],
+                'premio':tr['monto']*PAGO_TRIPLETA if gano else 0,
+                'gano':gano,
+                'salieron':salidos,
+                'pagado':bool(tr['pagado'])
+            })
+        
+        return jsonify({
+            'tripletas':out,
+            'total':len(out),
+            'ganadoras':ganadoras,
+            'total_premios':sum(x['premio'] for x in out)
+        })
     except Exception as e:
         return jsonify({'error':str(e)}),500
 
@@ -752,32 +1030,199 @@ def tripletas_hoy():
 @admin_required
 def exportar_csv():
     try:
-        data=request.get_json(); fi=data.get('fecha_inicio'); ff=data.get('fecha_fin')
-        dti=datetime.strptime(fi,"%Y-%m-%d"); dtf=datetime.strptime(ff,"%Y-%m-%d").replace(hour=23,minute=59)
+        data=request.get_json(); 
+        fi=data.get('fecha_inicio'); 
+        ff=data.get('fecha_fin')
+        dti=datetime.strptime(fi,"%Y-%m-%d")
+        dtf=datetime.strptime(ff,"%Y-%m-%d").replace(hour=23,minute=59)
+        
         with get_db() as db:
             ags=db.execute("SELECT * FROM agencias WHERE es_admin=0").fetchall()
             all_t=db.execute("SELECT * FROM tickets WHERE anulado=0 ORDER BY id DESC LIMIT 50000").fetchall()
-        stats={ag['id']:{'nombre':ag['nombre_agencia'],'usuario':ag['usuario'],'tickets':0,'ventas':0,'premios':0,'comision_pct':ag['comision']} for ag in ags}
+        
+        stats={ag['id']:{
+            'nombre':ag['nombre_agencia'],
+            'usuario':ag['usuario'],
+            'tickets':0,
+            'ventas':0,
+            'premios':0,
+            'comision_pct':ag['comision']
+        } for ag in ags}
+        
         for t in all_t:
             dt=parse_fecha(t['fecha'])
             if not dt or dt<dti or dt>dtf: continue
             aid=t['agencia_id']
             if aid not in stats: continue
-            stats[aid]['tickets']+=1; stats[aid]['ventas']+=t['total']
+            stats[aid]['tickets']+=1
+            stats[aid]['ventas']+=t['total']
             if t['pagado']:
-                with get_db() as db2: stats[aid]['premios']+=calcular_premio_ticket(t['id'],db2)
-        out=io.StringIO(); w=csv.writer(out)
-        w.writerow(['REPORTE ZOOLO CASINO']); w.writerow([f'Periodo: {fi} al {ff}']); w.writerow([])
+                with get_db() as db2: 
+                    stats[aid]['premios']+=calcular_premio_ticket(t['id'],db2)
+        
+        out=io.StringIO(); 
+        w=csv.writer(out)
+        w.writerow(['REPORTE ZOOLO CASINO'])
+        w.writerow([f'Periodo: {fi} al {ff}'])
+        w.writerow([])
         w.writerow(['Agencia','Usuario','Tickets','Ventas','Premios','Comision','Balance'])
+        
         tv=0
         for s in sorted(stats.values(),key=lambda x:x['ventas'],reverse=True):
             if s['tickets']==0: continue
             com=s['ventas']*s['comision_pct']
-            w.writerow([s['nombre'],s['usuario'],s['tickets'],round(s['ventas'],2),round(s['premios'],2),round(com,2),round(s['ventas']-s['premios']-com,2)])
+            w.writerow([
+                s['nombre'],
+                s['usuario'],
+                s['tickets'],
+                round(s['ventas'],2),
+                round(s['premios'],2),
+                round(com,2),
+                round(s['ventas']-s['premios']-com,2)
+            ])
             tv+=s['ventas']
-        w.writerow([]); w.writerow(['TOTAL','',sum(s['tickets'] for s in stats.values()),round(tv,2),'','',''])
+        
+        w.writerow([])
+        w.writerow(['TOTAL','',sum(s['tickets'] for s in stats.values()),round(tv,2),'','',''])
         out.seek(0)
-        return Response(out.getvalue(),mimetype='text/csv',headers={'Content-Disposition':f'attachment; filename=reporte_{fi}_{ff}.csv'})
+        
+        return Response(
+            out.getvalue(),
+            mimetype='text/csv',
+            headers={'Content-Disposition':f'attachment; filename=reporte_{fi}_{ff}.csv'}
+        )
+    except Exception as e:
+        return jsonify({'error':str(e)}),500
+
+@app.route('/admin/estadisticas-rango', methods=['POST'])
+@admin_required
+def estadisticas_rango():
+    try:
+        data=request.get_json()
+        fi=data.get('fecha_inicio')
+        ff=data.get('fecha_fin')
+        if not fi or not ff: 
+            return jsonify({'error':'Fechas requeridas'}),400
+        
+        dti=datetime.strptime(fi,"%Y-%m-%d")
+        dtf=datetime.strptime(ff,"%Y-%m-%d").replace(hour=23,minute=59)
+        
+        with get_db() as db:
+            all_t=db.execute("SELECT * FROM tickets WHERE anulado=0 ORDER BY id DESC LIMIT 10000").fetchall()
+        
+        dias={}; total_v=total_p=total_t=0
+        for t in all_t:
+            dt=parse_fecha(t['fecha'])
+            if not dt or dt<dti or dt>dtf: continue
+            dk=dt.strftime("%d/%m/%Y")
+            if dk not in dias: 
+                dias[dk]={'ventas':0,'tickets':0,'ids':[]}
+            dias[dk]['ventas']+=t['total']
+            dias[dk]['tickets']+=1
+            dias[dk]['ids'].append(t['id'])
+            total_v+=t['total']
+            total_t+=1
+        
+        resumen=[]
+        total_p=0
+        for dk in sorted(dias.keys()):
+            d=dias[dk]
+            prem=0
+            for tid in d['ids']:
+                with get_db() as db2: 
+                    prem+=calcular_premio_ticket(tid,db2)
+            total_p+=prem
+            cd=d['ventas']*COMISION_AGENCIA
+            resumen.append({
+                'fecha':dk,
+                'ventas':round(d['ventas'],2),
+                'premios':round(prem,2),
+                'comisiones':round(cd,2),
+                'balance':round(d['ventas']-prem-cd,2),
+                'tickets':d['tickets']
+            })
+        
+        tc=total_v*COMISION_AGENCIA
+        return jsonify({
+            'resumen_por_dia':resumen,
+            'totales':{
+                'ventas':round(total_v,2),
+                'premios':round(total_p,2),
+                'comisiones':round(tc,2),
+                'balance':round(total_v-total_p-tc,2),
+                'tickets':total_t
+            }
+        })
+    except Exception as e:
+        return jsonify({'error':str(e)}),500
+
+@app.route('/admin/reporte-agencias-rango', methods=['POST'])
+@admin_required
+def reporte_agencias_rango():
+    try:
+        data=request.get_json()
+        fi=data.get('fecha_inicio')
+        ff=data.get('fecha_fin')
+        if not fi or not ff: 
+            return jsonify({'error':'Fechas requeridas'}),400
+        
+        dti=datetime.strptime(fi,"%Y-%m-%d")
+        dtf=datetime.strptime(ff,"%Y-%m-%d").replace(hour=23,minute=59)
+        
+        with get_db() as db:
+            ags=db.execute("SELECT * FROM agencias WHERE es_admin=0").fetchall()
+            all_t=db.execute("SELECT * FROM tickets WHERE anulado=0 ORDER BY id DESC LIMIT 50000").fetchall()
+        
+        stats={ag['id']:{
+            'nombre':ag['nombre_agencia'],
+            'usuario':ag['usuario'],
+            'tickets':0,
+            'ventas':0,
+            'premios_teoricos':0,
+            'comision_pct':ag['comision']
+        } for ag in ags}
+        
+        for t in all_t:
+            dt=parse_fecha(t['fecha'])
+            if not dt or dt<dti or dt>dtf: continue
+            aid=t['agencia_id']
+            if aid not in stats: continue
+            stats[aid]['tickets']+=1
+            stats[aid]['ventas']+=t['total']
+            with get_db() as db2: 
+                p=calcular_premio_ticket(t['id'],db2)
+            stats[aid]['premios_teoricos']+=p
+        
+        out=[]
+        for s in stats.values():
+            if s['tickets']==0: continue
+            com=s['ventas']*s['comision_pct']
+            s['comision']=round(com,2)
+            s['balance']=round(s['ventas']-s['premios_teoricos']-com,2)
+            s['ventas']=round(s['ventas'],2)
+            s['premios_teoricos']=round(s['premios_teoricos'],2)
+            out.append(s)
+        
+        out.sort(key=lambda x:x['ventas'],reverse=True)
+        tv=sum(x['ventas'] for x in out)
+        
+        if tv>0:
+            for x in out: 
+                x['porcentaje_ventas']=round(x['ventas']/tv*100,1)
+        
+        total={
+            'tickets':sum(x['tickets'] for x in out),
+            'ventas':round(tv,2),
+            'premios':round(sum(x['premios_teoricos'] for x in out),2),
+            'comision':round(sum(x['comision'] for x in out),2),
+            'balance':round(sum(x['balance'] for x in out),2)
+        }
+        
+        return jsonify({
+            'agencias':out,
+            'total':total,
+            'periodo':{'inicio':fi,'fin':ff}
+        })
     except Exception as e:
         return jsonify({'error':str(e)}),500
 
@@ -814,7 +1259,6 @@ body{background:#050a12;min-height:100vh;display:flex;align-items:center;justify
 </form>
 </div></body></html>'''
 
-
 POS_HTML = r'''<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8">
@@ -835,7 +1279,7 @@ POS_HTML = r'''<!DOCTYPE html>
 html,body{height:100%;overflow:hidden}
 body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;font-size:14px;display:flex;flex-direction:column}
 
-/* ===== TOPBAR ===== */
+/* TOPBAR */
 .topbar{background:#0d1428;border-bottom:2px solid #f5a623;padding:0 10px;height:36px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
 .brand{font-family:'Oswald',sans-serif;font-size:1rem;font-weight:700;letter-spacing:2px;color:#fff}
 .brand em{color:var(--gold);font-style:normal}
@@ -847,13 +1291,13 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 .tbtn.exit{background:#8b1515;color:#fff}
 .tbtn.exit:hover{background:#b01818}
 
-/* ===== LAYOUT PRINCIPAL ===== */
+/* LAYOUT */
 .layout{display:flex;flex:1;overflow:hidden;gap:0}
 
-/* ===== PANEL IZQUIERDO — ANIMALES ===== */
+/* PANEL IZQUIERDO — ANIMALES */
 .left-panel{display:flex;flex-direction:column;width:62%;border-right:2px solid var(--border);overflow:hidden}
 
-/* Especiales arriba */
+/* ESPECIALES */
 .especiales-bar{display:flex;gap:4px;padding:5px 6px;background:var(--panel);border-bottom:1px solid var(--border);flex-shrink:0}
 .esp-btn{flex:1;padding:7px 4px;text-align:center;border-radius:4px;cursor:pointer;font-family:'Oswald',sans-serif;font-size:.78rem;font-weight:700;letter-spacing:1px;border:2px solid transparent;transition:all .15s}
 .esp-btn.rojo{background:#cc1a1a;border-color:#ff2a2a;color:#fff}
@@ -869,50 +1313,47 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 .esp-btn.impar.sel{background:#8030c0;border-color:#c060ff;box-shadow:0 0 12px rgba(160,80,240,.5)}
 .esp-btn.impar:hover{background:#7a28b0;border-color:#b050e8}
 
-/* Grid animales */
+/* JUGADA MANUAL */
+.manual-box{padding:6px;background:#0a1020;border-bottom:2px solid #1a3060}
+.manual-input{width:100%;padding:8px;background:#060e1e;border:2px solid #2a5080;border-radius:4px;color:#fbbf24;font-family:'Oswald',sans-serif;font-size:1rem;letter-spacing:1px;text-transform:uppercase}
+.manual-input:focus{outline:none;border-color:#00c8e8;box-shadow:0 0 8px rgba(0,200,232,.2)}
+.manual-label{color:#4a6090;font-size:.65rem;font-family:'Oswald',sans-serif;letter-spacing:2px;margin-bottom:4px;display:flex;justify-content:space-between}
+.manual-label span{color:#f5a623}
+
+/* GRID ANIMALES */
 .animals-scroll{flex:1;overflow-y:auto;padding:4px 5px}
 .animals-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:3px}
 
-/* Celda animal */
+/* CELDA ANIMAL */
 .acard{border-radius:4px;padding:3px 2px 2px;text-align:center;cursor:pointer;transition:all .12s;border:2px solid transparent;position:relative;overflow:hidden}
 .acard:active{transform:scale(.92)}
-
-/* VERDE */
 .acard.cv{background:#0d5c1e;border-color:#16a34a}
 .acard.cv .anum{color:#bbf7d0}
 .acard.cv .anom{color:#86efac}
 .acard.cv:hover{background:#157028;border-color:#22c55e}
 .acard.cv.sel{background:#15803d;border-color:#4ade80;box-shadow:0 0 8px rgba(34,197,94,.5)}
-
-/* ROJO */
 .acard.cr{background:#8b1a1a;border-color:#dc2626}
 .acard.cr .anum{color:#fecaca}
 .acard.cr .anom{color:#fca5a5}
 .acard.cr:hover{background:#a81f1f;border-color:#ef4444}
 .acard.cr.sel{background:#b91c1c;border-color:#ff4444;box-shadow:0 0 8px rgba(220,38,38,.5)}
-
-/* NEGRO */
 .acard.cn{background:#162040;border-color:#2a4080}
 .acard.cn .anum{color:#bfdbfe}
 .acard.cn .anom{color:#93c5fd}
 .acard.cn:hover{background:#1e2a58;border-color:#3b60b0}
 .acard.cn.sel{background:#1e3a6a;border-color:#60a0ff;box-shadow:0 0 8px rgba(96,160,255,.5)}
-
-/* LECHUZA (40) */
 .acard.cl{background:#6b4a08;border-color:#d97706}
 .acard.cl .anum{color:#fef3c7}
 .acard.cl .anom{color:#fde68a}
 .acard.cl:hover{background:#845c0a;border-color:#f59e0b}
 .acard.cl.sel{background:#92400e;border-color:#fbbf24;box-shadow:0 0 10px rgba(245,166,35,.5)}
-
 .acard.sel::after{content:'✓';position:absolute;top:0;right:2px;font-size:.55rem;color:rgba(255,255,255,.8);font-weight:700}
 .anum{font-size:.85rem;font-weight:700;font-family:'Oswald',sans-serif;line-height:1}
 .anom{font-size:.52rem;line-height:1;margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
-/* ===== PANEL DERECHO — CONTROLES ===== */
+/* PANEL DERECHO */
 .right-panel{width:38%;display:flex;flex-direction:column;overflow-y:auto;background:var(--panel)}
 
-/* SECCION */
 .rsec{padding:5px 8px;border-bottom:1px solid var(--border)}
 .rlabel{font-family:'Oswald',sans-serif;font-size:.65rem;font-weight:600;color:var(--text2);letter-spacing:2px;text-transform:uppercase;margin-bottom:4px}
 
@@ -973,6 +1414,8 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 .abtn.anular:hover{background:#b91c1c;border-color:#ff6060}
 .abtn.borrar{background:#7c2d12;border-color:#f97316}
 .abtn.borrar:hover{background:#9a3412;border-color:#fb923c}
+.abtn.rep{background:#1e40af;border-color:#3b82f6}
+.abtn.rep:hover{background:#2563eb;border-color:#60a5fa}
 .abtn.salir{background:#7f1d1d;border-color:#dc2626}
 .abtn.salir:hover{background:#991b1b;border-color:#ef4444}
 
@@ -1016,7 +1459,7 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 .cgv{color:#fbbf24;font-size:1.1rem;font-weight:700;font-family:'Oswald',sans-serif}
 .cgv.g{color:#4ade80}.cgv.r{color:#f87171}
 
-/* TRIPLETA MODAL ESPECIFICO */
+/* TRIPLETA MODAL */
 .trip-slots{display:flex;gap:8px;margin-bottom:12px}
 .tslot{flex:1;background:#1a0a40;border:2px solid #5020a0;border-radius:4px;padding:8px;text-align:center;cursor:pointer;min-height:50px;display:flex;flex-direction:column;align-items:center;justify-content:center;transition:all .15s}
 .tslot.act{border-color:#c060ff;box-shadow:0 0 12px rgba(180,80,255,.5);background:#280a60}
@@ -1038,7 +1481,13 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 ::-webkit-scrollbar-thumb{background:#1a2540;border-radius:2px}
 ::-webkit-scrollbar-thumb:hover{background:var(--blue)}
 
-/* RESPONSIVE MOBILE */
+/* REPETIR MODAL */
+.rep-info{background:#0a1a30;border:1px solid #1a4a80;border-radius:4px;padding:10px;margin-bottom:12px;font-size:.8rem;color:#80b0e0}
+.rep-item{display:flex;align-items:center;gap:8px;padding:6px;background:#060c1a;border-radius:3px;margin-bottom:6px;border:1px solid #1a2a40}
+.rep-item select{flex:1;padding:6px;background:#0a1828;border:1px solid #2a4a80;color:#fbbf24;font-family:'Rajdhani',sans-serif;font-size:.85rem}
+.rep-item input[type="number"]{width:80px;padding:6px;background:#0a1828;border:1px solid #d97706;color:#fbbf24;font-family:'Oswald',sans-serif;text-align:center}
+
+/* RESPONSIVE */
 @media(max-width:599px){
   html,body{overflow:auto}
   .layout{flex-direction:column}
@@ -1071,7 +1520,7 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 <!-- LAYOUT -->
 <div class="layout">
 
-  <!-- ===== IZQUIERDA: ESPECIALES + ANIMALES ===== -->
+  <!-- IZQUIERDA: ESPECIALES + MANUAL + ANIMALES -->
   <div class="left-panel">
 
     <!-- ESPECIALES -->
@@ -1082,6 +1531,15 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
       <div class="esp-btn impar" id="esp-IMPAR" onclick="selEsp('IMPAR')">IMPAR</div>
     </div>
 
+    <!-- JUGADA MANUAL -->
+    <div class="manual-box">
+      <div class="manual-label">
+        <span>📝 JUGADA MANUAL (pegar números)</span>
+        <span style="font-size:.6rem;color:#4a6090">Ej: 2.25.36.14.11</span>
+      </div>
+      <input type="text" class="manual-input" id="manual-input" placeholder="2.25.36.14.11" onpaste="handleManualPaste(event)" onkeyup="handleManualKeyup(event)">
+    </div>
+
     <!-- GRID ANIMALES -->
     <div class="animals-scroll">
       <div class="animals-grid" id="animals-grid"></div>
@@ -1089,12 +1547,12 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 
   </div>
 
-  <!-- ===== DERECHA: CONTROLES ===== -->
+  <!-- DERECHA: CONTROLES -->
   <div class="right-panel">
 
     <!-- HORARIOS -->
     <div class="rsec">
-      <div class="rlabel">⏰ Horarios</div>
+      <div class="rlabel">⏰ Horarios (Cierra 2min antes)</div>
       <div class="horas-grid" id="horas-grid"></div>
       <div class="horas-btns-row">
         <button class="hsel-btn" onclick="selTodos()">☑ Todos</button>
@@ -1142,39 +1600,52 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
       </div>
       <div class="btns-row2">
         <div class="abtn trip" onclick="openTripletaModal()">🎯 TRIPLETA</div>
+        <div class="abtn rep" onclick="openRepetirModal()">🔄 REPETIR</div>
         <div class="abtn borrar" onclick="borrarTodo()">🗑 BORRAR</div>
-        <div class="abtn salir" onclick="location.href='/logout'">🚪 SALIR</div>
       </div>
     </div>
 
   </div>
-</div><!-- /layout -->
+</div>
 
 <div class="toast" id="toast"></div>
 
-<!-- ====== MODALES ====== -->
+<!-- MODALES -->
 
-<!-- TRIPLETA JUEGO MODAL -->
+<!-- REPETIR TICKET -->
+<div class="modal" id="mod-repetir">
+<div class="mc">
+  <div class="mh">
+    <h3>🔄 REPETIR TICKET</h3>
+    <button class="btn-close" onclick="closeMod('mod-repetir')">✕</button>
+  </div>
+  <div class="mbody">
+    <div class="frow">
+      <input type="text" id="rep-serial" placeholder="Serial del ticket" style="flex:2">
+      <button class="btn-q" onclick="cargarTicketRepetir()" style="flex:1;margin:0">CARGAR</button>
+    </div>
+    <div id="rep-contenido"></div>
+  </div>
+</div></div>
+
+<!-- TRIPLETA -->
 <div class="modal" id="mod-tripleta">
 <div class="mc">
   <div class="mh">
-    <h3>🎯 JUGAR TRIPLETA x60</h3>
+    <h3>🎯 JUGAR TRIPLETA x60 (9AM-6PM)</h3>
     <button class="btn-close" onclick="closeMod('mod-tripleta')">✕</button>
   </div>
   <div class="mbody">
-    <div style="color:var(--text2);font-size:.75rem;margin-bottom:10px;text-align:center">Selecciona 3 animales diferentes</div>
+    <div style="color:var(--text2);font-size:.75rem;margin-bottom:10px;text-align:center">Válida solo para hoy - Sorteos 9AM a 6PM</div>
     
-    <!-- Slots -->
     <div class="trip-slots">
       <div class="tslot act" id="tms0" onclick="activarSlotModal(0)"><div class="sph">ANIMAL 1</div></div>
       <div class="tslot" id="tms1" onclick="activarSlotModal(1)"><div class="sph">ANIMAL 2</div></div>
       <div class="tslot" id="tms2" onclick="activarSlotModal(2)"><div class="sph">ANIMAL 3</div></div>
     </div>
     
-    <!-- Grilla animales para tripleta -->
     <div class="trip-modal-grid" id="trip-modal-grid"></div>
     
-    <!-- Monto específico para tripleta -->
     <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
       <div style="color:var(--purple);font-size:.75rem;margin-bottom:6px;font-family:'Oswald',sans-serif;letter-spacing:1px">MONTO PARA TRIPLETA</div>
       <div class="monto-input-wrap">
@@ -1202,7 +1673,7 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
   </div>
 </div></div>
 
-<!-- CONSULTAS (tickets) -->
+<!-- CONSULTAS -->
 <div class="modal" id="mod-consultas">
 <div class="mc">
   <div class="mh"><h3>📋 CONSULTAS</h3><button class="btn-close" onclick="closeMod('mod-consultas')">✕</button></div>
@@ -1278,20 +1749,19 @@ let horasSel = [];
 let animalesSel = [];
 let espSel = null;
 let horasBloq = [];
-
-// Variables para modal de tripleta
 let tripSlotModal = 0;
 let tripAnimModal = [null, null, null];
 
-// ===== INIT =====
+// INIT
 function init(){
   renderAnimales();
   renderHoras();
-  renderTripModalGrid(); // Prepara la grilla del modal (oculta)
+  renderTripModalGrid();
   actualizarBloq();
   setInterval(actualizarBloq, 30000);
   setInterval(actualizarClock, 1000);
   actualizarClock();
+  
   let hoy = new Date().toISOString().split('T')[0];
   ['res-fecha','mt-ini','mt-fin','ar-ini','ar-fin'].forEach(id=>{
     let el=document.getElementById(id); if(el) el.value=hoy;
@@ -1314,7 +1784,7 @@ function actualizarBloq(){
   }).catch(()=>{});
 }
 
-// ===== COLORES =====
+// COLORES
 function getCardClass(k){
   if(k==='40') return 'cl';
   let c = COLORES[k];
@@ -1323,7 +1793,7 @@ function getCardClass(k){
   return 'cn';
 }
 
-// ===== ANIMALES =====
+// ANIMALES GRID
 function renderAnimales(){
   let g = document.getElementById('animals-grid');
   g.innerHTML = '';
@@ -1340,22 +1810,78 @@ function renderAnimales(){
 
 function toggleAnimal(k, el){
   let i = animalesSel.indexOf(k);
-  if(i>=0){ animalesSel.splice(i,1); el.classList.remove('sel'); }
-  else { animalesSel.push(k); el.classList.add('sel'); }
+  if(i>=0){ 
+    animalesSel.splice(i,1); 
+    el.classList.remove('sel'); 
+  } else { 
+    animalesSel.push(k); 
+    el.classList.add('sel'); 
+  }
 }
 
-// ===== ESPECIALES =====
+// JUGADA MANUAL
+function handleManualPaste(e){
+  e.preventDefault();
+  let texto = (e.clipboardData || window.clipboardData).getData('text');
+  procesarManual(texto);
+}
+
+function handleManualKeyup(e){
+  if(e.key==='Enter'){
+    procesarManual(e.target.value);
+    e.target.value='';
+  }
+}
+
+function procesarManual(texto){
+  // Limpiar y separar por puntos, comas, espacios o saltos de línea
+  let nums = texto.split(/[.,;\s\n]+/).map(x=>x.trim()).filter(x=>x!=='');
+  let validos = [];
+  
+  nums.forEach(n=>{
+    // Normalizar: 00, 0, 1-40
+    let num = n.replace(/^0+(?=\d)/,''); // quitar ceros a la izquierda excepto si es 0
+    if(num==='') num='0';
+    
+    // Verificar si existe en ANIMALES
+    if(ANIMALES[num]!==undefined && !validos.includes(num)){
+      validos.push(num);
+    }
+  });
+  
+  if(validos.length===0){
+    toast('No se encontraron números válidos','err');
+    return;
+  }
+  
+  // Seleccionar en el grid
+  validos.forEach(k=>{
+    if(!animalesSel.includes(k)){
+      animalesSel.push(k);
+      let card = document.querySelector(`.acard[data-k="${k}"]`);
+      if(card) card.classList.add('sel');
+    }
+  });
+  
+  toast(`Seleccionados: ${validos.join(', ')}`,'ok');
+  document.getElementById('manual-input').value='';
+}
+
+// ESPECIALES
 function selEsp(v){
-  if(espSel===v){ espSel=null; document.getElementById('esp-'+v).classList.remove('sel'); }
-  else {
+  if(espSel===v){ 
+    espSel=null; 
+    document.getElementById('esp-'+v).classList.remove('sel'); 
+  } else {
     if(espSel) document.getElementById('esp-'+espSel).classList.remove('sel');
     espSel=v;
-    animalesSel=[]; document.querySelectorAll('.animals-grid .acard').forEach(c=>c.classList.remove('sel'));
+    animalesSel=[]; 
+    document.querySelectorAll('.animals-grid .acard').forEach(c=>c.classList.remove('sel'));
     document.getElementById('esp-'+v).classList.add('sel');
   }
 }
 
-// ===== HORARIOS =====
+// HORARIOS
 function renderHoras(){
   let g = document.getElementById('horas-grid'); g.innerHTML='';
   HPERU.forEach((h,i)=>{
@@ -1365,19 +1891,30 @@ function renderHoras(){
     let sel = horasSel.includes(h);
     if(bloq) b.classList.add('bloq');
     if(sel) b.classList.add('sel');
-    let hp = h.replace(':00',''); let hv = HVEN[i].replace(':00','');
+    let hp = h.replace(':00',''); 
+    let hv = HVEN[i].replace(':00','');
     b.innerHTML = `<div class="hperu">${hp}</div><div class="hven">VE:${hv}</div>`;
     if(!bloq) b.onclick = ()=>toggleH(h);
     g.appendChild(b);
   });
 }
-function toggleH(h){ let i=horasSel.indexOf(h); if(i>=0) horasSel.splice(i,1); else horasSel.push(h); renderHoras(); }
-function selTodos(){ horasSel=HPERU.filter(h=>!horasBloq.includes(h)); renderHoras(); }
-function limpiarH(){ horasSel=[]; renderHoras(); }
+function toggleH(h){ 
+  let i=horasSel.indexOf(h); 
+  if(i>=0) horasSel.splice(i,1); 
+  else horasSel.push(h); 
+  renderHoras(); 
+}
+function selTodos(){ 
+  horasSel=HPERU.filter(h=>!horasBloq.includes(h)); 
+  renderHoras(); 
+}
+function limpiarH(){ 
+  horasSel=[]; 
+  renderHoras(); 
+}
 
-// ===== TRIPLETA MODAL =====
+// TRIPLETA MODAL
 function openTripletaModal(){
-  // Resetear selección
   tripAnimModal = [null, null, null];
   tripSlotModal = 0;
   actualizarSlotsModal();
@@ -1404,7 +1941,6 @@ function activarSlotModal(i){
 }
 
 function selTripAnimModal(k){
-  // Verificar si ya está en otro slot
   let otro = tripAnimModal.findIndex((x,idx)=>x===k && idx!==tripSlotModal);
   if(otro>=0){ 
     toast('Animal ya seleccionado en otro slot','err'); 
@@ -1412,7 +1948,6 @@ function selTripAnimModal(k){
   }
   tripAnimModal[tripSlotModal] = k;
   actualizarSlotsModal();
-  // Avanzar automáticamente al siguiente slot vacío
   if(tripSlotModal < 2){
     let nextEmpty = tripAnimModal.findIndex(x=>x===null, tripSlotModal+1);
     if(nextEmpty === -1) nextEmpty = tripSlotModal+1;
@@ -1447,17 +1982,127 @@ function agregarTripletaModal(){
   
   let sel = tripAnimModal.join(',');
   let desc = tripAnimModal.map(n=>n+'-'+ANIMALES[n].substring(0,4)).join(' ');
-  carrito.push({tipo:'tripleta',hora:'TODO DÍA',seleccion:sel,monto,desc:'🎯 '+desc});
+  carrito.push({tipo:'tripleta',hora:'TODO DÍA (9AM-6PM)',seleccion:sel,monto,desc:'🎯 '+desc});
   
   renderCarrito();
   closeMod('mod-tripleta');
-  toast('Tripleta agregada al ticket','ok');
+  toast('Tripleta agregada (válida 9AM-6PM)','ok');
 }
 
-// ===== MONTO =====
+// REPETIR TICKET
+function openRepetirModal(){
+  document.getElementById('rep-serial').value='';
+  document.getElementById('rep-contenido').innerHTML='';
+  openMod('mod-repetir');
+}
+
+function cargarTicketRepetir(){
+  let serial = document.getElementById('rep-serial').value.trim();
+  if(!serial){ toast('Ingrese serial','err'); return; }
+  
+  fetch('/api/repetir-ticket',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({serial:serial})
+  })
+  .then(r=>r.json())
+  .then(d=>{
+    if(d.error){
+      toast(d.error,'err');
+      return;
+    }
+    mostrarEditorRepetir(d);
+  })
+  .catch(()=>toast('Error al cargar ticket','err'));
+}
+
+function mostrarEditorRepetir(data){
+  let html = `<div class="rep-info">
+    <div>📋 Ticket Original: <b>${data.ticket_original.serial}</b></div>
+    <div>💰 Total Original: S/${data.ticket_original.total}</div>
+    <div style="margin-top:8px;color:#f5a623">Modifique horarios y montos antes de agregar:</div>
+  </div>`;
+  
+  data.jugadas.forEach((j,idx)=>{
+    if(j.tipo==='tripleta'){
+      html += `<div class="rep-item">
+        <span style="color:#c084fc;font-family:'Oswald',sans-serif;min-width:60px">🎯 TRIP</span>
+        <span style="flex:1;color:#e0a0ff">${j.animal1}-${j.animal2}-${j.animal3}</span>
+        <input type="number" id="rep-m-${idx}" value="${j.monto}" min="0.5" step="0.5">
+        <button class="btn-close" style="padding:4px 8px;font-size:.7rem" onclick="agregarItemRepetir(${idx},'tripleta','${j.animal1},${j.animal2},${j.animal3}')">➕</button>
+      </div>`;
+    } else {
+      let horaOpts = HPERU.map(h=>{
+        let bloq = horasBloq.includes(h);
+        return `<option value="${h}" ${bloq?'disabled':''}>${h}${bloq?' (CERRADO)':''}</option>`;
+      }).join('');
+      
+      html += `<div class="rep-item">
+        <span style="color:${j.tipo==='animal'?'#4ade80':'#60a5fa'};font-family:'Oswald',sans-serif;min-width:60px">${j.tipo==='animal'?'🐾':'🎲'} ${j.seleccion}</span>
+        <select id="rep-h-${idx}">${horaOpts}</select>
+        <input type="number" id="rep-m-${idx}" value="${j.monto}" min="0.5" step="0.5">
+        <button class="btn-close" style="padding:4px 8px;font-size:.7rem" onclick="agregarItemRepetir(${idx},'${j.tipo}','${j.seleccion}')">➕</button>
+      </div>`;
+    }
+  });
+  
+  html += `<button class="btn-q" onclick="agregarTodoRepetir()" style="margin-top:12px;background:#166534;border-color:#22c55e">AGREGAR TODO AL TICKET</button>`;
+  
+  document.getElementById('rep-contenido').innerHTML = html;
+  
+  // Seleccionar horarios originales donde estén disponibles
+  data.jugadas.forEach((j,idx)=>{
+    if(j.tipo!=='tripleta'){
+      let sel = document.getElementById(`rep-h-${idx}`);
+      if(sel){
+        for(let opt of sel.options){
+          if(opt.value===j.hora && !opt.disabled){
+            sel.value = j.hora;
+            break;
+          }
+        }
+      }
+    }
+  });
+}
+
+function agregarItemRepetir(idx, tipo, seleccion){
+  let monto = parseFloat(document.getElementById(`rep-m-${idx}`).value)||0;
+  if(monto<=0){ toast('Monto inválido','err'); return; }
+  
+  if(tipo==='tripleta'){
+    let nums = seleccion.split(',');
+    let desc = nums.map(n=>n+'-'+ANIMALES[n].substring(0,4)).join(' ');
+    carrito.push({tipo:'tripleta',hora:'TODO DÍA (9AM-6PM)',seleccion:seleccion,monto,desc:'🎯 '+desc});
+    toast('Tripleta agregada','ok');
+  } else {
+    let hora = document.getElementById(`rep-h-${idx}`).value;
+    if(!hora){ toast('Seleccione horario','err'); return; }
+    if(horasBloq.includes(hora)){ toast('Ese horario ya cerró','err'); return; }
+    
+    let nombre = tipo==='animal' ? ANIMALES[seleccion] : seleccion;
+    carrito.push({
+      tipo:tipo,
+      hora:hora,
+      seleccion:seleccion,
+      monto:monto,
+      desc: tipo==='animal' ? `${seleccion}-${nombre}` : `🎲 ${seleccion}`
+    });
+    toast('Jugada agregada','ok');
+  }
+  renderCarrito();
+}
+
+function agregarTodoRepetir(){
+  // Simular clicks en todos los botones +
+  let btns = document.querySelectorAll('#rep-contenido .rep-item button');
+  btns.forEach(btn=>btn.click());
+}
+
+// MONTO
 function setM(v){ document.getElementById('monto').value=v; }
 
-// ===== AGREGAR =====
+// AGREGAR
 function agregar(){
   let monto = parseFloat(document.getElementById('monto').value)||0;
   if(monto<=0){ toast('Monto inválido','err'); return; }
@@ -1469,34 +2114,46 @@ function agregar(){
       let labels={'ROJO':'🔴 ROJO','NEGRO':'⚫ NEGRO','PAR':'🔵 PAR','IMPAR':'🟡 IMPAR'};
       carrito.push({tipo:'especial',hora:h,seleccion:espSel,monto,desc:labels[espSel]+' x2'});
     });
-    renderCarrito(); toast('Especial(es) agregado','ok'); return;
+    renderCarrito(); 
+    toast('Especial(es) agregado','ok'); 
+    return;
   }
 
   // Animal
   if(animalesSel.length===0){ toast('Seleccione animal(es)','err'); return; }
   if(horasSel.length===0){ toast('Seleccione horario(s)','err'); return; }
+  
   horasSel.forEach(h=>{
     animalesSel.forEach(k=>{
       carrito.push({tipo:'animal',hora:h,seleccion:k,monto,desc:`${k}-${ANIMALES[k]}`});
     });
   });
-  renderCarrito(); toast(`${animalesSel.length * horasSel.length} jugada(s) agregada(s)`,'ok');
+  
+  // Limpiar selección de animales después de agregar
+  animalesSel=[];
+  document.querySelectorAll('.animals-grid .acard').forEach(c=>c.classList.remove('sel'));
+  document.getElementById('manual-input').value='';
+  
+  renderCarrito(); 
+  toast(`${animalesSel.length * horasSel.length} jugada(s) agregada(s)`,'ok');
 }
 
-// ===== CARRITO =====
+// CARRITO
 function renderCarrito(){
   let list=document.getElementById('ticket-list');
   let tot=document.getElementById('ticket-total');
   document.getElementById('btn-wa').disabled = carrito.length===0;
+  
   if(!carrito.length){
     list.innerHTML='<div class="ticket-empty">TICKET VACÍO</div>';
-    tot.style.display='none'; return;
+    tot.style.display='none'; 
+    return;
   }
+  
   let html='', total=0;
   carrito.forEach((it,i)=>{
     total+=it.monto;
-    let idx=HPERU.indexOf(it.hora);
-    let horaLabel=it.hora==='TODO DÍA'?'x60':it.hora.replace(':00','').replace(' ','');
+    let horaLabel=it.hora==='TODO DÍA (9AM-6PM)'?'x60':it.hora.replace(':00','').replace(' ','');
     html+=`<div class="ti">
       <span class="ti-hora">${horaLabel}</span>
       <span class="ti-desc">${it.desc}</span>
@@ -1504,29 +2161,46 @@ function renderCarrito(){
       <button class="ti-del" onclick="quitarItem(${i})">✕</button>
     </div>`;
   });
+  
   list.innerHTML=html;
   tot.style.display='block';
   tot.textContent=`TOTAL: S/ ${total.toFixed(2)}`;
 }
 
 function quitarItem(i){ carrito.splice(i,1); renderCarrito(); }
-function borrarTodo(){ carrito=[]; renderCarrito(); toast('Ticket borrado','err'); }
+function borrarTodo(){ 
+  carrito=[]; 
+  animalesSel=[];
+  espSel=null;
+  document.querySelectorAll('.acard').forEach(c=>c.classList.remove('sel'));
+  document.querySelectorAll('.esp-btn').forEach(e=>e.classList.remove('sel'));
+  renderCarrito(); 
+  toast('Ticket borrado','err'); 
+}
 
-// ===== VENDER =====
+// VENDER
 async function vender(){
   if(!carrito.length){ toast('Ticket vacío','err'); return; }
+  
   let btn=document.getElementById('btn-wa');
-  btn.disabled=true; btn.textContent='⏳ PROCESANDO...';
+  btn.disabled=true; 
+  btn.textContent='⏳ PROCESANDO...';
+  
   try{
-    let r=await fetch('/api/procesar-venta',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({jugadas:carrito.map(c=>({hora:c.hora,seleccion:c.seleccion,monto:c.monto,tipo:c.tipo}))})});
+    let r=await fetch('/api/procesar-venta',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({jugadas:carrito.map(c=>({hora:c.hora,seleccion:c.seleccion,monto:c.monto,tipo:c.tipo}))})
+    });
     let d=await r.json();
-    if(d.error){ toast(d.error,'err'); }
-    else{
+    
+    if(d.error){ 
+      toast(d.error,'err'); 
+    } else {
       window.open(d.url_whatsapp,'_blank');
       toast(`✅ Ticket #${d.ticket_id} generado!`,'ok');
       
-      // LIMPIAR TODO PARA NUEVO TICKET - CORRECCIÓN APLICADA
+      // LIMPIAR TODO
       carrito=[];
       animalesSel=[];
       if(espSel){
@@ -1534,22 +2208,30 @@ async function vender(){
         espSel=null;
       }
       horasSel=[];
+      document.getElementById('manual-input').value='';
       renderCarrito();
       renderAnimales();
       renderHoras();
     }
-  }catch(e){ toast('Error de conexión','err'); }
-  finally{ btn.disabled=false; btn.textContent='📤 ENVIAR POR WHATSAPP'; }
+  } catch(e){ 
+    toast('Error de conexión','err'); 
+  } finally{ 
+    btn.disabled=false; 
+    btn.textContent='📤 ENVIAR POR WHATSAPP'; 
+  }
 }
 
-// ===== RESULTADOS =====
+// RESULTADOS
 function openResultados(){ openMod('mod-resultados'); }
 function cargarResultados(){
-  let f=document.getElementById('res-fecha').value; if(!f)return;
+  let f=document.getElementById('res-fecha').value; 
+  if(!f)return;
   let c=document.getElementById('res-lista');
   c.innerHTML='<p style="color:var(--text2);text-align:center;padding:10px;font-size:.75rem;letter-spacing:2px">CARGANDO...</p>';
+  
   fetch('/api/resultados-fecha',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:f})})
-  .then(r=>r.json()).then(d=>{
+  .then(r=>r.json())
+  .then(d=>{
     let fd=new Date(f+'T00:00:00');
     document.getElementById('res-titulo').textContent=fd.toLocaleDateString('es-PE',{weekday:'long',day:'numeric',month:'long'}).toUpperCase();
     let html='';
@@ -1562,23 +2244,40 @@ function cargarResultados(){
       </div>`;
     });
     c.innerHTML=html;
-  }).catch(()=>{c.innerHTML='<p style="color:var(--red);text-align:center">Error</p>';});
+  })
+  .catch(()=>{c.innerHTML='<p style="color:var(--red);text-align:center">Error</p>';});
 }
 
-// ===== CONSULTAS =====
+// CONSULTAS
 function consultarTickets(){
   let ini=document.getElementById('mt-ini').value;
   let fin=document.getElementById('mt-fin').value;
   let est=document.getElementById('mt-estado').value;
   if(!ini||!fin){ toast('Seleccione fechas','err'); return; }
+  
   let lista=document.getElementById('mt-lista');
   lista.innerHTML='<p style="color:#6090c0;text-align:center;padding:15px;font-size:.75rem;letter-spacing:2px">CARGANDO...</p>';
-  fetch('/api/mis-tickets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin,estado:est})})
-  .then(r=>r.json()).then(d=>{
-    if(d.error){lista.innerHTML=`<p style="color:#f87171;text-align:center">${d.error}</p>`;return;}
-    let res=document.getElementById('mt-resumen'); res.style.display='block';
+  
+  fetch('/api/mis-tickets',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin,estado:est})
+  })
+  .then(r=>r.json())
+  .then(d=>{
+    if(d.error){
+      lista.innerHTML=`<p style="color:#f87171;text-align:center">${d.error}</p>`;
+      return;
+    }
+    let res=document.getElementById('mt-resumen'); 
+    res.style.display='block';
     res.textContent=`${d.totales.cantidad} TICKET(S) — TOTAL: S/ ${d.totales.ventas.toFixed(2)}`;
-    if(!d.tickets.length){lista.innerHTML='<p style="color:#4a6090;text-align:center;padding:20px;font-size:.75rem;letter-spacing:2px">SIN RESULTADOS</p>';return;}
+    
+    if(!d.tickets.length){
+      lista.innerHTML='<p style="color:#4a6090;text-align:center;padding:20px;font-size:.75rem;letter-spacing:2px">SIN RESULTADOS</p>';
+      return;
+    }
+    
     let html='';
     d.tickets.forEach((t)=>{
       let bc=t.pagado?'p':(t.premio_calculado>0?'g':'n');
@@ -1650,18 +2349,26 @@ function consultarTickets(){
       </div>`;
     });
     lista.innerHTML=html;
-  }).catch(()=>{lista.innerHTML='<p style="color:#f87171;text-align:center">Error de conexión</p>';});
+  })
+  .catch(()=>{lista.innerHTML='<p style="color:#f87171;text-align:center">Error de conexión</p>';});
 }
 
-// ===== ARCHIVO/CAJA HISTÓRICO =====
+// ARCHIVO/CAJA HISTÓRICO
 function cajaHist(){
   let ini=document.getElementById('ar-ini').value;
   let fin=document.getElementById('ar-fin').value;
   if(!ini||!fin){ toast('Seleccione fechas','err'); return; }
+  
   let c=document.getElementById('ar-res');
   c.innerHTML='<p style="color:var(--text2);text-align:center;padding:10px;font-size:.75rem;letter-spacing:2px">CARGANDO...</p>';
-  fetch('/api/caja-historico',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin})})
-  .then(r=>r.json()).then(d=>{
+  
+  fetch('/api/caja-historico',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin})
+  })
+  .then(r=>r.json())
+  .then(d=>{
     if(d.error){c.innerHTML=`<p style="color:var(--red)">${d.error}</p>`;return;}
     let html='<div class="sbox">';
     d.resumen_por_dia.forEach(dia=>{
@@ -1682,7 +2389,7 @@ function cajaHist(){
   });
 }
 
-// ===== CAJA HOY =====
+// CAJA HOY
 function openCaja(){
   openMod('mod-caja');
   fetch('/api/caja').then(r=>r.json()).then(d=>{
@@ -1702,14 +2409,25 @@ function openCaja(){
   });
 }
 
-// ===== PAGAR =====
-function openPagar(){ openMod('mod-pagar'); document.getElementById('pag-serial').value=''; document.getElementById('pag-res').innerHTML=''; }
+// PAGAR
+function openPagar(){ 
+  openMod('mod-pagar'); 
+  document.getElementById('pag-serial').value=''; 
+  document.getElementById('pag-res').innerHTML=''; 
+}
+
 function verificarTicket(){
-  let s=document.getElementById('pag-serial').value.trim(); if(!s)return;
+  let s=document.getElementById('pag-serial').value.trim(); 
+  if(!s)return;
+  
   let c=document.getElementById('pag-res');
   fetch('/api/verificar-ticket',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({serial:s})})
-  .then(r=>r.json()).then(d=>{
-    if(d.error){c.innerHTML=`<div style="background:var(--red-bg);color:var(--red);padding:10px;border-radius:3px;text-align:center;margin-top:8px;border:1px solid var(--red-border)">❌ ${d.error}</div>`;return;}
+  .then(r=>r.json())
+  .then(d=>{
+    if(d.error){
+      c.innerHTML=`<div style="background:var(--red-bg);color:var(--red);padding:10px;border-radius:3px;text-align:center;margin-top:8px;border:1px solid var(--red-border)">❌ ${d.error}</div>`;
+      return;
+    }
     let col=d.total_ganado>0?'var(--green)':'var(--text2)';
     c.innerHTML=`<div style="border:1px solid ${col};border-radius:4px;padding:14px;margin-top:10px">
       <div style="color:var(--teal);font-family:'Oswald',sans-serif;letter-spacing:2px;margin-bottom:10px">TICKET #${s}</div>
@@ -1721,38 +2439,57 @@ function verificarTicket(){
     </div>`;
   });
 }
+
 function pagarTicket(tid,m){
   if(!confirm(`¿Confirmar pago S/${m}?`))return;
   fetch('/api/pagar-ticket',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ticket_id:tid})})
-  .then(r=>r.json()).then(d=>{
-    if(d.status==='ok'){toast('✅ Ticket pagado','ok');closeMod('mod-pagar');}
-    else toast(d.error||'Error','err');
+  .then(r=>r.json())
+  .then(d=>{
+    if(d.status==='ok'){
+      toast('✅ Ticket pagado','ok');
+      closeMod('mod-pagar');
+    } else {
+      toast(d.error||'Error','err');
+    }
   });
 }
 
-// ===== ANULAR =====
-function openAnular(){ openMod('mod-anular'); document.getElementById('an-serial').value=''; document.getElementById('an-res').innerHTML=''; }
+// ANULAR
+function openAnular(){ 
+  openMod('mod-anular'); 
+  document.getElementById('an-serial').value=''; 
+  document.getElementById('an-res').innerHTML=''; 
+}
+
 function anularTicket(){
-  let s=document.getElementById('an-serial').value.trim(); if(!s)return;
+  let s=document.getElementById('an-serial').value.trim(); 
+  if(!s)return;
+  
   fetch('/api/anular-ticket',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({serial:s})})
-  .then(r=>r.json()).then(d=>{
+  .then(r=>r.json())
+  .then(d=>{
     let c=document.getElementById('an-res');
-    if(d.status==='ok') c.innerHTML=`<div style="background:#062012;color:var(--green);padding:10px;border-radius:3px;text-align:center;margin-top:8px;border:1px solid #0d5a2a">✅ ${d.mensaje}</div>`;
-    else c.innerHTML=`<div style="background:var(--red-bg);color:var(--red);padding:10px;border-radius:3px;text-align:center;margin-top:8px;border:1px solid var(--red-border)">❌ ${d.error}</div>`;
+    if(d.status==='ok') {
+      c.innerHTML=`<div style="background:#062012;color:var(--green);padding:10px;border-radius:3px;text-align:center;margin-top:8px;border:1px solid #0d5a2a">✅ ${d.mensaje}</div>`;
+    } else {
+      c.innerHTML=`<div style="background:var(--red-bg);color:var(--red);padding:10px;border-radius:3px;text-align:center;margin-top:8px;border:1px solid var(--red-border)">❌ ${d.error}</div>`;
+    }
   });
 }
 
-// ===== MODAL =====
+// MODAL
 function openMod(id){ document.getElementById(id).classList.add('open'); }
 function closeMod(id){ document.getElementById(id).classList.remove('open'); }
 document.querySelectorAll('.modal').forEach(m=>{
   m.addEventListener('click',e=>{ if(e.target===m) m.classList.remove('open'); });
 });
 
-// ===== TOAST =====
+// TOAST
 function toast(msg,tipo){
   let t=document.getElementById('toast');
-  t.textContent=msg; t.className='toast '+tipo; t.style.display='block';
+  t.textContent=msg; 
+  t.className='toast '+tipo; 
+  t.style.display='block';
   clearTimeout(window._tt);
   window._tt=setTimeout(()=>t.style.display='none',2800);
 }
@@ -1760,7 +2497,6 @@ function toast(msg,tipo){
 document.addEventListener('DOMContentLoaded',init);
 </script>
 </body></html>'''
-
 
 ADMIN_HTML = r'''<!DOCTYPE html>
 <html><head>
@@ -1829,7 +2565,7 @@ tr:hover td{background:#0d1828}
   <div class="tab active" onclick="showTab('dashboard')">📊 DASHBOARD</div>
   <div class="tab" onclick="showTab('resultados')">🎯 RESULTADOS</div>
   <div class="tab" onclick="showTab('tripletas')">🔮 TRIPLETAS</div>
-  <div class="tab" onclick="showTab('riesgo')">⚠️ RIESGO</div>
+  <div class="tab" onclick="showTab('riesgo')">⚠️ RIESGO (2min)</div>
   <div class="tab" onclick="showTab('reportes')">📈 REPORTES</div>
   <div class="tab" onclick="showTab('agencias')">🏪 AGENCIAS</div>
   <div class="tab" onclick="showTab('operaciones')">💰 OPERACIONES</div>
@@ -1868,7 +2604,7 @@ tr:hover td{background:#0d1828}
 
 <div id="tc-tripletas" class="tc">
   <div class="fbox">
-    <h3>🔮 TRIPLETAS HOY</h3>
+    <h3>🔮 TRIPLETAS HOY (9AM-6PM)</h3>
     <button class="btn-s" onclick="cargarTrip()" style="margin-bottom:10px">🔄 ACTUALIZAR</button>
     <div id="tri-stats" style="margin-bottom:10px"></div>
     <div id="tri-lista" style="max-height:500px;overflow-y:auto"></div>
@@ -1877,7 +2613,7 @@ tr:hover td{background:#0d1828}
 
 <div id="tc-riesgo" class="tc">
   <div class="fbox">
-    <h3>⚠️ RIESGO</h3>
+    <h3>⚠️ RIESGO (Cierra 2 min antes)</h3>
     <button class="btn-s" onclick="cargarRiesgo()" style="margin-bottom:10px">🔄 ACTUALIZAR</button>
     <div id="riesgo-info" style="color:var(--gold);font-family:'Oswald',sans-serif;font-size:.82rem;letter-spacing:1px;margin-bottom:8px"></div>
     <div id="riesgo-lista" style="max-height:500px;overflow-y:auto"></div>
@@ -2083,7 +2819,7 @@ function cargarTrip(){
 
 function cargarRiesgo(){
   fetch('/admin/riesgo').then(r=>r.json()).then(d=>{
-    document.getElementById('riesgo-info').innerHTML=`<span style="background:#0d1828;border:2px solid #2a4a80;border-radius:3px;padding:4px 10px;font-size:.8rem">⏱ PRÓXIMO SORTEO: <b style="color:#fbbf24">${d.sorteo_objetivo||'N/A'}</b> &nbsp;|&nbsp; 💰 TOTAL EN JUEGO: <b style="color:#f87171">S/${(d.total_apostado||0).toFixed(2)}</b></span>`;
+    document.getElementById('riesgo-info').innerHTML=`<span style="background:#0d1828;border:2px solid #2a4a80;border-radius:3px;padding:4px 10px;font-size:.8rem">⏱ PRÓXIMO SORTEO: <b style="color:#fbbf24">${d.sorteo_objetivo||'N/A'}</b> &nbsp;|&nbsp; CIERRE: <b style="color:#f87171">${d.minutos_cierre||2} min antes</b> &nbsp;|&nbsp; 💰 TOTAL: <b style="color:#f87171">S/${(d.total_apostado||0).toFixed(2)}</b></span>`;
     let l=document.getElementById('riesgo-lista');
     if(!Object.keys(d.riesgo).length){l.innerHTML='<p style="color:#2a4060;text-align:center;padding:20px;font-size:.75rem;letter-spacing:2px">SIN APUESTAS PARA ESE SORTEO</p>';return;}
     let html='';
@@ -2263,86 +2999,8 @@ document.addEventListener('DOMContentLoaded',()=>{
   ['rep-ini','rep-fin','ra-fecha','ra-fi'].forEach(id=>{let e=document.getElementById(id);if(e)e.value=hoy;});
   cargarDash();
 });
-
-async function fetchEstadisticasRango(ini,fin){
-  return fetch('/admin/estadisticas-rango',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json());
-}
-async function fetchReporteAgenciasRango(ini,fin){
-  return fetch('/admin/reporte-agencias-rango',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json());
-}
 </script>
 </body></html>'''
-
-@app.route('/admin/estadisticas-rango', methods=['POST'])
-@admin_required
-def estadisticas_rango():
-    try:
-        data=request.get_json(); fi=data.get('fecha_inicio'); ff=data.get('fecha_fin')
-        if not fi or not ff: return jsonify({'error':'Fechas requeridas'}),400
-        dti=datetime.strptime(fi,"%Y-%m-%d"); dtf=datetime.strptime(ff,"%Y-%m-%d").replace(hour=23,minute=59)
-        with get_db() as db:
-            all_t=db.execute("SELECT * FROM tickets WHERE anulado=0 ORDER BY id DESC LIMIT 10000").fetchall()
-        dias={}; total_v=total_p=total_t=0
-        for t in all_t:
-            dt=parse_fecha(t['fecha'])
-            if not dt or dt<dti or dt>dtf: continue
-            dk=dt.strftime("%d/%m/%Y")
-            if dk not in dias: dias[dk]={'ventas':0,'tickets':0,'ids':[]}
-            dias[dk]['ventas']+=t['total']; dias[dk]['tickets']+=1; dias[dk]['ids'].append(t['id'])
-            total_v+=t['total']; total_t+=1
-        resumen=[]; total_p=0
-        for dk in sorted(dias.keys()):
-            d=dias[dk]; prem=0
-            for tid in d['ids']:
-                with get_db() as db2: prem+=calcular_premio_ticket(tid,db2)
-            total_p+=prem
-            cd=d['ventas']*COMISION_AGENCIA
-            resumen.append({'fecha':dk,'ventas':round(d['ventas'],2),'premios':round(prem,2),
-                'comisiones':round(cd,2),'balance':round(d['ventas']-prem-cd,2),'tickets':d['tickets']})
-        tc=total_v*COMISION_AGENCIA
-        return jsonify({'resumen_por_dia':resumen,
-            'totales':{'ventas':round(total_v,2),'premios':round(total_p,2),
-                'comisiones':round(tc,2),'balance':round(total_v-total_p-tc,2),'tickets':total_t}})
-    except Exception as e:
-        return jsonify({'error':str(e)}),500
-
-@app.route('/admin/reporte-agencias-rango', methods=['POST'])
-@admin_required
-def reporte_agencias_rango():
-    try:
-        data=request.get_json(); fi=data.get('fecha_inicio'); ff=data.get('fecha_fin')
-        if not fi or not ff: return jsonify({'error':'Fechas requeridas'}),400
-        dti=datetime.strptime(fi,"%Y-%m-%d"); dtf=datetime.strptime(ff,"%Y-%m-%d").replace(hour=23,minute=59)
-        with get_db() as db:
-            ags=db.execute("SELECT * FROM agencias WHERE es_admin=0").fetchall()
-            all_t=db.execute("SELECT * FROM tickets WHERE anulado=0 ORDER BY id DESC LIMIT 50000").fetchall()
-        stats={ag['id']:{'nombre':ag['nombre_agencia'],'usuario':ag['usuario'],'tickets':0,'ventas':0,'premios_teoricos':0,'comision_pct':ag['comision']} for ag in ags}
-        for t in all_t:
-            dt=parse_fecha(t['fecha'])
-            if not dt or dt<dti or dt>dtf: continue
-            aid=t['agencia_id']
-            if aid not in stats: continue
-            stats[aid]['tickets']+=1; stats[aid]['ventas']+=t['total']
-            with get_db() as db2: p=calcular_premio_ticket(t['id'],db2)
-            stats[aid]['premios_teoricos']+=p
-        out=[]
-        for s in stats.values():
-            if s['tickets']==0: continue
-            com=s['ventas']*s['comision_pct']
-            s['comision']=round(com,2); s['balance']=round(s['ventas']-s['premios_teoricos']-com,2)
-            s['ventas']=round(s['ventas'],2); s['premios_teoricos']=round(s['premios_teoricos'],2)
-            out.append(s)
-        out.sort(key=lambda x:x['ventas'],reverse=True)
-        tv=sum(x['ventas'] for x in out)
-        if tv>0:
-            for x in out: x['porcentaje_ventas']=round(x['ventas']/tv*100,1)
-        total={'tickets':sum(x['tickets'] for x in out),'ventas':round(tv,2),
-            'premios':round(sum(x['premios_teoricos'] for x in out),2),
-            'comision':round(sum(x['comision'] for x in out),2),
-            'balance':round(sum(x['balance'] for x in out),2)}
-        return jsonify({'agencias':out,'total':total,'periodo':{'inicio':fi,'fin':ff}})
-    except Exception as e:
-        return jsonify({'error':str(e)}),500
 
 if __name__ == '__main__':
     init_db()
