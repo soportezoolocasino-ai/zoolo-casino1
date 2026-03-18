@@ -356,6 +356,16 @@ def init_db():
             UNIQUE(admin_id, hora, numero),
             FOREIGN KEY (admin_id) REFERENCES agencias(id)
         );
+        CREATE TABLE IF NOT EXISTS topes_global (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER NOT NULL,
+            loteria TEXT NOT NULL,
+            hora TEXT NOT NULL,
+            numero TEXT NOT NULL,
+            monto_tope REAL NOT NULL DEFAULT 0,
+            UNIQUE(admin_id, loteria, hora, numero),
+            FOREIGN KEY (admin_id) REFERENCES agencias(id)
+        );
         CREATE TABLE IF NOT EXISTS topes_agencia (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             admin_id INTEGER NOT NULL,
@@ -430,6 +440,20 @@ def init_db():
                 UNIQUE(admin_id, agencia_id, loteria),
                 FOREIGN KEY (admin_id) REFERENCES agencias(id),
                 FOREIGN KEY (agencia_id) REFERENCES agencias(id)
+            )""")
+            db.commit()
+        except: pass
+        # Migration: add topes_global if missing
+        try:
+            db.execute("""CREATE TABLE IF NOT EXISTS topes_global (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER NOT NULL,
+                loteria TEXT NOT NULL,
+                hora TEXT NOT NULL,
+                numero TEXT NOT NULL,
+                monto_tope REAL NOT NULL DEFAULT 0,
+                UNIQUE(admin_id, loteria, hora, numero),
+                FOREIGN KEY (admin_id) REFERENCES agencias(id)
             )""")
             db.commit()
         except: pass
@@ -574,6 +598,29 @@ def verificar_limites(admin_id, loteria, numero, hora, monto_nuevo, agencia_id=N
                 return False, f"Tope global: número {numero} agotó S/{tope_g:.0f} para {hora}", 0
             if monto_nuevo > disponible:
                 return False, f"Tope global: solo disponible S/{disponible:.0f} para {numero} en {hora}", disponible
+
+        # --- Capa 2b: tope global por lotería (topes_global) — suma de TODAS las agencias ---
+        tope_gl = db.execute("""
+            SELECT monto_tope FROM topes_global
+            WHERE admin_id=? AND loteria=? AND hora=? AND numero=?
+        """, (admin_id, loteria, hora, str(numero))).fetchone()
+
+        if tope_gl and tope_gl['monto_tope'] > 0:
+            tope_g2 = tope_gl['monto_tope']
+            # Suma vendida entre TODAS las agencias para ese número/hora/lotería hoy
+            vendido_g2 = db.execute("""
+                SELECT COALESCE(SUM(j.monto),0) as total FROM jugadas j
+                JOIN tickets t ON j.ticket_id = t.id
+                WHERE t.admin_id=? AND j.loteria=? AND j.seleccion=? AND j.hora=?
+                AND j.tipo='animal' AND t.anulado=0 AND t.fecha LIKE ?
+            """, (admin_id, loteria, str(numero), hora, hoy+'%')).fetchone()
+            vendido2 = vendido_g2['total'] or 0
+            disponible2 = tope_g2 - vendido2
+            lot_nombre = get_loteria(loteria)['nombre']
+            if disponible2 <= 0:
+                return False, f"Cupo total agotado: número {numero} llegó al límite global de S/{tope_g2:.0f} en {lot_nombre} {hora}", 0
+            if monto_nuevo > disponible2:
+                return False, f"Cupo global: quedan S/{disponible2:.0f} disponibles para {numero} en {lot_nombre} {hora}", disponible2
 
         # --- Capa 3: tope específico por agencia ---
         if agencia_id:
@@ -1542,6 +1589,105 @@ def limpiar_topes():
         return jsonify({'status':'ok','mensaje':f'Topes de {hora} eliminados'})
     except Exception as e:
         return jsonify({'error':str(e)}),500
+
+# ========================= API TOPES GLOBAL POR LOTERÍA =========================
+@app.route('/admin/topes-global/guardar-masivo', methods=['POST'])
+@admin_required
+def guardar_topes_global_masivo():
+    """Guarda topes globales (suma de todas las agencias) por lotería/hora/número."""
+    try:
+        data        = request.get_json() or {}
+        admin_id    = session['user_id']
+        loteria_ids = data.get('loteria_ids', [])
+        horas       = data.get('horas', [])
+        numeros     = data.get('numeros', [])
+        monto_tope  = float(data.get('monto_tope', 0))
+        count = 0
+        with get_db() as db:
+            for lot_id in loteria_ids:
+                lot = get_loteria(lot_id)
+                horas_validas, _ = get_horarios(lot_id)
+                nums_validos = list(lot['animales'].keys()) if not numeros else [n for n in numeros if n in lot['animales']]
+                if not nums_validos:
+                    nums_validos = list(lot['animales'].keys())
+                for hora in horas:
+                    if hora not in horas_validas:
+                        continue
+                    for num in nums_validos:
+                        if monto_tope <= 0:
+                            db.execute("""DELETE FROM topes_global
+                                WHERE admin_id=? AND loteria=? AND hora=? AND numero=?""",
+                                (admin_id, lot_id, hora, str(num)))
+                        else:
+                            db.execute("""INSERT INTO topes_global
+                                (admin_id, loteria, hora, numero, monto_tope) VALUES (?,?,?,?,?)
+                                ON CONFLICT(admin_id, loteria, hora, numero)
+                                DO UPDATE SET monto_tope=excluded.monto_tope""",
+                                (admin_id, lot_id, hora, str(num), monto_tope))
+                        count += 1
+            db.commit()
+        log_audit('TOPE_GLOBAL', f"{count} topes globales {'guardados' if monto_tope>0 else 'eliminados'}")
+        return jsonify({'status':'ok', 'mensaje': f'{count} tope(s) global(es) aplicado(s)'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/topes-global/lista')
+@admin_required
+def lista_topes_global():
+    try:
+        admin_id   = session['user_id']
+        loteria_id = request.args.get('loteria', '')
+        hora       = request.args.get('hora', '')
+        hoy        = ahora_peru().strftime("%d/%m/%Y")
+        with get_db() as db:
+            q = "SELECT * FROM topes_global WHERE admin_id=?"
+            params = [admin_id]
+            if loteria_id: q += " AND loteria=?"; params.append(loteria_id)
+            if hora:       q += " AND hora=?";    params.append(hora)
+            q += " ORDER BY loteria, hora, CAST(numero AS INTEGER)"
+            rows = db.execute(q, params).fetchall()
+            result = []
+            for r in rows:
+                lot = get_loteria(r['loteria'])
+                vendido_row = db.execute("""
+                    SELECT COALESCE(SUM(j.monto),0) as total FROM jugadas j
+                    JOIN tickets t ON j.ticket_id=t.id
+                    WHERE t.admin_id=? AND j.loteria=? AND j.seleccion=? AND j.hora=?
+                    AND j.tipo='animal' AND t.anulado=0 AND t.fecha LIKE ?
+                """, (admin_id, r['loteria'], r['numero'], r['hora'], hoy+'%')).fetchone()
+                vendido = vendido_row['total'] or 0
+                tope    = r['monto_tope']
+                result.append({
+                    'id': r['id'],
+                    'loteria': r['loteria'],
+                    'loteria_nombre': lot['nombre'],
+                    'loteria_emoji': lot['emoji'],
+                    'loteria_color': lot['color'],
+                    'hora': r['hora'],
+                    'numero': r['numero'],
+                    'animal': lot['animales'].get(r['numero'], '?'),
+                    'monto_tope': tope,
+                    'vendido_hoy': round(vendido, 2),
+                    'disponible': round(max(0, tope - vendido), 2),
+                    'pct_usado': round(vendido/tope*100, 1) if tope > 0 else 0
+                })
+        return jsonify({'status':'ok', 'topes': result})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/topes-global/eliminar', methods=['POST'])
+@admin_required
+def eliminar_tope_global():
+    try:
+        data     = request.get_json() or {}
+        admin_id = session['user_id']
+        tid      = data.get('id')
+        with get_db() as db:
+            db.execute("DELETE FROM topes_global WHERE id=? AND admin_id=?", (tid, admin_id))
+            db.commit()
+        return jsonify({'status':'ok'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 # ========================= API TOPES POR AGENCIA =========================
 @app.route('/admin/topes-agencia/guardar-masivo', methods=['POST'])
@@ -3707,8 +3853,8 @@ tr:hover td{background:#0d1828}
 <!-- TOPES -->
 <div id="tc-topes" class="tc">
   <div class="fbox">
-    <h3>🛡️ GESTIÓN DE TOPES POR NÚMERO</h3>
-    <div style="color:var(--text2);font-size:.78rem;margin-bottom:12px">Tope 0 = elimina tope. Sin tope = jugada libre.</div>
+    <h3>🛡️ TOPES INDIVIDUALES POR AGENCIA</h3>
+    <div style="color:var(--text2);font-size:.78rem;margin-bottom:12px">Tope por número para una agencia específica. Tope 0 = elimina tope.</div>
     <div class="lot-tabs" id="lot-tabs-topes" style="margin-bottom:10px"></div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center">
       <select id="tope-hora-sel" style="padding:8px 12px;background:#0a1828;border:2px solid #2a4a80;border-radius:3px;color:#fbbf24;font-family:'Rajdhani',sans-serif;font-size:.85rem;font-weight:600"></select>
@@ -3725,6 +3871,73 @@ tr:hover td{background:#0d1828}
     </div>
     <div id="tope-msg" style="margin-bottom:8px"></div>
     <div id="topes-lista" style="max-height:500px;overflow-y:auto"></div>
+  </div>
+
+  <!-- TOPE GLOBAL COMBINADO -->
+  <div class="fbox" style="border:2px solid #d97706;background:#0a0800">
+    <h3 style="color:#fbbf24">🌐 TOPE GLOBAL — LÍMITE COMBINADO DE TODAS LAS AGENCIAS</h3>
+    <div style="color:#a0800a;font-size:.76rem;margin-bottom:12px">
+      Define cuánto se puede vender en TOTAL entre todas las agencias para un número/sorteo/lotería.
+      Ejemplo: tope S/20 para el número 5 en 1PM de LOTTO ACTIVO — cuando la suma de todas las agencias llegue a S/20, nadie más puede vender ese número en ese sorteo.
+    </div>
+
+    <!-- Loterías -->
+    <div class="fbox" style="background:#080a00;border:1px solid #3a2a00;margin-bottom:8px">
+      <h3 style="font-size:.78rem;color:#fbbf24;margin-bottom:6px">LOTERÍAS</h3>
+      <div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">
+        <button class="btn-sec" style="font-size:.65rem" onclick="glSelAllLots()">✅ TODAS</button>
+        <button class="btn-sec" style="font-size:.65rem" onclick="glDeselAllLots()">⬜ NINGUNA</button>
+      </div>
+      <div id="gl-loterias" style="display:flex;flex-wrap:wrap;gap:4px"></div>
+    </div>
+
+    <!-- Horas -->
+    <div class="fbox" style="background:#080a00;border:1px solid #3a2a00;margin-bottom:8px">
+      <h3 style="font-size:.78rem;color:#fbbf24;margin-bottom:6px">HORAS DE SORTEO</h3>
+      <div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">
+        <button class="btn-sec" style="font-size:.65rem" onclick="glSelAllHoras()">✅ TODAS</button>
+        <button class="btn-sec" style="font-size:.65rem" onclick="glDeselAllHoras()">⬜ NINGUNA</button>
+      </div>
+      <div id="gl-horas" style="display:flex;flex-wrap:wrap;gap:3px"></div>
+    </div>
+
+    <!-- Números -->
+    <div class="fbox" style="background:#080a00;border:1px solid #3a2a00;margin-bottom:8px">
+      <h3 style="font-size:.78rem;color:#fbbf24;margin-bottom:6px">NÚMEROS <span style="color:#4a6090;font-size:.65rem">(vacío = todos)</span></h3>
+      <div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">
+        <button class="btn-sec" style="font-size:.65rem" onclick="glSelAllNums()">✅ TODOS</button>
+        <button class="btn-sec" style="font-size:.65rem" onclick="glDeselAllNums()">⬜ NINGUNO</button>
+      </div>
+      <div id="gl-numeros" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(62px,1fr));gap:3px;max-height:200px;overflow-y:auto"></div>
+    </div>
+
+    <!-- Monto global -->
+    <div style="display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap;margin-bottom:10px">
+      <div style="display:flex;flex-direction:column;gap:4px;flex:1;min-width:180px">
+        <label style="color:#a07020;font-size:.7rem;letter-spacing:1px">MONTO GLOBAL MÁXIMO S/ (0 = eliminar tope)</label>
+        <input type="number" id="gl-monto" placeholder="Ej: 20" min="0" step="1"
+          style="padding:12px;background:#0a0800;border:2px solid #d97706;border-radius:4px;color:#fbbf24;font-family:'Oswald',sans-serif;font-size:1.3rem;font-weight:700;text-align:center">
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn-s" style="background:#78350f;border-color:#d97706" onclick="guardarTopeGlobal()">💾 APLICAR TOPE GLOBAL</button>
+        <button class="btn-d" onclick="if(confirm('¿Eliminar topes globales seleccionados?')){document.getElementById('gl-monto').value=0;guardarTopeGlobal();}">🗑 ELIMINAR</button>
+      </div>
+    </div>
+    <div id="gl-msg" style="font-size:.78rem;margin-bottom:8px"></div>
+
+    <!-- Tabla de topes globales configurados -->
+    <div style="border-top:1px solid #3a2a00;padding-top:10px;margin-top:4px">
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center">
+        <select id="gl-filtro-lot" style="padding:6px 10px;background:#0a0800;border:1px solid #3a2a00;border-radius:3px;color:#fbbf24;font-size:.78rem">
+          <option value="">— Todas las loterías —</option>
+        </select>
+        <select id="gl-filtro-hora" style="padding:6px 10px;background:#0a0800;border:1px solid #3a2a00;border-radius:3px;color:#fbbf24;font-size:.78rem">
+          <option value="">— Todas las horas —</option>
+        </select>
+        <button class="btn-sec" style="font-size:.65rem" onclick="cargarTablaGlobal()">🔄 ACTUALIZAR</button>
+      </div>
+      <div id="gl-tabla" style="max-height:400px;overflow-y:auto;overflow-x:auto"></div>
+    </div>
   </div>
 </div>
 
@@ -4032,7 +4245,7 @@ function showTab(id){
   if(id==='resultados'){setHoy('ra-fecha');setHoy('ra-fi');cargarRA();}
   if(id==='tripletas') cargarTrip();
   if(id==='riesgo') cargarRiesgo();
-  if(id==='topes') cargarTopes();
+  if(id==='topes'){cargarTopes();if(!window._glInited){window._glInited=true;initTopeGlobal();}else{cargarTablaGlobal();}}
   if(id==='topes-ag'){if(typeof initTabTopesAg==='function'){if(!window._tapInited){window._tapInited=true;initTabTopesAg();}else{cargarTablaTopesAg();}}}
   if(id==='bloqueos'){renderLotTabs('lot-tabs-lim',lotLimActual,selLotLim);updateHorarioSelect(lotLimActual,'lim-hora');renderAnimalesMini(lotLimActual,'animals-lim',(k)=>{animalSelLim=k;document.getElementById('lim-sel-info').textContent='✓ '+k+' — '+(LOTERIAS_DATA[lotLimActual].animales[k]||'');});cargarLimites();}
   if(id==='agencias'){cargarAgs();cargarAgsSel();}
@@ -4285,6 +4498,150 @@ function limpiarTopesHora(){
   if(!confirm('¿Limpiar todos los topes de '+hora+'?'))return;
   fetch('/admin/topes/limpiar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hora:hora})})
   .then(r=>r.json()).then(d=>{if(d.status==='ok'){glMsg(d.mensaje,'ok');cargarTopes();}else glMsg(d.error,'err');});
+}
+
+// ======================== TOPE GLOBAL ========================
+let glLotsSelSet=new Set(), glHorasSelSet=new Set(), glNumsSelSet=new Set();
+let glAllHoras=[], glAllNums={};
+
+function initTopeGlobal(){
+  // Loterías
+  let c=document.getElementById('gl-loterias'); if(!c)return; c.innerHTML='';
+  let filtLot=document.getElementById('gl-filtro-lot');
+  filtLot.innerHTML='<option value="">— Todas las loterías —</option>';
+  Object.entries(LOTERIAS_DATA).forEach(([lid,lot])=>{
+    let btn=document.createElement('button');
+    btn.className='ltag'+(glLotsSelSet.has(lid)?' sel':'');
+    btn.dataset.id=lid;
+    btn.innerHTML=`${lot.emoji} ${lot.nombre}`;
+    btn.style.borderColor=glLotsSelSet.has(lid)?lot.color:'#3a2a00';
+    if(glLotsSelSet.has(lid)) btn.style.background=lot.color+'33';
+    btn.onclick=()=>{
+      if(glLotsSelSet.has(lid)){glLotsSelSet.delete(lid);btn.classList.remove('sel');btn.style.background='';btn.style.borderColor='#3a2a00';}
+      else{glLotsSelSet.add(lid);btn.classList.add('sel');btn.style.background=lot.color+'33';btn.style.borderColor=lot.color;}
+      recalcGlHorasNums();
+    };
+    c.appendChild(btn);
+    filtLot.innerHTML+=`<option value="${lid}">${lot.emoji} ${lot.nombre}</option>`;
+  });
+  // Poblar filtro horas
+  let filtH=document.getElementById('gl-filtro-hora');
+  let todasH=["08:00 AM","09:00 AM","10:00 AM","11:00 AM","12:00 PM","01:00 PM","02:00 PM","03:00 PM","04:00 PM","05:00 PM","06:00 PM",
+               "08:30 AM","09:30 AM","10:30 AM","11:30 AM","12:30 PM","01:30 PM","02:30 PM","03:30 PM","04:30 PM","05:30 PM","06:30 PM"];
+  filtH.innerHTML='<option value="">— Todas las horas —</option>';
+  todasH.forEach(h=>filtH.innerHTML+=`<option value="${h}">${h}</option>`);
+  recalcGlHorasNums();
+  cargarTablaGlobal();
+}
+
+function recalcGlHorasNums(){
+  glAllHoras=[]; glAllNums={};
+  glLotsSelSet.forEach(lid=>{
+    let lot=LOTERIAS_DATA[lid]; let horas=getHorarios(lid);
+    horas.forEach(h=>{if(!glAllHoras.includes(h))glAllHoras.push(h);});
+    Object.entries(lot.animales).forEach(([n,nom])=>{glAllNums[n]=nom;});
+  });
+  glHorasSelSet.forEach(h=>{if(!glAllHoras.includes(h))glHorasSelSet.delete(h);});
+  glNumsSelSet.forEach(n=>{if(!(n in glAllNums))glNumsSelSet.delete(n);});
+  renderGlHoras(); renderGlNums();
+}
+
+function renderGlHoras(){
+  let c=document.getElementById('gl-horas'); if(!c)return; c.innerHTML='';
+  glAllHoras.forEach(h=>{
+    let btn=document.createElement('button');
+    btn.className='hbtn'+(glHorasSelSet.has(h)?' sel':'');
+    btn.dataset.h=h; btn.textContent=h.replace(':00','').replace(' ','');
+    btn.onclick=()=>{
+      if(glHorasSelSet.has(h)){glHorasSelSet.delete(h);btn.classList.remove('sel');}
+      else{glHorasSelSet.add(h);btn.classList.add('sel');}
+    };
+    c.appendChild(btn);
+  });
+}
+
+function renderGlNums(){
+  let c=document.getElementById('gl-numeros'); if(!c)return; c.innerHTML='';
+  let sorted=Object.keys(glAllNums).sort((a,b)=>{let ia=parseInt(a),ib=parseInt(b);return isNaN(ia)||isNaN(ib)?0:ia-ib;});
+  sorted.forEach(n=>{
+    let btn=document.createElement('button');
+    btn.className='am-item'+(glNumsSelSet.has(n)?' sel':'');
+    btn.dataset.n=n;
+    btn.innerHTML=`<div class="anum">${n}</div><div class="anom">${(glAllNums[n]||'').substring(0,7)}</div>`;
+    btn.onclick=()=>{
+      if(glNumsSelSet.has(n)){glNumsSelSet.delete(n);btn.classList.remove('sel');}
+      else{glNumsSelSet.add(n);btn.classList.add('sel');}
+    };
+    c.appendChild(btn);
+  });
+}
+
+function glSelAllLots(){Object.keys(LOTERIAS_DATA).forEach(lid=>{glLotsSelSet.add(lid);});initTopeGlobal();}
+function glDeselAllLots(){glLotsSelSet.clear();initTopeGlobal();}
+function glSelAllHoras(){glAllHoras.forEach(h=>{glHorasSelSet.add(h);let b=document.querySelector(`#gl-horas button[data-h='${h}']`);if(b)b.classList.add('sel');});}
+function glDeselAllHoras(){glHorasSelSet.clear();document.querySelectorAll('#gl-horas button').forEach(b=>b.classList.remove('sel'));}
+function glSelAllNums(){Object.keys(glAllNums).forEach(n=>{glNumsSelSet.add(n);let b=document.querySelector(`#gl-numeros button[data-n='${n}']`);if(b)b.classList.add('sel');});}
+function glDeselAllNums(){glNumsSelSet.clear();document.querySelectorAll('#gl-numeros button').forEach(b=>b.classList.remove('sel'));}
+
+async function guardarTopeGlobal(){
+  let m=document.getElementById('gl-msg');
+  if(!glLotsSelSet.size){m.innerHTML='<span style="color:#e05050">Selecciona al menos una lotería</span>';return;}
+  if(!glHorasSelSet.size){m.innerHTML='<span style="color:#e05050">Selecciona al menos una hora</span>';return;}
+  let monto=parseFloat(document.getElementById('gl-monto').value)||0;
+  m.innerHTML='<span style="color:#a07020">Guardando...</span>';
+  let body={
+    loteria_ids:[...glLotsSelSet],
+    horas:[...glHorasSelSet],
+    numeros:glNumsSelSet.size>0?[...glNumsSelSet]:[],
+    monto_tope:monto
+  };
+  let d=await fetch('/admin/topes-global/guardar-masivo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json());
+  if(d.status==='ok'){
+    m.innerHTML=`<span style="color:#4ade80">✅ ${d.mensaje}</span>`;
+    glMsg('✅ '+d.mensaje,'ok'); cargarTablaGlobal();
+  } else { m.innerHTML=`<span style="color:#e05050">❌ ${d.error}</span>`; }
+}
+
+function cargarTablaGlobal(){
+  let lotFil=document.getElementById('gl-filtro-lot')?document.getElementById('gl-filtro-lot').value:'';
+  let horaFil=document.getElementById('gl-filtro-hora')?document.getElementById('gl-filtro-hora').value:'';
+  let url='/admin/topes-global/lista?';
+  if(lotFil)  url+='loteria='+encodeURIComponent(lotFil)+'&';
+  if(horaFil) url+='hora='+encodeURIComponent(horaFil);
+  let c=document.getElementById('gl-tabla'); if(!c)return;
+  c.innerHTML='<p style="color:#a07020;font-size:.75rem;padding:6px">Cargando...</p>';
+  fetch(url).then(r=>r.json()).then(d=>{
+    if(d.error){c.innerHTML=`<p style="color:#e05050">${d.error}</p>`;return;}
+    if(!d.topes||!d.topes.length){c.innerHTML='<p style="color:#4a4000;font-size:.75rem;padding:6px">Sin topes globales configurados</p>';return;}
+    let html='<table><thead><tr><th>LOTERÍA</th><th>HORA</th><th>NUM</th><th>ANIMAL</th><th>TOPE GLOBAL</th><th>VENDIDO HOY</th><th>DISPONIBLE</th><th>%</th><th>❌</th></tr></thead><tbody>';
+    d.topes.forEach(t=>{
+      let danger=t.pct_usado>=80;
+      let barColor=t.pct_usado>=100?'#dc2626':(t.pct_usado>=80?'#f59e0b':'#22c55e');
+      html+=`<tr style="${t.pct_usado>=100?'background:#1a0808':''}">
+        <td style="color:${t.loteria_color};font-size:.7rem">${t.loteria_emoji} ${t.loteria_nombre}</td>
+        <td style="color:#fbbf24;font-family:'Oswald',sans-serif;font-size:.7rem">${t.hora}</td>
+        <td style="color:#00d8ff;font-family:'Oswald',sans-serif;font-weight:700">${t.numero}</td>
+        <td style="font-size:.65rem;color:#c0d8f0">${t.animal}</td>
+        <td style="color:#fbbf24;font-weight:700;font-family:'Oswald',sans-serif">S/${t.monto_tope}</td>
+        <td style="color:${barColor};font-family:'Oswald',sans-serif">S/${t.vendido_hoy}</td>
+        <td style="color:${t.disponible<=0?'#dc2626':'#4ade80'};font-weight:700">S/${t.disponible}</td>
+        <td>
+          <div style="background:#0a0800;border-radius:3px;height:8px;width:60px;overflow:hidden">
+            <div style="background:${barColor};width:${Math.min(t.pct_usado,100)}%;height:100%"></div>
+          </div>
+          <span style="color:${barColor};font-size:.6rem">${t.pct_usado}%</span>
+        </td>
+        <td><button onclick="eliminarTopeGlobal(${t.id})" style="padding:2px 5px;background:#1a0808;border:1px solid #6b1515;color:#e05050;font-size:.58rem;cursor:pointer;border-radius:2px">✕</button></td>
+      </tr>`;
+    });
+    html+='</tbody></table>';
+    c.innerHTML=html;
+  });
+}
+
+function eliminarTopeGlobal(id){
+  fetch('/admin/topes-global/eliminar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})})
+  .then(r=>r.json()).then(d=>{if(d.status==='ok'){glMsg('Tope global eliminado','ok');cargarTablaGlobal();}else glMsg(d.error,'err');});
 }
 
 // ======================== TOPES POR AGENCIA ========================
