@@ -265,7 +265,7 @@ HORARIOS_VENEZUELA_OFFSET = [
 ROJOS_ZOOLO = ["1","3","5","7","9","12","14","16","18","19",
                "21","23","25","27","30","32","34","36","37","39"]
 
-COMISION_AGENCIA = 0.15
+COMISION_AGENCIA = 0.0   # Por defecto 0% — se configura individualmente por agencia
 MINUTOS_BLOQUEO = 5
 
 # ========================= BASE DE DATOS =========================
@@ -356,6 +356,29 @@ def init_db():
             UNIQUE(admin_id, hora, numero),
             FOREIGN KEY (admin_id) REFERENCES agencias(id)
         );
+        CREATE TABLE IF NOT EXISTS topes_agencia (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER NOT NULL,
+            agencia_id INTEGER NOT NULL,
+            loteria TEXT NOT NULL,
+            hora TEXT NOT NULL,
+            numero TEXT NOT NULL,
+            monto_tope REAL NOT NULL DEFAULT 0,
+            porcentaje REAL NOT NULL DEFAULT 0,
+            UNIQUE(admin_id, agencia_id, loteria, hora, numero),
+            FOREIGN KEY (admin_id) REFERENCES agencias(id),
+            FOREIGN KEY (agencia_id) REFERENCES agencias(id)
+        );
+        CREATE TABLE IF NOT EXISTS comisiones_loteria (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER NOT NULL,
+            agencia_id INTEGER NOT NULL,
+            loteria TEXT NOT NULL,
+            comision REAL NOT NULL DEFAULT 0,
+            UNIQUE(admin_id, agencia_id, loteria),
+            FOREIGN KEY (admin_id) REFERENCES agencias(id),
+            FOREIGN KEY (agencia_id) REFERENCES agencias(id)
+        );
         CREATE TABLE IF NOT EXISTS audit_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             agencia_id INTEGER,
@@ -377,6 +400,37 @@ def init_db():
         # Migration: add tope_taquilla if missing
         try:
             db.execute("ALTER TABLE agencias ADD COLUMN tope_taquilla REAL DEFAULT 0")
+            db.commit()
+        except: pass
+        # Migration: add topes_agencia if missing
+        try:
+            db.execute("""CREATE TABLE IF NOT EXISTS topes_agencia (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER NOT NULL,
+                agencia_id INTEGER NOT NULL,
+                loteria TEXT NOT NULL,
+                hora TEXT NOT NULL,
+                numero TEXT NOT NULL,
+                monto_tope REAL NOT NULL DEFAULT 0,
+                porcentaje REAL NOT NULL DEFAULT 0,
+                UNIQUE(admin_id, agencia_id, loteria, hora, numero),
+                FOREIGN KEY (admin_id) REFERENCES agencias(id),
+                FOREIGN KEY (agencia_id) REFERENCES agencias(id)
+            )""")
+            db.commit()
+        except: pass
+        # Migration: add comisiones_loteria if missing
+        try:
+            db.execute("""CREATE TABLE IF NOT EXISTS comisiones_loteria (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER NOT NULL,
+                agencia_id INTEGER NOT NULL,
+                loteria TEXT NOT NULL,
+                comision REAL NOT NULL DEFAULT 0,
+                UNIQUE(admin_id, agencia_id, loteria),
+                FOREIGN KEY (admin_id) REFERENCES agencias(id),
+                FOREIGN KEY (agencia_id) REFERENCES agencias(id)
+            )""")
             db.commit()
         except: pass
 
@@ -444,6 +498,20 @@ def get_horarios(loteria_id):
         return HORARIOS_PERU_OFFSET, HORARIOS_VENEZUELA_OFFSET
     return HORARIOS_PERU_BASE, HORARIOS_VENEZUELA_BASE
 
+def get_comision_loteria(admin_id, agencia_id, loteria_id, db_conn):
+    """
+    Devuelve la comisión a aplicar para una agencia en una lotería específica.
+    Prioridad: comisiones_loteria (por lotería) > agencias.comision (general)
+    """
+    row = db_conn.execute("""
+        SELECT comision FROM comisiones_loteria
+        WHERE admin_id=? AND agencia_id=? AND loteria=?
+    """, (admin_id, agencia_id, loteria_id)).fetchone()
+    if row is not None:
+        return row['comision']
+    ag = db_conn.execute("SELECT comision FROM agencias WHERE id=?", (agencia_id,)).fetchone()
+    return ag['comision'] if ag else 0.0
+
 def get_admin_id(user_id):
     with get_db() as db:
         row = db.execute("SELECT es_admin, admin_padre_id FROM agencias WHERE id=?", (user_id,)).fetchone()
@@ -451,8 +519,17 @@ def get_admin_id(user_id):
         if row['es_admin']: return user_id
         return row['admin_padre_id']
 
-def verificar_limites(admin_id, loteria, numero, hora, monto_nuevo):
+def verificar_limites(admin_id, loteria, numero, hora, monto_nuevo, agencia_id=None):
+    """
+    Verifica tres capas de límites:
+    1. limites_venta  → bloqueos/límites globales del admin por número+hora+lotería
+    2. topes          → tope global del admin para cualquier agencia (tabla topes)
+    3. topes_agencia  → tope específico por agencia+lotería+hora+número
+    Cualquier capa que falle bloquea la venta.
+    """
+    hoy = ahora_peru().strftime("%d/%m/%Y")
     with get_db() as db:
+        # --- Capa 1: bloqueos/límites de limites_venta ---
         limite = db.execute("""
             SELECT monto_max, bloqueado FROM limites_venta 
             WHERE admin_id=? AND loteria=? AND numero=? AND hora=?
@@ -462,9 +539,8 @@ def verificar_limites(admin_id, loteria, numero, hora, monto_nuevo):
             return False, f"Número {numero} bloqueado para {hora} en {get_loteria(loteria)['nombre']}", 0
         
         if limite and limite['monto_max'] > 0:
-            hoy = ahora_peru().strftime("%d/%m/%Y")
             ventas = db.execute("""
-                SELECT SUM(j.monto) as total FROM jugadas j
+                SELECT COALESCE(SUM(j.monto),0) as total FROM jugadas j
                 JOIN tickets t ON j.ticket_id = t.id
                 WHERE t.admin_id=? AND j.loteria=? AND j.seleccion=? AND j.hora=? 
                 AND t.fecha LIKE ? AND t.anulado=0
@@ -474,11 +550,55 @@ def verificar_limites(admin_id, loteria, numero, hora, monto_nuevo):
             disponible = limite['monto_max'] - vendido
             
             if disponible <= 0:
-                return False, f"Número {numero} agotado para {hora} (límite: {limite['monto_max']})", 0
-            
+                return False, f"Número {numero} agotado para {hora} (límite global: S/{limite['monto_max']:.0f})", 0
             if monto_nuevo > disponible:
-                return False, f"Solo disponible S/{disponible} para {numero} en {hora}", disponible
+                return False, f"Solo disponible S/{disponible:.0f} para {numero} en {hora}", disponible
+
+        # --- Capa 2: tope global del admin (tabla topes, sin distinción de lotería) ---
+        tope_global = db.execute("""
+            SELECT monto_tope FROM topes
+            WHERE admin_id=? AND hora=? AND numero=?
+        """, (admin_id, hora, str(numero))).fetchone()
+
+        if tope_global and tope_global['monto_tope'] > 0:
+            tope_g = tope_global['monto_tope']
+            vendido_g = db.execute("""
+                SELECT COALESCE(SUM(j.monto),0) as total FROM jugadas j
+                JOIN tickets t ON j.ticket_id = t.id
+                WHERE t.admin_id=? AND j.seleccion=? AND j.hora=?
+                AND j.tipo='animal' AND t.anulado=0 AND t.fecha LIKE ?
+            """, (admin_id, str(numero), hora, hoy+'%')).fetchone()
+            vendido = vendido_g['total'] or 0
+            disponible = tope_g - vendido
+            if disponible <= 0:
+                return False, f"Tope global: número {numero} agotó S/{tope_g:.0f} para {hora}", 0
+            if monto_nuevo > disponible:
+                return False, f"Tope global: solo disponible S/{disponible:.0f} para {numero} en {hora}", disponible
+
+        # --- Capa 3: tope específico por agencia ---
+        if agencia_id:
+            tope_row = db.execute("""
+                SELECT monto_tope FROM topes_agencia
+                WHERE admin_id=? AND agencia_id=? AND loteria=? AND hora=? AND numero=?
+            """, (admin_id, agencia_id, loteria, hora, str(numero))).fetchone()
+            
+            if tope_row and tope_row['monto_tope'] > 0:
+                tope = tope_row['monto_tope']
+                vendido_ag = db.execute("""
+                    SELECT COALESCE(SUM(j.monto),0) as total FROM jugadas j
+                    JOIN tickets t ON j.ticket_id = t.id
+                    WHERE t.agencia_id=? AND j.loteria=? AND j.seleccion=? AND j.hora=?
+                    AND j.tipo='animal' AND t.anulado=0 AND t.fecha LIKE ?
+                """, (agencia_id, loteria, str(numero), hora, hoy+'%')).fetchone()
                 
+                vendido = vendido_ag['total'] or 0
+                disponible = tope - vendido
+                
+                if disponible <= 0:
+                    return False, f"Tope de agencia: número {numero} agotó S/{tope:.0f} para {hora} ({get_loteria(loteria)['nombre']})", 0
+                if monto_nuevo > disponible:
+                    return False, f"Tope de agencia: solo disponible S/{disponible:.0f} para {numero} en {hora}", disponible
+
     return True, "", 0
 
 def calcular_premio_jugada(j_tipo, j_seleccion, j_monto, resultado_animal, loteria_id):
@@ -730,6 +850,54 @@ def eliminar_limite():
         return jsonify({'error': str(e)}), 500
 
 # ========================= API VENTA UNIFICADA =========================
+@app.route('/api/validar-carrito', methods=['POST'])
+@agencia_required
+def validar_carrito():
+    """
+    Valida todos los items del carrito sin procesar la venta.
+    Devuelve por cada jugada:
+      ok=True  → puede venderse tal cual
+      ok=False, disponible=0   → completamente agotado/bloqueado
+      ok=False, disponible>0   → hay monto parcial disponible, se puede ajustar
+    """
+    try:
+        data = request.get_json()
+        jugadas = data.get('jugadas', [])
+        admin_id = session.get('admin_id')
+        agencia_id = session.get('user_id')
+        if not admin_id:
+            return jsonify({'error': 'Error de sesión'}), 403
+
+        resultados = []
+        for idx, j in enumerate(jugadas):
+            if j['tipo'] == 'tripleta':
+                resultados.append({'idx': idx, 'ok': True, 'msg': '', 'disponible': None, 'agotado_total': False})
+                continue
+            if not puede_vender(j['hora']):
+                resultados.append({
+                    'idx': idx, 'ok': False,
+                    'msg': f"Sorteo {j['hora']} ya cerró",
+                    'disponible': 0,
+                    'agotado_total': True
+                })
+                continue
+            puede, msg, disp = verificar_limites(
+                admin_id, j['loteria'], j['seleccion'], j['hora'], j['monto'],
+                agencia_id=agencia_id
+            )
+            resultados.append({
+                'idx': idx,
+                'ok': puede,
+                'msg': msg,
+                'disponible': disp,           # >0 → ajustable; 0 → agotado total
+                'agotado_total': (not puede and disp == 0)
+            })
+
+        hay_errores = any(not r['ok'] for r in resultados)
+        return jsonify({'status': 'ok', 'resultados': resultados, 'hay_errores': hay_errores})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/procesar-venta', methods=['POST'])
 @agencia_required
 def procesar_venta():
@@ -744,7 +912,8 @@ def procesar_venta():
             if j['tipo']!='tripleta' and not puede_vender(j['hora']):
                 return jsonify({'error':f"Sorteo {j['hora']} de {j['loteria'].upper()} ya cerró"}),400
             if j['tipo'] == 'animal':
-                puede, msg, disp = verificar_limites(admin_id, j['loteria'], j['seleccion'], j['hora'], j['monto'])
+                agencia_id_venta = session.get('user_id')
+                puede, msg, disp = verificar_limites(admin_id, j['loteria'], j['seleccion'], j['hora'], j['monto'], agencia_id=agencia_id_venta)
                 if not puede:
                     return jsonify({'error': msg, 'disponible': disp}), 400
         
@@ -1143,22 +1312,46 @@ def caja_agencia():
     try:
         hoy = ahora_peru().strftime("%d/%m/%Y")
         admin_id = session.get('admin_id')
+        agencia_id = session['user_id']
         with get_db() as db:
-            tickets = db.execute("SELECT * FROM tickets WHERE agencia_id=? AND admin_id=? AND anulado=0 AND fecha LIKE ?",
-                               (session['user_id'], admin_id, hoy+'%')).fetchall()
-            ag = db.execute("SELECT comision FROM agencias WHERE id=?",(session['user_id'],)).fetchone()
-            com_pct = ag['comision'] if ag else COMISION_AGENCIA
-            ventas=0; premios_pagados=0; pendientes=0
+            tickets = db.execute(
+                "SELECT * FROM tickets WHERE agencia_id=? AND admin_id=? AND anulado=0 AND fecha LIKE ?",
+                (agencia_id, admin_id, hoy+'%')).fetchall()
+            ventas=0; premios_pagados=0; pendientes=0; comision_total=0
             for t in tickets:
                 ventas += t['total']
-                p = calcular_premio_ticket(t['id'],db)
-                if t['pagado']: premios_pagados+=p
-                elif p>0: pendientes+=1
-        return jsonify({'ventas':round(ventas,2),'premios':round(premios_pagados,2),
-                       'comision':round(ventas*com_pct,2),'balance':round(ventas-premios_pagados-ventas*com_pct,2),
-                       'tickets_pendientes':pendientes,'total_tickets':len(tickets)})
+                p = calcular_premio_ticket(t['id'], db)
+                if t['pagado']: premios_pagados += p
+                elif p > 0: pendientes += 1
+                # Calcular comisión por lotería para este ticket
+                jugs = db.execute(
+                    "SELECT DISTINCT loteria, SUM(monto) as subtotal FROM jugadas WHERE ticket_id=? GROUP BY loteria",
+                    (t['id'],)).fetchall()
+                trips = db.execute(
+                    "SELECT DISTINCT loteria, SUM(monto) as subtotal FROM tripletas WHERE ticket_id=? GROUP BY loteria",
+                    (t['id'],)).fetchall()
+                ticket_com = 0
+                for j in jugs:
+                    pct = get_comision_loteria(admin_id, agencia_id, j['loteria'], db)
+                    ticket_com += (j['subtotal'] or 0) * pct
+                for tr in trips:
+                    pct = get_comision_loteria(admin_id, agencia_id, tr['loteria'], db)
+                    ticket_com += (tr['subtotal'] or 0) * pct
+                # Si no hay jugadas desglosadas, usar comisión general del total
+                if not jugs and not trips:
+                    ag = db.execute("SELECT comision FROM agencias WHERE id=?", (agencia_id,)).fetchone()
+                    ticket_com = t['total'] * (ag['comision'] if ag else 0)
+                comision_total += ticket_com
+        return jsonify({
+            'ventas': round(ventas, 2),
+            'premios': round(premios_pagados, 2),
+            'comision': round(comision_total, 2),
+            'balance': round(ventas - premios_pagados - comision_total, 2),
+            'tickets_pendientes': pendientes,
+            'total_tickets': len(tickets)
+        })
     except Exception as e:
-        return jsonify({'error':str(e)}),500
+        return jsonify({'error': str(e)}), 500
 
 # ========================= API ADMIN =========================
 @app.route('/admin/guardar-resultado', methods=['POST'])
@@ -1349,6 +1542,242 @@ def limpiar_topes():
         return jsonify({'status':'ok','mensaje':f'Topes de {hora} eliminados'})
     except Exception as e:
         return jsonify({'error':str(e)}),500
+
+# ========================= API TOPES POR AGENCIA =========================
+@app.route('/admin/topes-agencia/guardar-masivo', methods=['POST'])
+@admin_required
+def guardar_topes_agencia_masivo():
+    """Guarda topes para múltiples agencias, loterías, horas y números a la vez."""
+    try:
+        data = request.get_json() or {}
+        admin_id = session['user_id']
+        agencia_ids = data.get('agencia_ids', [])
+        loteria_ids  = data.get('loteria_ids', [])
+        horas        = data.get('horas', [])
+        numeros      = data.get('numeros', [])   # lista de strings
+        monto_tope   = float(data.get('monto_tope', 0))
+        porcentaje   = float(data.get('porcentaje', 0))
+
+        if not agencia_ids or not loteria_ids or not horas:
+            return jsonify({'error': 'Seleccione agencia(s), lotería(s) y hora(s)'}), 400
+
+        # Verificar que las agencias pertenezcan a este admin
+        with get_db() as db:
+            ags_validas = {r['id'] for r in db.execute(
+                "SELECT id FROM agencias WHERE admin_padre_id=? AND es_admin=0",
+                (admin_id,)).fetchall()}
+            count = 0
+            for ag_id in agencia_ids:
+                if int(ag_id) not in ags_validas:
+                    continue
+                for lot_id in loteria_ids:
+                    lot = get_loteria(lot_id)
+                    horas_validas, _ = get_horarios(lot_id)
+                    nums_validos = list(lot['animales'].keys()) if not numeros else [n for n in numeros if n in lot['animales']]
+                    if not nums_validos:
+                        nums_validos = list(lot['animales'].keys())
+                    for hora in horas:
+                        if hora not in horas_validas:
+                            continue
+                        for num in nums_validos:
+                            if monto_tope <= 0 and porcentaje <= 0:
+                                db.execute("""DELETE FROM topes_agencia 
+                                    WHERE admin_id=? AND agencia_id=? AND loteria=? AND hora=? AND numero=?""",
+                                    (admin_id, ag_id, lot_id, hora, str(num)))
+                            else:
+                                db.execute("""INSERT INTO topes_agencia 
+                                    (admin_id, agencia_id, loteria, hora, numero, monto_tope, porcentaje)
+                                    VALUES (?,?,?,?,?,?,?)
+                                    ON CONFLICT(admin_id, agencia_id, loteria, hora, numero)
+                                    DO UPDATE SET monto_tope=excluded.monto_tope, porcentaje=excluded.porcentaje""",
+                                    (admin_id, ag_id, lot_id, hora, str(num), monto_tope, porcentaje))
+                            count += 1
+            db.commit()
+        log_audit('TOPES_AGENCIA_MASIVO', f"Guardados {count} topes para {len(agencia_ids)} agencias")
+        return jsonify({'status':'ok', 'mensaje': f'{count} tope(s) aplicado(s)'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/topes-agencia/lista', methods=['GET'])
+@admin_required
+def lista_topes_agencia():
+    """Lista los topes configurados para una agencia."""
+    try:
+        admin_id  = session['user_id']
+        agencia_id = request.args.get('agencia_id')
+        loteria_id = request.args.get('loteria', '')
+        hoy        = ahora_peru().strftime("%d/%m/%Y")
+        with get_db() as db:
+            q = """SELECT ta.*, ag.nombre_agencia
+                   FROM topes_agencia ta
+                   JOIN agencias ag ON ta.agencia_id = ag.id
+                   WHERE ta.admin_id=?"""
+            params = [admin_id]
+            if agencia_id:
+                q += " AND ta.agencia_id=?"; params.append(agencia_id)
+            if loteria_id:
+                q += " AND ta.loteria=?"; params.append(loteria_id)
+            q += " ORDER BY ag.nombre_agencia, ta.loteria, ta.hora, CAST(ta.numero AS INTEGER)"
+            rows = db.execute(q, params).fetchall()
+            # Calcular apostado hoy por agencia/lot/hora/num
+            apostados = {}
+            for r in rows:
+                key = (r['agencia_id'], r['loteria'], r['hora'], r['numero'])
+                if key not in apostados:
+                    res = db.execute("""
+                        SELECT COALESCE(SUM(j.monto),0) as total FROM jugadas j
+                        JOIN tickets t ON j.ticket_id=t.id
+                        WHERE t.agencia_id=? AND j.loteria=? AND j.hora=? AND j.seleccion=?
+                        AND j.tipo='animal' AND t.anulado=0 AND t.fecha LIKE ?
+                    """, (r['agencia_id'], r['loteria'], r['hora'], r['numero'], hoy+'%')).fetchone()
+                    apostados[key] = res['total'] if res else 0
+        result = []
+        for r in rows:
+            key = (r['agencia_id'], r['loteria'], r['hora'], r['numero'])
+            lot = get_loteria(r['loteria'])
+            apostado = apostados.get(key, 0)
+            tope = r['monto_tope']
+            result.append({
+                'id': r['id'],
+                'agencia_id': r['agencia_id'],
+                'agencia_nombre': r['nombre_agencia'],
+                'loteria': r['loteria'],
+                'loteria_nombre': lot['nombre'],
+                'hora': r['hora'],
+                'numero': r['numero'],
+                'animal': lot['animales'].get(r['numero'], '?'),
+                'monto_tope': tope,
+                'porcentaje': r['porcentaje'],
+                'apostado': round(apostado, 2),
+                'disponible': round(max(0, tope - apostado), 2) if tope > 0 else None
+            })
+        return jsonify({'status':'ok', 'topes': result})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/topes-agencia/eliminar', methods=['POST'])
+@admin_required
+def eliminar_tope_agencia():
+    try:
+        data = request.get_json() or {}
+        admin_id = session['user_id']
+        tope_id  = data.get('id')
+        with get_db() as db:
+            db.execute("DELETE FROM topes_agencia WHERE id=? AND admin_id=?", (tope_id, admin_id))
+            db.commit()
+        return jsonify({'status':'ok'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/topes-agencia/limpiar-agencia', methods=['POST'])
+@admin_required
+def limpiar_topes_agencia():
+    """Elimina todos los topes de una agencia (o con filtros opcionales)."""
+    try:
+        data      = request.get_json() or {}
+        admin_id  = session['user_id']
+        agencia_id= data.get('agencia_id')
+        loteria   = data.get('loteria','')
+        hora      = data.get('hora','')
+        with get_db() as db:
+            q = "DELETE FROM topes_agencia WHERE admin_id=?"
+            params = [admin_id]
+            if agencia_id: q += " AND agencia_id=?"; params.append(agencia_id)
+            if loteria:    q += " AND loteria=?";    params.append(loteria)
+            if hora:       q += " AND hora=?";       params.append(hora)
+            db.execute(q, params)
+            db.commit()
+        return jsonify({'status':'ok', 'mensaje':'Topes eliminados'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ========================= API COMISIONES POR LOTERÍA =========================
+@app.route('/admin/comisiones-loteria/guardar', methods=['POST'])
+@admin_required
+def guardar_comisiones_loteria():
+    """Guarda % de comisión por lotería para una o varias agencias."""
+    try:
+        data = request.get_json() or {}
+        admin_id = session['user_id']
+        agencia_ids = data.get('agencia_ids', [])
+        comisiones  = data.get('comisiones', {})
+        if not agencia_ids or not comisiones:
+            return jsonify({'error': 'Faltan agencias o comisiones'}), 400
+        with get_db() as db:
+            ags_validas = {r['id'] for r in db.execute(
+                "SELECT id FROM agencias WHERE admin_padre_id=? AND es_admin=0", (admin_id,)).fetchall()}
+            count = 0
+            for ag_id in agencia_ids:
+                if int(ag_id) not in ags_validas:
+                    continue
+                for lot_id, pct in comisiones.items():
+                    pct_val = float(pct)
+                    if pct_val < 0:
+                        continue
+                    db.execute("""
+                        INSERT INTO comisiones_loteria (admin_id, agencia_id, loteria, comision)
+                        VALUES (?,?,?,?)
+                        ON CONFLICT(admin_id, agencia_id, loteria)
+                        DO UPDATE SET comision=excluded.comision
+                    """, (admin_id, int(ag_id), lot_id, pct_val))
+                    count += 1
+            db.commit()
+        log_audit('COMISION_LOTERIA', f"{count} comisiones por lotería guardadas")
+        return jsonify({'status': 'ok', 'mensaje': f'{count} comisión(es) guardada(s)'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/comisiones-loteria/lista')
+@admin_required
+def lista_comisiones_loteria():
+    try:
+        admin_id   = session['user_id']
+        agencia_id = request.args.get('agencia_id')
+        with get_db() as db:
+            ags = db.execute(
+                "SELECT id, nombre_agencia, comision FROM agencias WHERE admin_padre_id=? AND es_admin=0",
+                (admin_id,)).fetchall()
+            q = """SELECT cl.*, ag.nombre_agencia, ag.comision as com_general
+                   FROM comisiones_loteria cl
+                   JOIN agencias ag ON cl.agencia_id=ag.id
+                   WHERE cl.admin_id=?"""
+            params = [admin_id]
+            if agencia_id:
+                q += " AND cl.agencia_id=?"; params.append(agencia_id)
+            q += " ORDER BY ag.nombre_agencia, cl.loteria"
+            rows = db.execute(q, params).fetchall()
+        result = []
+        for r in rows:
+            lot = get_loteria(r['loteria'])
+            result.append({
+                'id': r['id'],
+                'agencia_id': r['agencia_id'],
+                'agencia_nombre': r['nombre_agencia'],
+                'com_general': round(r['com_general']*100, 2),
+                'loteria': r['loteria'],
+                'loteria_nombre': lot['nombre'],
+                'loteria_emoji': lot['emoji'],
+                'comision': round(r['comision']*100, 2)
+            })
+        ags_list = [{'id': a['id'], 'nombre': a['nombre_agencia'],
+                     'com_general': round(a['comision']*100, 2)} for a in ags]
+        return jsonify({'status': 'ok', 'comisiones': result, 'agencias': ags_list})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/comisiones-loteria/eliminar', methods=['POST'])
+@admin_required
+def eliminar_comision_loteria():
+    try:
+        data     = request.get_json() or {}
+        admin_id = session['user_id']
+        cid      = data.get('id')
+        with get_db() as db:
+            db.execute("DELETE FROM comisiones_loteria WHERE id=? AND admin_id=?", (cid, admin_id))
+            db.commit()
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 # ========================= RIESGO MEJORADO =========================
 @app.route('/admin/riesgo')
@@ -1652,23 +2081,32 @@ def estadisticas_rango():
         admin_id = session['user_id']
         with get_db() as db:
             all_t = db.execute("SELECT * FROM tickets WHERE admin_id=? AND anulado=0 ORDER BY id DESC LIMIT 10000", (admin_id,)).fetchall()
-        dias = {}; total_v = total_p = total_t = 0
+            # Cargar comisión real de cada agencia
+            ags_com = {r['id']: r['comision'] for r in db.execute(
+                "SELECT id, comision FROM agencias WHERE admin_padre_id=? OR id=?", (admin_id, admin_id)).fetchall()}
+        dias = {}; total_v = total_t = 0; total_com = 0
         for t in all_t:
             dt = parse_fecha(t['fecha'])
             if not dt or dt<dti or dt>dtf: continue
             dk = dt.strftime("%d/%m/%Y")
-            if dk not in dias: dias[dk] = {'ventas':0,'tickets':0,'ids':[]}
-            dias[dk]['ventas'] += t['total']; dias[dk]['tickets'] += 1; dias[dk]['ids'].append(t['id'])
-            total_v += t['total']; total_t += 1
+            com_pct = ags_com.get(t['agencia_id'], 0)
+            if dk not in dias: dias[dk] = {'ventas':0,'tickets':0,'ids':[],'comision':0}
+            dias[dk]['ventas'] += t['total']
+            dias[dk]['tickets'] += 1
+            dias[dk]['ids'].append(t['id'])
+            dias[dk]['comision'] += t['total'] * com_pct
+            total_v += t['total']
+            total_t += 1
+            total_com += t['total'] * com_pct
         resumen = []; total_p2 = 0
         for dk in sorted(dias.keys()):
             d = dias[dk]; prem = 0
             for tid in d['ids']:
                 with get_db() as db2: prem += calcular_premio_ticket(tid,db2)
-            total_p2 += prem; cd = d['ventas']*COMISION_AGENCIA
+            total_p2 += prem
+            cd = d['comision']
             resumen.append({'fecha':dk,'ventas':round(d['ventas'],2),'premios':round(prem,2),'comisiones':round(cd,2),'balance':round(d['ventas']-prem-cd,2),'tickets':d['tickets']})
-        tc = total_v*COMISION_AGENCIA
-        return jsonify({'resumen_por_dia':resumen,'totales':{'ventas':round(total_v,2),'premios':round(total_p2,2),'comisiones':round(tc,2),'balance':round(total_v-total_p2-tc,2),'tickets':total_t}})
+        return jsonify({'resumen_por_dia':resumen,'totales':{'ventas':round(total_v,2),'premios':round(total_p2,2),'comisiones':round(total_com,2),'balance':round(total_v-total_p2-total_com,2),'tickets':total_t}})
     except Exception as e:
         return jsonify({'error':str(e)}),500
 
@@ -1720,24 +2158,48 @@ def caja_historico():
         dti = datetime.strptime(fi,"%Y-%m-%d")
         dtf = datetime.strptime(ff,"%Y-%m-%d").replace(hour=23,minute=59)
         admin_id = session.get('admin_id')
+        agencia_id = session['user_id']
         with get_db() as db:
-            ag = db.execute("SELECT comision FROM agencias WHERE id=?",(session['user_id'],)).fetchone()
-            com_pct = ag['comision'] if ag else COMISION_AGENCIA
-            tickets = db.execute("SELECT * FROM tickets WHERE agencia_id=? AND admin_id=? AND anulado=0 ORDER BY id DESC LIMIT 2000",(session['user_id'],admin_id)).fetchall()
-        dias = {}; tv = 0; tp = 0
-        for t in tickets:
-            dt = parse_fecha(t['fecha'])
-            if not dt or dt<dti or dt>dtf: continue
-            dk = dt.strftime("%d/%m/%Y")
-            if dk not in dias: dias[dk] = {'ventas':0,'tickets':0,'premios':0}
-            dias[dk]['ventas'] += t['total']; dias[dk]['tickets'] += 1; tv += t['total']
-            with get_db() as db2: p = calcular_premio_ticket(t['id'],db2)
-            if t['pagado']: dias[dk]['premios'] += p; tp += p
+            tickets = db.execute(
+                "SELECT * FROM tickets WHERE agencia_id=? AND admin_id=? AND anulado=0 ORDER BY id DESC LIMIT 2000",
+                (agencia_id, admin_id)).fetchall()
+            dias = {}; tv = 0; tp = 0; tc = 0
+            for t in tickets:
+                dt = parse_fecha(t['fecha'])
+                if not dt or dt<dti or dt>dtf: continue
+                dk = dt.strftime("%d/%m/%Y")
+                if dk not in dias: dias[dk] = {'ventas':0,'tickets':0,'premios':0,'comision':0}
+                dias[dk]['ventas'] += t['total']
+                dias[dk]['tickets'] += 1
+                tv += t['total']
+                p = calcular_premio_ticket(t['id'], db)
+                if t['pagado']:
+                    dias[dk]['premios'] += p; tp += p
+                # Comisión por lotería
+                jugs = db.execute(
+                    "SELECT loteria, SUM(monto) as sub FROM jugadas WHERE ticket_id=? GROUP BY loteria",
+                    (t['id'],)).fetchall()
+                trips = db.execute(
+                    "SELECT loteria, SUM(monto) as sub FROM tripletas WHERE ticket_id=? GROUP BY loteria",
+                    (t['id'],)).fetchall()
+                ticket_com = 0
+                for j in jugs:
+                    pct = get_comision_loteria(admin_id, agencia_id, j['loteria'], db)
+                    ticket_com += (j['sub'] or 0) * pct
+                for tr in trips:
+                    pct = get_comision_loteria(admin_id, agencia_id, tr['loteria'], db)
+                    ticket_com += (tr['sub'] or 0) * pct
+                if not jugs and not trips:
+                    ag = db.execute("SELECT comision FROM agencias WHERE id=?", (agencia_id,)).fetchone()
+                    ticket_com = t['total'] * (ag['comision'] if ag else 0)
+                dias[dk]['comision'] += ticket_com
+                tc += ticket_com
         resumen = []
         for dk in sorted(dias.keys()):
-            d = dias[dk]; cd = d['ventas']*com_pct
-            resumen.append({'fecha':dk,'tickets':d['tickets'],'ventas':round(d['ventas'],2),'premios':round(d['premios'],2),'comision':round(cd,2),'balance':round(d['ventas']-d['premios']-cd,2)})
-        tc = tv*com_pct
+            d = dias[dk]
+            resumen.append({'fecha':dk,'tickets':d['tickets'],'ventas':round(d['ventas'],2),
+                           'premios':round(d['premios'],2),'comision':round(d['comision'],2),
+                           'balance':round(d['ventas']-d['premios']-d['comision'],2)})
         return jsonify({'resumen_por_dia':resumen,'totales':{'ventas':round(tv,2),'premios':round(tp,2),'comision':round(tc,2),'balance':round(tv-tp-tc,2)}})
     except Exception as e:
         return jsonify({'error':str(e)}),500
@@ -2141,6 +2603,7 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
       <button class="action-btn" style="background:#1a3a90;border-color:#4070d0" onclick="agregarJugada()">➕ AGREGAR</button>
       <button class="action-btn trip" onclick="openTripletaModal()">🎯 TRIPLETA</button>
       <button class="action-btn wa" onclick="vender()" id="btn-wa" disabled>📤 WHATSAPP</button>
+      <button class="action-btn" style="background:#0a2a1a;border-color:#16a34a;color:#4ade80" onclick="validarCarritoUI()">🔍 VERIFICAR</button>
       <button class="action-btn sec" onclick="borrarTodo()">🗑 BORRAR TODO</button>
       <button class="action-btn sec" onclick="openPagar()">💵 PAGAR</button>
       <button class="action-btn danger" onclick="openAnular()">❌ ANULAR</button>
@@ -2549,6 +3012,8 @@ function agregarJugada(){
 }
 
 // ========================= RENDER CARRITO =========================
+let carritoErrores = {}; // idx -> {msg, disponible, agotado_total}
+
 function renderCarrito(){
   let list = document.getElementById('ticket-list');
   let tot = document.getElementById('ticket-total');
@@ -2557,6 +3022,7 @@ function renderCarrito(){
     list.innerHTML = '<div class="ticket-empty">TICKET VACÍO<br>Ingresa número y monto</div>';
     tot.style.display = 'none';
     document.getElementById('btn-wa').disabled = true;
+    carritoErrores = {};
     return;
   }
   
@@ -2565,31 +3031,200 @@ function renderCarrito(){
     total += item.monto;
     let lot = LOTERIAS_DATA[item.loteria];
     let esTripleta = item.tipo === 'tripleta';
+    let err = carritoErrores[i];
     let horaLabel = esTripleta
       ? '<span style="color:#c084fc;font-size:.58rem;font-weight:700;font-family:\'Oswald\',sans-serif;letter-spacing:1px">TRIPLETA</span>'
       : `<span class="ti-hora">${item.hora.replace(':00 ','').replace(' ','')}</span>`;
-    html += `<div class="ti" style="${esTripleta ? 'background:#0d0620;border-left:3px solid #a855f7;' : ''}">
-      <span class="ti-lotbadge" style="background:${lot.color}30;color:${lot.color};border:1px solid ${lot.color}50">${lot.emoji}</span>
-      ${horaLabel}
-      <span class="ti-desc" style="${esTripleta ? 'color:#e0a0ff;' : ''}">${item.desc}</span>
-      <span class="ti-monto">${item.monto.toFixed(1)}</span>
-      <button class="ti-del" onclick="quitarItem(${i})">✕</button>
-    </div>`;
+
+    if(err){
+      let esAjustable = (!err.agotado_total && err.disponible > 0);
+      // Fila con error — rojo si agotado total, naranja si ajustable
+      let rowColor  = esAjustable ? '#1a0e00' : '#1a0505';
+      let bordColor = esAjustable ? '#d97706' : '#dc2626';
+      let txtColor  = esAjustable ? '#fbbf24' : '#fca5a5';
+      let icono     = esAjustable ? '⚠️' : '⛔';
+      let msgCorto  = err.msg.length > 26 ? err.msg.substring(0,26)+'…' : err.msg;
+
+      let botonesErr = `<button onclick="quitarItem(${i})" style="padding:2px 5px;background:#7f1d1d;border:1px solid #dc2626;color:#fca5a5;font-size:.58rem;font-family:'Oswald',sans-serif;cursor:pointer;border-radius:2px;white-space:nowrap">✕ QUITAR</button>`;
+      if(esAjustable){
+        botonesErr += `<button onclick="ajustarMonto(${i},${err.disponible})" style="padding:2px 5px;background:#78350f;border:1px solid #d97706;color:#fde68a;font-size:.58rem;font-family:'Oswald',sans-serif;cursor:pointer;border-radius:2px;white-space:nowrap">→ S/${err.disponible.toFixed(1)}</button>`;
+      }
+
+      html += `<div class="ti" style="background:${rowColor};border-left:3px solid ${bordColor};border-top:1px solid ${bordColor}40;flex-wrap:wrap;gap:2px;padding:4px 3px;">
+        <span class="ti-lotbadge" style="background:${bordColor}30;color:${txtColor};border:1px solid ${bordColor}50">${lot.emoji}</span>
+        ${horaLabel}
+        <span style="flex:1;color:${txtColor};font-size:.6rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${err.msg}">${icono} ${item.seleccion} ${msgCorto}</span>
+        <span class="ti-monto" style="color:${txtColor}">${item.monto.toFixed(1)}</span>
+        <div style="display:flex;gap:2px;width:100%;justify-content:flex-end;margin-top:1px">${botonesErr}</div>
+      </div>`;
+    } else {
+      let rowStyle = esTripleta ? 'background:#0d0620;border-left:3px solid #a855f7;' : '';
+      let descColor = esTripleta ? 'color:#e0a0ff;' : '';
+      html += `<div class="ti" style="${rowStyle}">
+        <span class="ti-lotbadge" style="background:${lot.color}30;color:${lot.color};border:1px solid ${lot.color}50">${lot.emoji}</span>
+        ${horaLabel}
+        <span class="ti-desc" style="${descColor}">${item.desc}</span>
+        <span class="ti-monto">${item.monto.toFixed(1)}</span>
+        <button class="ti-del" onclick="quitarItem(${i})">✕</button>
+      </div>`;
+    }
   });
+
+  // Banner de errores encima del ticket
+  let numErrores  = Object.keys(carritoErrores).length;
+  let numAgotados = Object.values(carritoErrores).filter(e=>e.agotado_total).length;
+  let numAjust    = Object.values(carritoErrores).filter(e=>!e.agotado_total && e.disponible>0).length;
+
+  if(numErrores > 0){
+    let bannerColor = numAgotados > 0 ? '#dc2626' : '#d97706';
+    let bannerBg    = numAgotados > 0 ? '#1a0505'  : '#1a0e00';
+    let bannerMsg   = [];
+    if(numAgotados > 0) bannerMsg.push(`⛔ ${numAgotados} agotado(s)`);
+    if(numAjust    > 0) bannerMsg.push(`⚠️ ${numAjust} ajustable(s)`);
+
+    let btns = `<button onclick="quitarTodosErrores()" style="flex:1;padding:5px;background:#7f1d1d;border:1px solid #dc2626;color:#fca5a5;font-size:.63rem;font-family:'Oswald',sans-serif;font-weight:700;cursor:pointer;border-radius:2px">🗑 QUITAR AGOTADOS</button>`;
+    if(numAjust > 0){
+      btns += `<button onclick="ajustarTodos()" style="flex:1;padding:5px;background:#78350f;border:1px solid #d97706;color:#fde68a;font-size:.63rem;font-family:'Oswald',sans-serif;font-weight:700;cursor:pointer;border-radius:2px">⚡ AJUSTAR TODOS</button>`;
+    }
+    btns += `<button onclick="validarCarritoUI()" style="flex:1;padding:5px;background:#1a2a50;border:1px solid #4070d0;color:#90b8ff;font-size:.63rem;font-family:'Oswald',sans-serif;font-weight:700;cursor:pointer;border-radius:2px">🔄 REVERIFICAR</button>`;
+
+    html = `<div style="background:${bannerBg};border:2px solid ${bannerColor};border-radius:4px;padding:6px 8px;margin-bottom:4px">
+      <div style="color:${bannerColor==='#dc2626'?'#f87171':'#fbbf24'};font-family:'Oswald',sans-serif;font-size:.7rem;letter-spacing:1px;margin-bottom:4px">${bannerMsg.join(' — ')}</div>
+      <div style="display:flex;gap:3px;flex-wrap:wrap">${btns}</div>
+    </div>` + html;
+  }
   
   list.innerHTML = html;
   tot.style.display = 'block';
-  tot.textContent = `TOTAL: S/${total.toFixed(2)} (${carrito.length} jugadas)`;
-  document.getElementById('btn-wa').disabled = false;
+
+  if(numErrores > 0){
+    let partes = [];
+    if(numAgotados > 0) partes.push(`<span style="color:#f87171">⛔ ${numAgotados} agotado(s)</span>`);
+    if(numAjust    > 0) partes.push(`<span style="color:#fbbf24">⚠️ ${numAjust} ajustable(s)</span>`);
+    tot.innerHTML = partes.join(' — ') + ` <span style="color:#c8d8f0">— TOTAL: S/${total.toFixed(2)}</span>`;
+  } else {
+    tot.textContent = `TOTAL: S/${total.toFixed(2)} (${carrito.length} jugadas)`;
+  }
+
+  // Bloquear WHATSAPP si hay cualquier error (agotado O ajustable pendiente de ajuste)
+  document.getElementById('btn-wa').disabled = (carrito.length === 0 || numErrores > 0);
 }
 
-function quitarItem(i){ carrito.splice(i,1); renderCarrito(); }
-function borrarTodo(){ if(carrito.length && !confirm('¿Borrar todo?')) return; carrito=[]; renderCarrito(); }
+function ajustarMonto(idx, disponible){
+  if(disponible <= 0){ quitarItem(idx); return; }
+  carrito[idx].monto = disponible;
+  delete carritoErrores[idx];
+  renderCarrito();
+  toast(`✓ Monto ajustado a S/${disponible.toFixed(1)}`, 'ok');
+}
+
+function ajustarTodos(){
+  // Ajustar todos los que tienen disponible > 0, quitar los agotados totales
+  let idxsAgotados = [];
+  Object.entries(carritoErrores).forEach(([k,v])=>{
+    let i = parseInt(k);
+    if(!v.agotado_total && v.disponible > 0){
+      carrito[i].monto = v.disponible;
+      delete carritoErrores[i];
+    } else {
+      idxsAgotados.push(i);
+    }
+  });
+  // Quitar agotados totales en orden inverso
+  idxsAgotados.sort((a,b)=>b-a).forEach(i=>{
+    carrito.splice(i,1);
+  });
+  carritoErrores = {};
+  renderCarrito();
+  toast('✓ Ajuste aplicado a todos', 'ok');
+}
+
+function quitarItem(i){
+  carrito.splice(i,1);
+  let newErr = {};
+  Object.entries(carritoErrores).forEach(([k,v])=>{
+    let ki = parseInt(k);
+    if(ki < i) newErr[ki] = v;
+    else if(ki > i) newErr[ki-1] = v;
+  });
+  carritoErrores = newErr;
+  renderCarrito();
+}
+
+function quitarTodosErrores(){
+  let idxs = Object.keys(carritoErrores).map(Number).sort((a,b)=>b-a);
+  idxs.forEach(i => carrito.splice(i,1));
+  carritoErrores = {};
+  renderCarrito();
+}
+
+function borrarTodo(){ if(carrito.length && !confirm('¿Borrar todo?')) return; carrito=[]; carritoErrores={}; renderCarrito(); }
+
+async function validarCarritoUI(){
+  if(carrito.length === 0) return;
+  try{
+    let r = await fetch('/api/validar-carrito',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({jugadas: carrito})
+    });
+    let d = await r.json();
+    if(d.error){ toast(d.error,'err'); return; }
+    carritoErrores = {};
+    d.resultados.forEach(res=>{
+      if(!res.ok) carritoErrores[res.idx] = {
+        msg: res.msg,
+        disponible: res.disponible || 0,
+        agotado_total: res.agotado_total || false
+      };
+    });
+    renderCarrito();
+    if(d.hay_errores){
+      let nAg = Object.values(carritoErrores).filter(e=>e.agotado_total).length;
+      let nAj = Object.values(carritoErrores).filter(e=>!e.agotado_total&&e.disponible>0).length;
+      let partes = [];
+      if(nAg>0) partes.push(`${nAg} agotado(s)`);
+      if(nAj>0) partes.push(`${nAj} con disponible parcial — usa ⚡ AJUSTAR`);
+      toast('⛔ ' + partes.join(' | '), 'err');
+    } else {
+      toast('✓ Todas las jugadas disponibles','ok');
+    }
+  } catch(e){ toast('Error al verificar','err'); }
+}
 
 async function vender(){
   if(carrito.length===0){ toast('Ticket vacío','err'); return; }
   let btn = document.getElementById('btn-wa');
-  btn.disabled = true; btn.textContent = '⏳...';
+  btn.disabled = true; btn.textContent = '⏳ VERIFICANDO...';
+
+  try{
+    let rv = await fetch('/api/validar-carrito',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({jugadas: carrito})
+    });
+    let dv = await rv.json();
+    if(dv.error){ toast(dv.error,'err'); btn.disabled=false; btn.textContent='📤 WHATSAPP'; return; }
+    if(dv.hay_errores){
+      carritoErrores = {};
+      dv.resultados.forEach(res=>{
+        if(!res.ok) carritoErrores[res.idx] = {
+          msg: res.msg,
+          disponible: res.disponible || 0,
+          agotado_total: res.agotado_total || false
+        };
+      });
+      renderCarrito();
+      let nAg = Object.values(carritoErrores).filter(e=>e.agotado_total).length;
+      let nAj = Object.values(carritoErrores).filter(e=>!e.agotado_total&&e.disponible>0).length;
+      let partes = [];
+      if(nAg>0) partes.push(`${nAg} agotado(s)`);
+      if(nAj>0) partes.push(`${nAj} ajustable(s) — presiona ⚡ AJUSTAR TODOS`);
+      toast('⛔ ' + partes.join(' | '), 'err');
+      btn.disabled = true; btn.textContent='📤 WHATSAPP';
+      return;
+    }
+  } catch(e){ toast('Error de conexión al verificar','err'); btn.disabled=false; btn.textContent='📤 WHATSAPP'; return; }
+
+  btn.textContent = '⏳ PROCESANDO...';
   try{
     let r = await fetch('/api/procesar-venta',{
       method:'POST', headers:{'Content-Type':'application/json'},
@@ -2600,7 +3235,7 @@ async function vender(){
     else{
       if(/Android|iPhone|iPad/i.test(navigator.userAgent)) window.location.href = d.url_whatsapp;
       else window.open(d.url_whatsapp,'_blank');
-      carrito=[]; renderCarrito(); toast('¡Ticket generado!','ok');
+      carrito=[]; carritoErrores={}; renderCarrito(); toast('¡Ticket generado!','ok');
     }
   } catch(e){ toast('Error de conexión','err'); }
   finally{ btn.disabled = carrito.length===0; btn.textContent = '📤 WHATSAPP'; }
@@ -2995,9 +3630,11 @@ tr:hover td{background:#0d1828}
   <div class="tab" onclick="showTab('tripletas')">🔮 TRIPLETAS</div>
   <div class="tab" onclick="showTab('riesgo')">⚠️ RIESGO</div>
   <div class="tab" onclick="showTab('topes')">🛡️ TOPES</div>
+  <div class="tab" onclick="showTab('topes-ag')">🏪 TOPES AGENCIAS</div>
   <div class="tab" onclick="showTab('bloqueos')">🔒 BLOQUEOS</div>
   <div class="tab" onclick="showTab('reportes')">📈 REPORTES</div>
   <div class="tab" onclick="showTab('agencias')">🏪 AGENCIAS</div>
+  <div class="tab" onclick="showTab('comisiones')">💹 COMISIONES</div>
   <div class="tab" onclick="showTab('operaciones')">💰 OPERACIONES</div>
   <div class="tab" onclick="showTab('auditoria')">📋 AUDITORÍA</div>
 </div>
@@ -3091,6 +3728,96 @@ tr:hover td{background:#0d1828}
   </div>
 </div>
 
+<!-- TOPES AGENCIAS -->
+<div id="tc-topes-ag" class="tc">
+  <div class="fbox">
+    <h3>🏪 TOPES POR AGENCIA — CONFIGURACIÓN MASIVA</h3>
+    <div style="color:var(--text2);font-size:.76rem;margin-bottom:12px">
+      Selecciona una o varias agencias, loterías, horas y números para aplicar el tope de una sola vez.
+      Tope 0 = elimina el tope. El porcentaje es referencial para tu control interno.
+    </div>
+
+    <!-- PASO 1: Agencias -->
+    <div class="fbox" style="margin-bottom:10px;background:#080d18;border:1px solid #1a2a50">
+      <h3 style="font-size:.82rem;margin-bottom:8px">① AGENCIAS</h3>
+      <div style="display:flex;gap:6px;margin-bottom:6px;flex-wrap:wrap">
+        <button class="btn-sec" style="font-size:.68rem" onclick="tapSelAllAgs()">✅ TODAS</button>
+        <button class="btn-sec" style="font-size:.68rem" onclick="tapDeselAllAgs()">⬜ NINGUNA</button>
+      </div>
+      <div id="tap-agencias" style="display:flex;flex-wrap:wrap;gap:5px"></div>
+    </div>
+
+    <!-- PASO 2: Loterías -->
+    <div class="fbox" style="margin-bottom:10px;background:#080d18;border:1px solid #1a2a50">
+      <h3 style="font-size:.82rem;margin-bottom:8px">② LOTERÍAS</h3>
+      <div style="display:flex;gap:6px;margin-bottom:6px;flex-wrap:wrap">
+        <button class="btn-sec" style="font-size:.68rem" onclick="tapSelAllLots()">✅ TODAS</button>
+        <button class="btn-sec" style="font-size:.68rem" onclick="tapDeselAllLots()">⬜ NINGUNA</button>
+      </div>
+      <div id="tap-loterias" style="display:flex;flex-wrap:wrap;gap:5px"></div>
+    </div>
+
+    <!-- PASO 3: Horas -->
+    <div class="fbox" style="margin-bottom:10px;background:#080d18;border:1px solid #1a2a50">
+      <h3 style="font-size:.82rem;margin-bottom:8px">③ HORAS DE SORTEO</h3>
+      <div style="display:flex;gap:6px;margin-bottom:6px;flex-wrap:wrap">
+        <button class="btn-sec" style="font-size:.68rem" onclick="tapSelAllHoras()">✅ TODAS</button>
+        <button class="btn-sec" style="font-size:.68rem" onclick="tapDeselAllHoras()">⬜ NINGUNA</button>
+      </div>
+      <div id="tap-horas" style="display:flex;flex-wrap:wrap;gap:4px"></div>
+    </div>
+
+    <!-- PASO 4: Números -->
+    <div class="fbox" style="margin-bottom:10px;background:#080d18;border:1px solid #1a2a50">
+      <h3 style="font-size:.82rem;margin-bottom:8px">④ NÚMEROS / ANIMALES <span style="color:#4a6090;font-size:.68rem">(vacío = todos)</span></h3>
+      <div style="display:flex;gap:6px;margin-bottom:6px;flex-wrap:wrap">
+        <button class="btn-sec" style="font-size:.68rem" onclick="tapSelAllNums()">✅ TODOS</button>
+        <button class="btn-sec" style="font-size:.68rem" onclick="tapDeselAllNums()">⬜ NINGUNO</button>
+      </div>
+      <div id="tap-numeros" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(68px,1fr));gap:4px;max-height:280px;overflow-y:auto"></div>
+    </div>
+
+    <!-- PASO 5: Tope y porcentaje -->
+    <div class="fbox" style="margin-bottom:10px;background:#080d18;border:1px solid #1a2a50">
+      <h3 style="font-size:.82rem;margin-bottom:8px">⑤ MONTO Y PORCENTAJE</h3>
+      <div class="frow" style="flex-wrap:wrap;gap:10px">
+        <div style="display:flex;flex-direction:column;gap:4px;flex:1;min-width:160px">
+          <label style="color:#4a6090;font-size:.7rem;letter-spacing:1px">MONTO MÁXIMO POR NÚMERO (S/)</label>
+          <input type="number" id="tap-monto" placeholder="Ej: 5" min="0" step="0.5"
+            style="padding:10px;background:#0a1828;border:2px solid #2a4a80;border-radius:4px;color:#fbbf24;font-family:'Oswald',sans-serif;font-size:1.1rem;font-weight:700;text-align:center">
+        </div>
+        <div style="display:flex;flex-direction:column;gap:4px;flex:1;min-width:160px">
+          <label style="color:#4a6090;font-size:.7rem;letter-spacing:1px">PORCENTAJE DE VENTAS (%) — REFERENCIAL</label>
+          <input type="number" id="tap-pct" placeholder="Ej: 15" min="0" max="100" step="0.5"
+            style="padding:10px;background:#0a1828;border:2px solid #2a4a80;border-radius:4px;color:#c084fc;font-family:'Oswald',sans-serif;font-size:1.1rem;font-weight:700;text-align:center">
+        </div>
+      </div>
+      <div id="tap-resumen" style="color:#4a6090;font-size:.72rem;margin-top:8px;min-height:18px"></div>
+      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+        <button class="btn-s" onclick="guardarTopesAgMasivo()">💾 APLICAR TOPES</button>
+        <button class="btn-d" onclick="limpiarTopesAgSel()">🗑 ELIMINAR SELECCIONADOS</button>
+      </div>
+      <div id="tap-msg" style="margin-top:8px;font-size:.8rem"></div>
+    </div>
+
+    <!-- Tabla de topes configurados -->
+    <div class="fbox" style="background:#080d18;border:1px solid #1a2a50">
+      <h3 style="font-size:.82rem;margin-bottom:8px">📋 TOPES CONFIGURADOS POR AGENCIA</h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;align-items:center">
+        <select id="tap-filtro-ag" style="padding:7px 10px;background:#0a1828;border:2px solid #2a4a80;border-radius:3px;color:#fbbf24;font-size:.8rem">
+          <option value="">— Todas las agencias —</option>
+        </select>
+        <select id="tap-filtro-lot" style="padding:7px 10px;background:#0a1828;border:2px solid #2a4a80;border-radius:3px;color:#4ade80;font-size:.8rem">
+          <option value="">— Todas las loterías —</option>
+        </select>
+        <button class="btn-sec" onclick="cargarTablaTopesAg()">🔄 ACTUALIZAR</button>
+        <button class="btn-d" style="font-size:.68rem" onclick="if(confirm('¿Borrar TODOS los topes de la agencia filtrada?'))limpiarTopesAgFiltro()">🗑 LIMPIAR FILTRO</button>
+      </div>
+      <div id="tap-tabla" style="max-height:500px;overflow-y:auto;overflow-x:auto"></div>
+    </div>
+  </div>
+</div>
+
 <!-- BLOQUEOS (sistema limites_venta existente del 18) -->
 <div id="tc-bloqueos" class="tc">
   <div class="fbox">
@@ -3173,12 +3900,26 @@ tr:hover td{background:#0d1828}
     </table></div>
   </div>
   <div class="fbox" id="edit-ag-box" style="display:none">
-    <h3>✏️ EDITAR AGENCIA</h3>
+    <h3>✏️ EDITAR AGENCIA — <span id="edit-ag-nombre-title" style="color:var(--gold)"></span></h3>
+    <div style="background:#0a1828;border:1px solid #1a3060;border-radius:4px;padding:10px;margin-bottom:10px">
+      <div style="color:#4a6090;font-size:.68rem;letter-spacing:1px;margin-bottom:6px">COMISIÓN ACTUAL</div>
+      <div id="edit-ag-com-actual" style="color:#fbbf24;font-family:'Oswald',sans-serif;font-size:1.4rem;font-weight:700">---%</div>
+      <div style="color:#4a6090;font-size:.65rem;margin-top:2px">Esta es la comisión que se descuenta de las ventas en caja e informes</div>
+    </div>
     <div class="frow">
-      <input type="text" id="edit-ag-nombre" placeholder="Nombre agencia" readonly style="color:var(--gold)">
-      <input type="password" id="edit-ag-pass" placeholder="Nueva contraseña (vacío=no cambiar)">
-      <input type="number" id="edit-ag-com" placeholder="Comisión %" min="0" max="100" step="1">
-      <input type="number" id="edit-ag-tope" placeholder="Tope taquilla S/ (0=sin límite)" min="0" step="10">
+      <div style="display:flex;flex-direction:column;gap:3px;flex:1">
+        <label style="color:#4a6090;font-size:.68rem;letter-spacing:1px">NUEVA COMISIÓN % (ej: 12 para 12%)</label>
+        <input type="number" id="edit-ag-com" placeholder="Ej: 12" min="0" max="100" step="0.5"
+          style="padding:10px;background:#0a1828;border:2px solid #d97706;border-radius:4px;color:#fbbf24;font-family:'Oswald',sans-serif;font-size:1.1rem;font-weight:700;text-align:center">
+      </div>
+      <div style="display:flex;flex-direction:column;gap:3px;flex:1">
+        <label style="color:#4a6090;font-size:.68rem;letter-spacing:1px">CONTRASEÑA (vacío = no cambiar)</label>
+        <input type="password" id="edit-ag-pass" placeholder="Nueva contraseña">
+      </div>
+      <div style="display:flex;flex-direction:column;gap:3px;flex:1">
+        <label style="color:#4a6090;font-size:.68rem;letter-spacing:1px">TOPE TAQUILLA S/ (0 = sin límite)</label>
+        <input type="number" id="edit-ag-tope" placeholder="0" min="0" step="10">
+      </div>
     </div>
     <div style="display:flex;gap:6px">
       <button class="btn-s" onclick="guardarEditAg()">💾 GUARDAR CAMBIOS</button>
@@ -3186,6 +3927,52 @@ tr:hover td{background:#0d1828}
     </div>
     <input type="hidden" id="edit-ag-id">
     <div id="edit-ag-msg" style="margin-top:6px"></div>
+  </div>
+</div>
+
+<!-- COMISIONES POR LOTERÍA -->
+<div id="tc-comisiones" class="tc">
+  <div class="fbox">
+    <h3>💹 COMISIONES POR LOTERÍA</h3>
+    <div style="color:var(--text2);font-size:.76rem;margin-bottom:12px">
+      Define un % de comisión diferente para cada lotería. Si una lotería no tiene % específico, se usa el % general de la agencia.
+      <br>Ejemplo: ZOOLO 15%, resto de loterías 12%.
+    </div>
+
+    <!-- Selección de agencias -->
+    <div class="fbox" style="background:#080d18;border:1px solid #1a2a50;margin-bottom:10px">
+      <h3 style="font-size:.8rem;margin-bottom:8px">① AGENCIAS A CONFIGURAR</h3>
+      <div style="display:flex;gap:6px;margin-bottom:6px">
+        <button class="btn-sec" style="font-size:.68rem" onclick="comSelAllAgs()">✅ TODAS</button>
+        <button class="btn-sec" style="font-size:.68rem" onclick="comDeselAllAgs()">⬜ NINGUNA</button>
+      </div>
+      <div id="com-agencias" style="display:flex;flex-wrap:wrap;gap:5px"></div>
+    </div>
+
+    <!-- Loterías con % individual -->
+    <div class="fbox" style="background:#080d18;border:1px solid #1a2a50;margin-bottom:10px">
+      <h3 style="font-size:.8rem;margin-bottom:8px">② PORCENTAJE POR LOTERÍA</h3>
+      <div style="color:#4a6090;font-size:.68rem;margin-bottom:8px">Deja en blanco o 0 para usar el % general de la agencia</div>
+      <div id="com-loterias-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px"></div>
+    </div>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+      <button class="btn-s" onclick="guardarComisionesLot()">💾 GUARDAR COMISIONES</button>
+      <button class="btn-d" style="font-size:.72rem" onclick="borrarComisionesLot()">🗑 BORRAR CONFIGURACIÓN</button>
+    </div>
+    <div id="com-msg" style="margin-top:8px;font-size:.8rem"></div>
+  </div>
+
+  <!-- Tabla de comisiones configuradas -->
+  <div class="fbox" style="background:#080d18;border:1px solid #1a2a50">
+    <h3 style="font-size:.82rem;margin-bottom:8px">📋 COMISIONES CONFIGURADAS</h3>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+      <select id="com-filtro-ag" style="padding:7px 10px;background:#0a1828;border:2px solid #2a4a80;border-radius:3px;color:#fbbf24;font-size:.8rem">
+        <option value="">— Todas las agencias —</option>
+      </select>
+      <button class="btn-sec" onclick="cargarTablaComisiones()">🔄 ACTUALIZAR</button>
+    </div>
+    <div id="com-tabla" style="max-height:500px;overflow-y:auto;overflow-x:auto"></div>
   </div>
 </div>
 
@@ -3225,7 +4012,7 @@ tr:hover td{background:#0d1828}
 
 <script>
 const LOTERIAS_DATA = {{ loterias | tojson }};
-const TABS=['dashboard','resultados','tripletas','riesgo','topes','bloqueos','reportes','agencias','operaciones','auditoria'];
+const TABS=['dashboard','resultados','tripletas','riesgo','topes','topes-ag','bloqueos','reportes','agencias','comisiones','operaciones','auditoria'];
 let lotResActual='zoolo', lotLimActual='zoolo', lotRiesgoActual='zoolo', lotTopesActual='zoolo';
 let animalSelAdmin=null, animalSelLim=null, animalSelTope=null;
 
@@ -3246,8 +4033,10 @@ function showTab(id){
   if(id==='tripletas') cargarTrip();
   if(id==='riesgo') cargarRiesgo();
   if(id==='topes') cargarTopes();
+  if(id==='topes-ag'){if(typeof initTabTopesAg==='function'){if(!window._tapInited){window._tapInited=true;initTabTopesAg();}else{cargarTablaTopesAg();}}}
   if(id==='bloqueos'){renderLotTabs('lot-tabs-lim',lotLimActual,selLotLim);updateHorarioSelect(lotLimActual,'lim-hora');renderAnimalesMini(lotLimActual,'animals-lim',(k)=>{animalSelLim=k;document.getElementById('lim-sel-info').textContent='✓ '+k+' — '+(LOTERIAS_DATA[lotLimActual].animales[k]||'');});cargarLimites();}
   if(id==='agencias'){cargarAgs();cargarAgsSel();}
+  if(id==='comisiones'){if(!window._comInited){window._comInited=true;initTabComisiones();}else{cargarTablaComisiones();}}
   if(id==='auditoria'){setHoy('aud-ini');setHoy('aud-fin');cargarAudit();}
 }
 function setHoy(id){let e=document.getElementById(id);if(e)e.value=new Date().toISOString().split('T')[0];}
@@ -3498,6 +4287,252 @@ function limpiarTopesHora(){
   .then(r=>r.json()).then(d=>{if(d.status==='ok'){glMsg(d.mensaje,'ok');cargarTopes();}else glMsg(d.error,'err');});
 }
 
+// ======================== TOPES POR AGENCIA ========================
+let tapAgsData=[];    // [{id,nombre}]
+let tapAgsSelSet=new Set();
+let tapLotsSelSet=new Set();
+let tapHorasSelSet=new Set();
+let tapNumsSelSet=new Set();
+let tapAllHoras=[];   // union de horas de loterías seleccionadas
+let tapAllNums={};    // {num: nombre} union de loterías seleccionadas
+
+function initTabTopesAg(){
+  // Cargar agencias
+  fetch('/admin/lista-agencias').then(r=>r.json()).then(ags=>{
+    tapAgsData=ags;
+    let c=document.getElementById('tap-agencias');
+    c.innerHTML='';
+    // Populate filtro select
+    let fag=document.getElementById('tap-filtro-ag');
+    fag.innerHTML='<option value="">— Todas las agencias —</option>';
+    ags.forEach(ag=>{
+      let btn=document.createElement('button');
+      btn.className='ltag'; btn.dataset.id=ag.id;
+      btn.textContent=ag.nombre_agencia;
+      btn.style.border='2px solid #2a4a80';
+      btn.onclick=()=>tapToggleAg(ag.id,btn);
+      c.appendChild(btn);
+      fag.innerHTML+=`<option value="${ag.id}">${ag.nombre_agencia}</option>`;
+    });
+    // Populate filtro lot
+    let flot=document.getElementById('tap-filtro-lot');
+    flot.innerHTML='<option value="">— Todas las loterías —</option>';
+    Object.entries(LOTERIAS_DATA).forEach(([k,v])=>{
+      flot.innerHTML+=`<option value="${k}">${v.emoji} ${v.nombre}</option>`;
+    });
+    renderTopesAgLots();
+    cargarTablaTopesAg();
+  });
+}
+
+function renderTopesAgLots(){
+  let c=document.getElementById('tap-loterias');
+  c.innerHTML='';
+  Object.entries(LOTERIAS_DATA).forEach(([lid,lot])=>{
+    let btn=document.createElement('button');
+    btn.className='ltag'+(tapLotsSelSet.has(lid)?' sel':'');
+    btn.dataset.id=lid;
+    btn.innerHTML=`${lot.emoji} ${lot.nombre}`;
+    btn.style.borderColor=tapLotsSelSet.has(lid)?lot.color:'#2a4a80';
+    if(tapLotsSelSet.has(lid)) btn.style.background=lot.color+'33';
+    btn.onclick=()=>tapToggleLot(lid,btn,lot);
+    c.appendChild(btn);
+  });
+  recalcHorasNums();
+}
+
+function tapToggleAg(id,btn){
+  if(tapAgsSelSet.has(id)){tapAgsSelSet.delete(id);btn.classList.remove('sel');btn.style.background='';btn.style.borderColor='#2a4a80';}
+  else{tapAgsSelSet.add(id);btn.classList.add('sel');btn.style.background='#0a2a5a';btn.style.borderColor='#00b4d8';}
+  updateTapResumen();
+}
+function tapToggleLot(lid,btn,lot){
+  if(tapLotsSelSet.has(lid)){tapLotsSelSet.delete(lid);btn.classList.remove('sel');btn.style.background='';btn.style.borderColor='#2a4a80';}
+  else{tapLotsSelSet.add(lid);btn.classList.add('sel');btn.style.background=lot.color+'33';btn.style.borderColor=lot.color;}
+  recalcHorasNums();
+}
+function tapToggleHora(h,btn){
+  if(tapHorasSelSet.has(h)){tapHorasSelSet.delete(h);btn.classList.remove('sel');}
+  else{tapHorasSelSet.add(h);btn.classList.add('sel');}
+  updateTapResumen();
+}
+function tapToggleNum(n,btn){
+  if(tapNumsSelSet.has(n)){tapNumsSelSet.delete(n);btn.classList.remove('sel');}
+  else{tapNumsSelSet.add(n);btn.classList.add('sel');}
+  updateTapResumen();
+}
+
+function tapSelAllAgs(){
+  tapAgsData.forEach(ag=>{
+    tapAgsSelSet.add(ag.id);
+    let btn=document.querySelector(`#tap-agencias button[data-id='${ag.id}']`);
+    if(btn){btn.classList.add('sel');btn.style.background='#0a2a5a';btn.style.borderColor='#00b4d8';}
+  });
+  updateTapResumen();
+}
+function tapDeselAllAgs(){
+  tapAgsSelSet.clear();
+  document.querySelectorAll('#tap-agencias button').forEach(btn=>{btn.classList.remove('sel');btn.style.background='';btn.style.borderColor='#2a4a80';});
+  updateTapResumen();
+}
+function tapSelAllLots(){
+  Object.keys(LOTERIAS_DATA).forEach(lid=>{tapLotsSelSet.add(lid);});
+  renderTopesAgLots();
+}
+function tapDeselAllLots(){
+  tapLotsSelSet.clear();
+  renderTopesAgLots();
+}
+function tapSelAllHoras(){
+  tapAllHoras.forEach(h=>{
+    tapHorasSelSet.add(h);
+    let btn=document.querySelector(`#tap-horas button[data-h='${h}']`);
+    if(btn) btn.classList.add('sel');
+  });
+  updateTapResumen();
+}
+function tapDeselAllHoras(){
+  tapHorasSelSet.clear();
+  document.querySelectorAll('#tap-horas button').forEach(b=>b.classList.remove('sel'));
+  updateTapResumen();
+}
+function tapSelAllNums(){
+  Object.keys(tapAllNums).forEach(n=>{
+    tapNumsSelSet.add(n);
+    let btn=document.querySelector(`#tap-numeros button[data-n='${n}']`);
+    if(btn) btn.classList.add('sel');
+  });
+  updateTapResumen();
+}
+function tapDeselAllNums(){
+  tapNumsSelSet.clear();
+  document.querySelectorAll('#tap-numeros button').forEach(b=>b.classList.remove('sel'));
+  updateTapResumen();
+}
+
+function recalcHorasNums(){
+  // Recalcular unión de horas y números de las loterías seleccionadas
+  tapAllHoras=[];
+  tapAllNums={};
+  tapLotsSelSet.forEach(lid=>{
+    let lot=LOTERIAS_DATA[lid];
+    let horas=getHorarios(lid);
+    horas.forEach(h=>{if(!tapAllHoras.includes(h)) tapAllHoras.push(h);});
+    Object.entries(lot.animales).forEach(([n,nom])=>{tapAllNums[n]=nom;});
+  });
+  // Limpiar selecciones que ya no aplican
+  tapHorasSelSet.forEach(h=>{if(!tapAllHoras.includes(h)) tapHorasSelSet.delete(h);});
+  tapNumsSelSet.forEach(n=>{if(!(n in tapAllNums)) tapNumsSelSet.delete(n);});
+  renderTopesAgHoras(); renderTopesAgNums(); updateTapResumen();
+}
+
+function renderTopesAgHoras(){
+  let c=document.getElementById('tap-horas'); c.innerHTML='';
+  tapAllHoras.forEach(h=>{
+    let btn=document.createElement('button');
+    btn.className='hbtn'+(tapHorasSelSet.has(h)?' sel':'');
+    btn.dataset.h=h;
+    btn.textContent=h.replace(':00','').replace(' ','');
+    btn.onclick=()=>tapToggleHora(h,btn);
+    c.appendChild(btn);
+  });
+}
+
+function renderTopesAgNums(){
+  let c=document.getElementById('tap-numeros'); c.innerHTML='';
+  let sorted=Object.keys(tapAllNums).sort((a,b)=>{let ia=parseInt(a),ib=parseInt(b);return isNaN(ia)||isNaN(ib)?0:ia-ib;});
+  sorted.forEach(n=>{
+    let btn=document.createElement('button');
+    btn.className='am-item'+(tapNumsSelSet.has(n)?' sel':'');
+    btn.dataset.n=n;
+    btn.innerHTML=`<div class="anum">${n}</div><div class="anom">${(tapAllNums[n]||'').substring(0,8)}</div>`;
+    btn.onclick=()=>tapToggleNum(n,btn);
+    c.appendChild(btn);
+  });
+}
+
+function updateTapResumen(){
+  let nAg=tapAgsSelSet.size, nLot=tapLotsSelSet.size, nH=tapHorasSelSet.size;
+  let nN=tapNumsSelSet.size||Object.keys(tapAllNums).length;
+  let total=nAg*nLot*nH*nN;
+  document.getElementById('tap-resumen').textContent=
+    `${nAg} agencia(s) × ${nLot} lotería(s) × ${nH} hora(s) × ${tapNumsSelSet.size||'TODOS ('+Object.keys(tapAllNums).length+')'} números → ${total} tope(s) a aplicar`;
+}
+
+async function guardarTopesAgMasivo(){
+  let monto=parseFloat(document.getElementById('tap-monto').value)||0;
+  let pct=parseFloat(document.getElementById('tap-pct').value)||0;
+  let m=document.getElementById('tap-msg');
+  if(!tapAgsSelSet.size){m.innerHTML='<span style="color:#e05050">Seleccione al menos una agencia</span>';return;}
+  if(!tapLotsSelSet.size){m.innerHTML='<span style="color:#e05050">Seleccione al menos una lotería</span>';return;}
+  if(!tapHorasSelSet.size){m.innerHTML='<span style="color:#e05050">Seleccione al menos una hora</span>';return;}
+  m.innerHTML='<span style="color:#60a0d0">Guardando...</span>';
+  let body={
+    agencia_ids:[...tapAgsSelSet],
+    loteria_ids:[...tapLotsSelSet],
+    horas:[...tapHorasSelSet],
+    numeros:tapNumsSelSet.size>0?[...tapNumsSelSet]:[],
+    monto_tope:monto,
+    porcentaje:pct
+  };
+  let d=await fetch('/admin/topes-agencia/guardar-masivo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json());
+  if(d.status==='ok'){m.innerHTML=`<span style="color:#4ade80">✅ ${d.mensaje}</span>`;glMsg('✅ '+d.mensaje,'ok');cargarTablaTopesAg();}
+  else{m.innerHTML=`<span style="color:#e05050">❌ ${d.error}</span>`;glMsg('❌ '+d.error,'err');}
+}
+
+async function limpiarTopesAgSel(){
+  if(!confirm('¿Eliminar los topes seleccionados (monto=0)?'))return;
+  document.getElementById('tap-monto').value='0';
+  document.getElementById('tap-pct').value='0';
+  await guardarTopesAgMasivo();
+}
+
+function cargarTablaTopesAg(){
+  let agFil=document.getElementById('tap-filtro-ag').value;
+  let lotFil=document.getElementById('tap-filtro-lot').value;
+  let url='/admin/topes-agencia/lista?';
+  if(agFil) url+='agencia_id='+agFil+'&';
+  if(lotFil) url+='loteria='+lotFil;
+  let c=document.getElementById('tap-tabla');
+  c.innerHTML='<p style="color:#4a6090;font-size:.75rem;padding:8px">Cargando...</p>';
+  fetch(url).then(r=>r.json()).then(d=>{
+    if(d.error){c.innerHTML=`<p style="color:#e05050">${d.error}</p>`;return;}
+    if(!d.topes||!d.topes.length){c.innerHTML='<p style="color:var(--text2);font-size:.75rem;padding:8px">Sin topes configurados</p>';return;}
+    let html='<table><thead><tr><th>AGENCIA</th><th>LOTERÍA</th><th>HORA</th><th>NUM</th><th>ANIMAL</th><th>TOPE S/</th><th>%</th><th>APOST.</th><th>DISP.</th><th>❌</th></tr></thead><tbody>';
+    d.topes.forEach(t=>{
+      let lot=LOTERIAS_DATA[t.loteria]||{color:'#fff',emoji:''};
+      let danger=t.disponible!==null&&t.disponible<t.monto_tope*0.2;
+      html+=`<tr style="${danger?'background:#1a0808':''}">
+        <td style="color:var(--gold);font-size:.72rem">${t.agencia_nombre}</td>
+        <td style="color:${lot.color||'#fff'};font-size:.7rem">${lot.emoji||''} ${t.loteria_nombre}</td>
+        <td style="color:#fbbf24;font-family:'Oswald',sans-serif;font-size:.7rem">${t.hora}</td>
+        <td style="color:#00d8ff;font-family:'Oswald',sans-serif;font-weight:700">${t.numero}</td>
+        <td style="font-size:.68rem;color:#c0d8f0">${t.animal}</td>
+        <td style="color:#4ade80;font-weight:700">S/${t.monto_tope}</td>
+        <td style="color:#c084fc">${t.porcentaje>0?t.porcentaje+'%':'—'}</td>
+        <td>S/${t.apostado}</td>
+        <td style="color:${danger?'#e05050':'#4ade80'}">${t.disponible!==null?'S/'+t.disponible:'libre'}</td>
+        <td><button onclick="eliminarTopeAg(${t.id})" style="padding:2px 6px;background:#1a0808;border:1px solid #6b1515;color:#e05050;font-size:.58rem;cursor:pointer;border-radius:2px">✕</button></td>
+      </tr>`;
+    });
+    html+='</tbody></table>';
+    c.innerHTML=html;
+  });
+}
+
+function eliminarTopeAg(id){
+  fetch('/admin/topes-agencia/eliminar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})})
+  .then(r=>r.json()).then(d=>{if(d.status==='ok'){glMsg('Tope eliminado','ok');cargarTablaTopesAg();}else glMsg(d.error,'err');});
+}
+
+function limpiarTopesAgFiltro(){
+  let agFil=document.getElementById('tap-filtro-ag').value;
+  let lotFil=document.getElementById('tap-filtro-lot').value;
+  fetch('/admin/topes-agencia/limpiar-agencia',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({agencia_id:agFil||null,loteria:lotFil||''})})
+  .then(r=>r.json()).then(d=>{if(d.status==='ok'){glMsg(d.mensaje,'ok');cargarTablaTopesAg();}else glMsg(d.error,'err');});
+}
+
 // ---- BLOQUEOS (limites_venta) ----
 function selLotLim(lid){
   lotLimActual=lid;
@@ -3619,16 +4654,18 @@ function cargarAgs(){
   fetch('/admin/lista-agencias').then(r=>r.json()).then(d=>{
     let t=document.getElementById('tabla-ags'); t.innerHTML='';
     d.forEach(a=>{
+      let comPct=(a.comision*100);
+      let comColor=comPct===0?'#4a6090':(comPct>20?'#f87171':'#4ade80');
       let tope=a.tope_taquilla>0?`<span style="color:#fbbf24;font-family:'Oswald',sans-serif">S/${a.tope_taquilla}</span>`:`<span style="color:#22c55e;font-size:.75rem">SIN LÍMITE</span>`;
       t.innerHTML+=`<tr>
         <td>${a.id}</td>
         <td style="color:#a0c8f8;font-family:'Oswald',sans-serif">${a.usuario}</td>
         <td><b style="color:var(--gold)">${a.nombre_agencia}</b></td>
-        <td>${(a.comision*100).toFixed(0)}%</td>
+        <td><span style="color:${comColor};font-family:'Oswald',sans-serif;font-size:.95rem;font-weight:700">${comPct.toFixed(1)}%</span></td>
         <td>${tope}</td>
         <td><span style="color:${a.activa?'var(--green)':'var(--red)'}">● ${a.activa?'ACTIVA':'INACTIVA'}</span></td>
         <td style="display:flex;gap:4px">
-          <button class="btn-edit" onclick="abrirEditAg(${a.id},'${a.nombre_agencia}',${(a.comision*100).toFixed(0)},${a.tope_taquilla||0})">✏️ Editar</button>
+          <button class="btn-edit" onclick="abrirEditAg(${a.id},'${a.nombre_agencia}',${comPct.toFixed(1)},${a.tope_taquilla||0})">✏️ Editar</button>
           <button class="btn-sec" onclick="toggleAg(${a.id},${a.activa})" style="font-size:.7rem">${a.activa?'Desactivar':'Activar'}</button>
           <button style="padding:5px 8px;background:#3a0808;border:1px solid #6b1515;color:#f87171;font-size:.68rem;cursor:pointer;border-radius:2px;font-family:'Oswald',sans-serif;font-weight:700" onclick="eliminarAg(${a.id},'${a.nombre_agencia}')">🗑 ELIMINAR</button>
         </td>
@@ -3638,13 +4675,147 @@ function cargarAgs(){
 }
 function abrirEditAg(id,nombre,com,tope){
   document.getElementById('edit-ag-id').value=id;
-  document.getElementById('edit-ag-nombre').value=nombre;
+  document.getElementById('edit-ag-nombre-title').textContent=nombre;
   document.getElementById('edit-ag-pass').value='';
   document.getElementById('edit-ag-com').value=com;
+  document.getElementById('edit-ag-com-actual').textContent=parseFloat(com).toFixed(1)+'%';
   document.getElementById('edit-ag-tope').value=tope||0;
   document.getElementById('edit-ag-box').style.display='block';
   document.getElementById('edit-ag-msg').innerHTML='';
   document.getElementById('edit-ag-box').scrollIntoView({behavior:'smooth'});
+  document.getElementById('edit-ag-com').focus();
+  // Live preview while typing
+  document.getElementById('edit-ag-com').oninput=function(){
+    document.getElementById('edit-ag-com-actual').textContent=(parseFloat(this.value)||0).toFixed(1)+'%';
+  };
+}
+// ======================== COMISIONES POR LOTERÍA ========================
+let comAgsData=[], comAgsSelSet=new Set();
+
+function initTabComisiones(){
+  fetch('/admin/lista-agencias').then(r=>r.json()).then(ags=>{
+    comAgsData=ags;
+    let c=document.getElementById('com-agencias'); c.innerHTML='';
+    let fag=document.getElementById('com-filtro-ag');
+    fag.innerHTML='<option value="">— Todas las agencias —</option>';
+    ags.forEach(ag=>{
+      let btn=document.createElement('button');
+      btn.className='ltag'; btn.dataset.id=ag.id;
+      btn.innerHTML=`${ag.nombre_agencia} <span style="color:#4a6090;font-size:.6rem">(${(ag.comision*100).toFixed(1)}% gral)</span>`;
+      btn.style.border='2px solid #2a4a80';
+      btn.onclick=()=>comToggleAg(ag.id,btn);
+      c.appendChild(btn);
+      fag.innerHTML+=`<option value="${ag.id}">${ag.nombre_agencia}</option>`;
+    });
+    renderComLoteriasGrid();
+    cargarTablaComisiones();
+  });
+}
+
+function renderComLoteriasGrid(){
+  let g=document.getElementById('com-loterias-grid'); g.innerHTML='';
+  Object.entries(LOTERIAS_DATA).forEach(([lid,lot])=>{
+    let div=document.createElement('div');
+    div.style.cssText='background:#0a1020;border:1px solid #1a2a50;border-radius:4px;padding:8px';
+    div.innerHTML=`
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
+        <span style="font-size:.9rem">${lot.emoji}</span>
+        <span style="color:${lot.color};font-family:'Oswald',sans-serif;font-size:.78rem;font-weight:700">${lot.nombre}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:4px">
+        <input type="number" id="com-pct-${lid}" placeholder="% (vacío=gral)" min="0" max="100" step="0.5"
+          style="width:100%;padding:8px;background:#0a1828;border:2px solid #2a4080;border-radius:3px;color:#fbbf24;font-family:'Oswald',sans-serif;font-size:1rem;font-weight:700;text-align:center">
+        <span style="color:#4a6090;font-size:.9rem">%</span>
+      </div>`;
+    g.appendChild(div);
+  });
+}
+
+function comToggleAg(id,btn){
+  if(comAgsSelSet.has(id)){comAgsSelSet.delete(id);btn.classList.remove('sel');btn.style.background='';btn.style.borderColor='#2a4a80';}
+  else{comAgsSelSet.add(id);btn.classList.add('sel');btn.style.background='#0a2a5a';btn.style.borderColor='#00b4d8';}
+}
+function comSelAllAgs(){
+  comAgsData.forEach(ag=>{
+    comAgsSelSet.add(ag.id);
+    let btn=document.querySelector(`#com-agencias button[data-id='${ag.id}']`);
+    if(btn){btn.classList.add('sel');btn.style.background='#0a2a5a';btn.style.borderColor='#00b4d8';}
+  });
+}
+function comDeselAllAgs(){
+  comAgsSelSet.clear();
+  document.querySelectorAll('#com-agencias button').forEach(b=>{b.classList.remove('sel');b.style.background='';b.style.borderColor='#2a4a80';});
+}
+
+async function guardarComisionesLot(){
+  let m=document.getElementById('com-msg');
+  if(!comAgsSelSet.size){m.innerHTML='<span style="color:#e05050">Seleccione al menos una agencia</span>';return;}
+  let comisiones={};
+  Object.keys(LOTERIAS_DATA).forEach(lid=>{
+    let inp=document.getElementById('com-pct-'+lid);
+    if(inp&&inp.value!==''){
+      let v=parseFloat(inp.value);
+      if(!isNaN(v)&&v>=0) comisiones[lid]=v/100;
+    }
+  });
+  if(!Object.keys(comisiones).length){m.innerHTML='<span style="color:#e05050">Ingresa al menos un % para una lotería</span>';return;}
+  m.innerHTML='<span style="color:#60a0d0">Guardando...</span>';
+  let d=await fetch('/admin/comisiones-loteria/guardar',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({agencia_ids:[...comAgsSelSet],comisiones})}).then(r=>r.json());
+  if(d.status==='ok'){
+    m.innerHTML=`<span style="color:#4ade80">✅ ${d.mensaje}</span>`;
+    glMsg('✅ '+d.mensaje,'ok'); cargarTablaComisiones();
+  } else { m.innerHTML=`<span style="color:#e05050">❌ ${d.error}</span>`; }
+}
+
+async function borrarComisionesLot(){
+  let agFil=document.getElementById('com-filtro-ag').value;
+  if(!confirm('¿Borrar comisiones por lotería'+(agFil?' de esta agencia':' de todas las agencias')+'?'))return;
+  let ids=agFil?[parseInt(agFil)]:comAgsData.map(a=>a.id);
+  let count=0;
+  for(let aid of ids){
+    let rows=await fetch('/admin/comisiones-loteria/lista?agencia_id='+aid).then(r=>r.json());
+    for(let row of (rows.comisiones||[])){
+      await fetch('/admin/comisiones-loteria/eliminar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:row.id})});
+      count++;
+    }
+  }
+  glMsg(`✅ ${count} comisión(es) eliminadas`,'ok'); cargarTablaComisiones();
+}
+
+function cargarTablaComisiones(){
+  let agFil=document.getElementById('com-filtro-ag')?document.getElementById('com-filtro-ag').value:'';
+  let url='/admin/comisiones-loteria/lista'+(agFil?'?agencia_id='+agFil:'');
+  let c=document.getElementById('com-tabla'); if(!c)return;
+  c.innerHTML='<p style="color:#4a6090;font-size:.75rem;padding:8px">Cargando...</p>';
+  fetch(url).then(r=>r.json()).then(d=>{
+    if(d.error){c.innerHTML=`<p style="color:#e05050">${d.error}</p>`;return;}
+    if(!d.comisiones||!d.comisiones.length){
+      c.innerHTML='<p style="color:var(--text2);font-size:.75rem;padding:8px">Sin comisiones por lotería — se usa el % general de cada agencia</p>';return;
+    }
+    let html='<table><thead><tr><th>AGENCIA</th><th>LOTERÍA</th><th>% GENERAL</th><th>% ESPECÍFICO</th><th>❌</th></tr></thead><tbody>';
+    d.comisiones.forEach(row=>{
+      let lot=LOTERIAS_DATA[row.loteria]||{emoji:'',color:'#fff'};
+      let diff=row.comision-row.com_general;
+      let diffColor=diff>0?'#f87171':(diff<0?'#4ade80':'#fbbf24');
+      html+=`<tr>
+        <td style="color:var(--gold);font-size:.75rem">${row.agencia_nombre}</td>
+        <td style="color:${lot.color||'#fff'};font-size:.72rem">${lot.emoji||''} ${row.loteria_nombre}</td>
+        <td style="color:#4a6090;font-family:'Oswald',sans-serif">${row.com_general.toFixed(1)}%</td>
+        <td style="font-family:'Oswald',sans-serif;font-weight:700">
+          <span style="color:#fbbf24;font-size:1rem">${row.comision.toFixed(1)}%</span>
+          <span style="color:${diffColor};font-size:.68rem;margin-left:4px">${diff>=0?'+':''}${diff.toFixed(1)}%</span>
+        </td>
+        <td><button onclick="eliminarComisionLot(${row.id})" style="padding:2px 6px;background:#1a0808;border:1px solid #6b1515;color:#e05050;font-size:.58rem;cursor:pointer;border-radius:2px">✕</button></td>
+      </tr>`;
+    });
+    html+='</tbody></table>';
+    c.innerHTML=html;
+  });
+}
+function eliminarComisionLot(id){
+  fetch('/admin/comisiones-loteria/eliminar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})})
+  .then(r=>r.json()).then(d=>{if(d.status==='ok'){glMsg('Eliminado','ok');cargarTablaComisiones();}else glMsg(d.error,'err');});
 }
 function guardarEditAg(){
   let id=document.getElementById('edit-ag-id').value;
