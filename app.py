@@ -956,463 +956,7 @@ def guardar_resultado():
         return jsonify({'error':str(e)}),500
 
 
-# ========== AUTO-SORTEO: SELECCIÓN INTELIGENTE DE GANADOR ==========
 
-# ---- Configuracion de auto-sorteo ----
-MARGEN_CASA_DEFAULT  = 0.30   # 30% retiene la casa por defecto
-ESPERA_AUTO_MINUTOS  = 3      # Minutos post-sorteo antes de ejecutar auto
-
-
-import random as _random
-from datetime import date as date_type
-
-def _calcular_premio_numero(numero, hora, fecha_str, db):
-    """
-    Calcula el premio total que pagaria la casa si 'numero' sale ganador en 'hora'.
-    Incluye: jugadas de animal, jugadas especiales (ROJO/NEGRO/PAR/IMPAR) y tripletas.
-    """
-    mult = PAGO_LECHUZA if str(numero) == "40" else PAGO_ANIMAL_NORMAL
-    jugadas = db.execute("""
-        SELECT jg.monto, jg.tipo, jg.seleccion
-        FROM jugadas jg
-        JOIN tickets tk ON jg.ticket_id = tk.id
-        WHERE jg.hora=? AND tk.anulado=0 AND tk.fecha LIKE ?
-    """, (hora, fecha_str + '%')).fetchall()
-
-    total_premio = 0
-    for j in jugadas:
-        if j['tipo'] == 'animal' and str(j['seleccion']) == str(numero):
-            total_premio += j['monto'] * mult
-        elif j['tipo'] == 'especial' and str(numero) not in ["0", "00"]:
-            sel = j['seleccion']
-            num_int = int(numero)
-            if (sel == 'ROJO'  and str(numero) in ROJOS) or \
-               (sel == 'NEGRO' and str(numero) not in ROJOS) or \
-               (sel == 'PAR'   and num_int % 2 == 0) or \
-               (sel == 'IMPAR' and num_int % 2 != 0):
-                total_premio += j['monto'] * PAGO_ESPECIAL
-
-    # Tripletas: solo cuenta si el ticket fue comprado ANTES del sorteo actual
-    # y solo usan sorteos posteriores a la hora de compra para completar la tripleta.
-    resultados_previos = db.execute(
-        "SELECT hora, animal FROM resultados WHERE fecha=? AND hora!=?", (fecha_str, hora)
-    ).fetchall()
-    # Mapa hora->animal de sorteos ya registrados (sin el sorteo actual)
-    res_previos_map = {r['hora']: r['animal'] for r in resultados_previos}
-    # Agregar el candidato actual como si hubiera ganado
-    res_con_candidato = dict(res_previos_map)
-    res_con_candidato[hora] = str(numero)
-
-    tripletas = db.execute("""
-        SELECT tr.monto, tr.animal1, tr.animal2, tr.animal3, tk.fecha as fecha_ticket
-        FROM tripletas tr
-        JOIN tickets tk ON tr.ticket_id = tk.id
-        WHERE tr.fecha=? AND tk.anulado=0
-    """, (fecha_str,)).fetchall()
-
-    for tr in tripletas:
-        nums = {tr['animal1'], tr['animal2'], tr['animal3']}
-        fecha_compra_dt = parse_fecha(tr['fecha_ticket'])
-        # Solo los sorteos posteriores a la compra del ticket cuentan para esta tripleta
-        res_validos = resultados_validos_para_tripleta(res_con_candidato, fecha_compra_dt)
-        if nums.issubset(set(res_validos.values())):
-            total_premio += tr['monto'] * PAGO_TRIPLETA
-
-    return round(total_premio, 2)
-
-
-def _get_acumulado(fecha_str, db):
-    """
-    Retorna el saldo acumulado de sorteos anteriores del día actual.
-    El sobrante del presupuesto de premios (70% - premio_pagado) de cada
-    sorteo se arrastra al siguiente. Si no hubo ganador (sin_premio), el
-    70% completo de esa hora se acumula.
-    Solo se cuenta el saldo de horas que YA tienen resultado registrado.
-    """
-    try:
-        rows = db.execute(
-            "SELECT COALESCE(SUM(saldo_acumulado), 0) as ac FROM zoolo_acumulado WHERE fecha=?",
-            (fecha_str,)
-        ).fetchone()
-        return float(rows['ac']) if rows else 0.0
-    except Exception:
-        return 0.0
-
-
-def ejecutar_sorteo_automatico_zoolo(hora):
-    """
-    Motor de escrutinio inteligente para ZOOLO CASINO v5.
-    Reglas aplicadas:
-      1. ANIMAL ÚNICO POR DÍA: ningún animal puede salir dos veces el mismo día.
-         Los animales ya usados hoy quedan excluidos del sorteo actual.
-      2. SIN GANADOR SI NO CUBRE EL 70%: si el presupuesto disponible para premios
-         (70% de lo vendido + acumulado) no alcanza para pagar ni un solo premio,
-         el sorteo se registra sin ganador premiado (acumula el 70% para el
-         siguiente sorteo del día).
-      3. ACUMULADO CORRECTO: el sobrante del presupuesto de premios (70% - premio_pagado)
-         se acumula para el siguiente sorteo. Si no hubo ganador, acumula el 70% completo.
-      4. Lechuza #40: EXCLUIDA del auto-sorteo — solo sale si admin la carga manualmente.
-    Retorna: dict con resultado de la operación.
-    """
-    ahora = ahora_peru()
-    min_ahora = ahora.hour * 60 + ahora.minute
-    min_sorteo = hora_a_min(hora)
-    fecha_str = ahora.strftime("%d/%m/%Y")
-
-    if min_ahora < min_sorteo:
-        return {'status': 'pendiente', 'mensaje': f'Sorteo {hora} aún no ocurre'}
-
-    with get_db() as db:
-        # Si ya hay resultado registrado (manual o auto), respetar
-        ya_hay = db.execute(
-            "SELECT animal FROM resultados WHERE fecha=? AND hora=?", (fecha_str, hora)
-        ).fetchone()
-        if ya_hay:
-            return {
-                'status': 'ya_registrado',
-                'numero': ya_hay['animal'],
-                'nombre': ANIMALES.get(ya_hay['animal'], '?'),
-                'hora': hora
-            }
-
-        # ── REGLA 1: Animales que ya salieron hoy (NO pueden repetirse) ──────────
-        ya_salidos_hoy = set(
-            r['animal'] for r in db.execute(
-                "SELECT animal FROM resultados WHERE fecha=? AND hora!=?",
-                (fecha_str, hora)
-            ).fetchall()
-        )
-
-        # ── Total vendido en esta hora ─────────────────────────────────────────
-        venta_row = db.execute("""
-            SELECT COALESCE(SUM(jg.monto), 0) as tot
-            FROM jugadas jg
-            JOIN tickets tk ON jg.ticket_id = tk.id
-            WHERE jg.hora=? AND tk.anulado=0 AND tk.fecha LIKE ?
-        """, (hora, fecha_str + '%')).fetchone()
-        venta_total = venta_row['tot'] or 0
-
-        # ── Acumulado de sorteos previos del día ───────────────────────────────
-        acumulado_previo = _get_acumulado(fecha_str, db)
-
-        # ── Presupuesto disponible para premios: 70% de lo vendido + acumulado ─
-        presupuesto_premios = round(venta_total * (1.0 - MARGEN_CASA_DEFAULT) + acumulado_previo, 2)
-
-        if venta_total <= 0:
-            # Sin ventas en esta hora: elegir al azar entre animales no usados hoy
-            disponibles = [n for n in ANIMALES.keys()
-                           if str(n) != '40' and str(n) not in ya_salidos_hoy]
-            if not disponibles:
-                disponibles = [n for n in ANIMALES.keys() if str(n) != '40']
-            ganador_num = _random.choice(disponibles)
-            db.execute("""
-                INSERT INTO resultados (fecha, hora, animal) VALUES (?,?,?)
-                ON CONFLICT(fecha, hora) DO UPDATE SET animal=excluded.animal
-            """, (fecha_str, hora, ganador_num))
-            # Sin ventas → acumulado no cambia (nada apostado)
-            try:
-                db.execute("""
-                    INSERT INTO zoolo_acumulado
-                    (fecha, hora, venta_total, presupuesto_premios, premio_pagado, ganancia_casa, saldo_acumulado, animal_ganador)
-                    VALUES (?,?,?,?,?,?,?,?)
-                    ON CONFLICT(fecha, hora) DO NOTHING
-                """, (fecha_str, hora, 0, 0, 0, 0, acumulado_previo, ganador_num))
-            except Exception:
-                pass
-            db.commit()
-            log_audit('AUTO_SORTEO', f"Hora:{hora} Sin ventas, elegido al azar: {ganador_num}({ANIMALES[ganador_num]})")
-            return {
-                'status': 'ok', 'auto': True, 'hora': hora,
-                'numero': ganador_num, 'nombre': ANIMALES[ganador_num],
-                'margen_pct': 100.0, 'recaudado': 0, 'premio_pagado': 0,
-                'ganancia_casa': 0, 'acumulado_arrastrado': round(acumulado_previo, 2),
-                'motivo': 'sin_ventas'
-            }
-
-        # ── Construir candidatos viables ───────────────────────────────────────
-        # Excluir: Lechuza #40, animales ya salidos hoy
-        candidatos = []
-        todos_validos = []
-        for num in ANIMALES.keys():
-            if str(num) == '40':
-                continue  # Lechuza EXCLUIDA del auto-sorteo siempre
-            if str(num) in ya_salidos_hoy:
-                continue  # REGLA 1: animal ya salió hoy, no puede repetirse
-            premio_est = _calcular_premio_numero(num, hora, fecha_str, db)
-            todos_validos.append((num, premio_est))
-            if premio_est <= presupuesto_premios:
-                candidatos.append((num, premio_est))
-
-        # ── REGLA 2: Sin ganador si el presupuesto no cubre ningún premio ──────
-        # Si NINGÚN animal apostado tiene jugadas que generen premio > 0,
-        # o si el presupuesto es 0 y todos los premios son 0 también → sorteo sin premio
-        premios_positivos = [c for c in candidatos if c[1] > 0]
-
-        if not candidatos and todos_validos:
-            # Caso extremo: todo apostado en un solo número muy caro →
-            # usar el de menor costo entre los válidos (sin repetición ni lechuza)
-            todos_validos.sort(key=lambda x: x[1])
-            candidatos = [todos_validos[0]]
-            premios_positivos = [c for c in candidatos if c[1] > 0]
-
-        if not candidatos:
-            # No quedan animales disponibles (todos salieron hoy) — reiniciar pool
-            candidatos = [(n, _calcular_premio_numero(n, hora, fecha_str, db))
-                          for n in ANIMALES.keys() if str(n) != '40']
-
-        # Verificar si el presupuesto disponible alcanza para pagar algún premio real
-        puede_pagar_premio = any(c[1] <= presupuesto_premios and c[1] > 0 for c in candidatos)
-
-        if not puede_pagar_premio:
-            # ── REGLA 2: No hay fondos suficientes para dar premio ────────────
-            # Elegir un animal que no genere pago (o el de menor costo)
-            sin_ganadores = [c for c in candidatos if c[1] == 0]
-            if sin_ganadores:
-                ganador_num, premio_estimado = _random.choice(sin_ganadores)
-            else:
-                candidatos.sort(key=lambda x: x[1])
-                ganador_num, premio_estimado = candidatos[0]
-
-            premio_real = _calcular_premio_numero(ganador_num, hora, fecha_str, db)
-            # El 70% de esta venta + acumulado previo se acumula al siguiente sorteo
-            nuevo_acumulado = round(presupuesto_premios - premio_real, 2)
-
-            db.execute("""
-                INSERT INTO resultados (fecha, hora, animal) VALUES (?,?,?)
-                ON CONFLICT(fecha, hora) DO UPDATE SET animal=excluded.animal
-            """, (fecha_str, hora, ganador_num))
-            try:
-                db.execute("""
-                    INSERT INTO zoolo_acumulado
-                    (fecha, hora, venta_total, presupuesto_premios, premio_pagado, ganancia_casa, saldo_acumulado, animal_ganador)
-                    VALUES (?,?,?,?,?,?,?,?)
-                    ON CONFLICT(fecha, hora) DO NOTHING
-                """, (fecha_str, hora, venta_total, presupuesto_premios, premio_real,
-                      round(venta_total * MARGEN_CASA_DEFAULT, 2), nuevo_acumulado, ganador_num))
-            except Exception:
-                pass
-            db.commit()
-            log_audit('AUTO_SORTEO', (
-                f"Hora:{hora} SIN GANADOR PREMIADO — presupuesto insuficiente. "
-                f"Venta:S/{venta_total:.2f} Presupuesto:S/{presupuesto_premios:.2f} "
-                f"Acumulado arrastrado:S/{nuevo_acumulado:.2f} Animal registrado:{ganador_num}({ANIMALES[ganador_num]})"
-            ))
-            return {
-                'status': 'ok', 'auto': True, 'hora': hora,
-                'numero': ganador_num, 'nombre': ANIMALES[ganador_num],
-                'sin_premio': True,
-                'margen_pct': 100.0,
-                'recaudado': round(venta_total, 2),
-                'premio_pagado': round(premio_real, 2),
-                'ganancia_casa': round(venta_total * MARGEN_CASA_DEFAULT, 2),
-                'acumulado_arrastrado': nuevo_acumulado,
-                'motivo': 'presupuesto_insuficiente'
-            }
-
-        # ── Elección al azar entre candidatos con premio ≤ presupuesto ────────
-        viables_con_premio = [c for c in candidatos if c[1] <= presupuesto_premios and c[1] > 0]
-        viables_sin_premio = [c for c in candidatos if c[1] == 0]
-        pool = viables_con_premio if viables_con_premio else viables_sin_premio
-        ganador_num, premio_estimado = _random.choice(pool)
-
-        # Premio real
-        premio_real = _calcular_premio_numero(ganador_num, hora, fecha_str, db)
-        ganancia_casa = round(venta_total * MARGEN_CASA_DEFAULT, 2)
-        # Acumula el sobrante del presupuesto de premios al siguiente sorteo
-        saldo_nuevo = round(max(0.0, presupuesto_premios - premio_real), 2)
-        margen_real = (venta_total - premio_real) / venta_total if venta_total > 0 else 1.0
-
-        db.execute("""
-            INSERT INTO resultados (fecha, hora, animal) VALUES (?,?,?)
-            ON CONFLICT(fecha, hora) DO UPDATE SET animal=excluded.animal
-        """, (fecha_str, hora, ganador_num))
-        try:
-            db.execute("""
-                INSERT INTO zoolo_acumulado
-                (fecha, hora, venta_total, presupuesto_premios, premio_pagado, ganancia_casa, saldo_acumulado, animal_ganador)
-                VALUES (?,?,?,?,?,?,?,?)
-                ON CONFLICT(fecha, hora) DO NOTHING
-            """, (fecha_str, hora, venta_total, presupuesto_premios, premio_real,
-                  ganancia_casa, saldo_nuevo, ganador_num))
-        except Exception:
-            pass
-        db.commit()
-
-    motivo = 'viable_con_premio' if premio_real > 0 else 'sin_apostadores'
-    log_audit('AUTO_SORTEO', (
-        f"Hora:{hora} Ganador:{ganador_num}({ANIMALES[ganador_num]}) "
-        f"Margen:{round(margen_real*100,1)}% Venta:S/{venta_total:.2f} "
-        f"Presupuesto:S/{presupuesto_premios:.2f} Premio:S/{premio_real:.2f} "
-        f"Acumulado siguiente:S/{saldo_nuevo:.2f} Motivo:{motivo}"
-    ))
-
-    return {
-        'status': 'ok',
-        'auto': True,
-        'hora': hora,
-        'numero': ganador_num,
-        'nombre': ANIMALES[ganador_num],
-        'sin_premio': False,
-        'margen_pct': round(margen_real * 100, 1),
-        'recaudado': round(venta_total, 2),
-        'presupuesto_premios': round(presupuesto_premios, 2),
-        'premio_pagado': round(premio_real, 2),
-        'ganancia_casa': ganancia_casa,
-        'acumulado_arrastrado': saldo_nuevo,
-        'motivo': motivo
-    }
-
-
-# Alias de compatibilidad para los endpoints existentes
-def auto_sorteo_si_necesario(hora):
-    return ejecutar_sorteo_automatico_zoolo(hora)
-
-
-# ---- Endpoints del auto-sorteo ----
-
-@app.route('/api/auto-sorteo', methods=['POST'])
-@admin_required
-def api_auto_sorteo():
-    """
-    Ejecuta el auto-sorteo para una hora específica.
-    Si ya hay resultado, lo informa. Si no, elige automáticamente.
-    Body JSON: { "hora": "02:00 PM" }
-    """
-    try:
-        data = request.get_json() or {}
-        hora = data.get('hora', '').strip()
-        if hora not in HORARIOS_PERU:
-            return jsonify({'error': f'Hora inválida. Válidas: {HORARIOS_PERU}'}), 400
-        resultado = auto_sorteo_si_necesario(hora)
-        return jsonify(resultado)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/preview-ganadores', methods=['POST'])
-@admin_required
-def preview_ganadores():
-    """
-    Muestra un preview (SIN guardar) de los mejores candidatos ganadores
-    para una hora, con sus márgenes. Útil para que el admin elija manualmente
-    con información, o confirme el auto-sorteo.
-    Body JSON: { "hora": "02:00 PM" }
-    """
-    try:
-        data  = request.get_json() or {}
-        hora  = data.get('hora', '').strip()
-        if hora not in HORARIOS_PERU:
-            return jsonify({'error': 'Hora inválida'}), 400
-
-        fecha_str = ahora_peru().strftime("%d/%m/%Y")
-        CENTRO = (MARGEN_MIN + MARGEN_MAX) / 2.0
-
-        with get_db() as db:
-            total_rec = db.execute("""
-                SELECT COALESCE(SUM(jg.monto), 0) as tot
-                FROM jugadas jg
-                JOIN tickets tk ON jg.ticket_id = tk.id
-                WHERE jg.hora=? AND tk.anulado=0 AND tk.fecha LIKE ?
-            """, (hora, fecha_str + '%')).fetchone()['tot']
-
-            candidatos = []
-            for numero in ANIMALES.keys():
-                premio  = calcular_premio_si_gana(numero, hora, fecha_str, db)
-                ganancia = total_rec - premio
-                margen   = (ganancia / total_rec) if total_rec > 0 else 1.0
-                en_rango = MARGEN_MIN <= margen <= MARGEN_MAX
-                candidatos.append({
-                    'numero':   numero,
-                    'nombre':   ANIMALES[numero],
-                    'apostado': round(db.execute("""
-                        SELECT COALESCE(SUM(jg.monto),0) as s FROM jugadas jg
-                        JOIN tickets tk ON jg.ticket_id=tk.id
-                        WHERE jg.hora=? AND jg.seleccion=? AND jg.tipo='animal'
-                        AND tk.anulado=0 AND tk.fecha LIKE ?
-                    """, (hora, numero, fecha_str+'%')).fetchone()['s'], 2),
-                    'premio':   premio,
-                    'ganancia': round(ganancia, 2),
-                    'margen_pct': round(margen * 100, 1),
-                    'en_rango': en_rango,
-                    'es_optimo': False
-                })
-
-        # Marcar el óptimo
-        en_rango = [c for c in candidatos if c['en_rango']]
-        if en_rango:
-            optimo = min(en_rango, key=lambda x: abs(x['margen_pct'] - CENTRO * 100))
-        else:
-            optimo = max(candidatos, key=lambda x: x['margen_pct'])
-        optimo['es_optimo'] = True
-
-        # Ordenar: primero los del rango, luego por margen desc
-        candidatos_en  = sorted([c for c in candidatos if c['en_rango']], key=lambda x: abs(x['margen_pct'] - CENTRO*100))
-        candidatos_out = sorted([c for c in candidatos if not c['en_rango']], key=lambda x: -x['margen_pct'])
-
-        return jsonify({
-            'status': 'ok',
-            'hora': hora,
-            'fecha': fecha_str,
-            'recaudado': round(total_rec, 2),
-            'margen_objetivo': f'{int(MARGEN_MIN*100)}%-{int(MARGEN_MAX*100)}%',
-            'optimo_auto': optimo,
-            'candidatos_en_rango': candidatos_en,
-            'candidatos_fuera_rango': candidatos_out[:10]  # top 10 fuera del rango
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/estado-sorteos-hoy')
-@admin_required
-def estado_sorteos_hoy():
-    """
-    Muestra el estado de todos los sorteos del día:
-    - Pendiente (aún no ocurre)
-    - Necesita resultado (ya pasó, sin ganador)
-    - Registrado (tiene resultado)
-    Para cada uno 'necesita resultado', indica si el auto-sorteo actuará en 5 min.
-    """
-    try:
-        ahora = ahora_peru()
-        fecha_str = ahora.strftime("%d/%m/%Y")
-        min_ahora = ahora.hour * 60 + ahora.minute
-
-        with get_db() as db:
-            resultados_hoy = db.execute(
-                "SELECT hora, animal FROM resultados WHERE fecha=?", (fecha_str,)
-            ).fetchall()
-        res_map = {r['hora']: r['animal'] for r in resultados_hoy}
-
-        estados = []
-        for hora in HORARIOS_PERU:
-            min_h = hora_a_min(hora)
-            if hora in res_map:
-                estado = 'registrado'
-            elif min_ahora >= min_h:
-                estado = 'necesita_resultado'
-            else:
-                estado = 'pendiente'
-
-            estados.append({
-                'hora': hora,
-                'estado': estado,
-                'resultado': res_map.get(hora),
-                'nombre': ANIMALES.get(res_map.get(hora, ''), '') if hora in res_map else None,
-                'min_sorteo': min_h,
-                'min_ahora': min_ahora
-            })
-
-        necesitan = [e for e in estados if e['estado'] == 'necesita_resultado']
-        return jsonify({
-            'status': 'ok',
-            'fecha': fecha_str,
-            'hora_peru': ahora.strftime("%I:%M %p"),
-            'estados': estados,
-            'pendientes_de_resultado': len(necesitan)
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/resultados-fecha-admin', methods=['POST'])
@@ -1583,17 +1127,23 @@ def riesgo():
         now = ahora_peru()
         am  = now.hour*60+now.minute
 
-        sorteo = None
-        for h in HORARIOS_PERU:
-            m = hora_a_min(h)
-            if am >= m-MINUTOS_BLOQUEO and am < m+60:
-                sorteo = h; break
-        if not sorteo:
+        # Usar hora del parámetro GET si se envió y es válida
+        hora_param = request.args.get('hora', '').strip()
+        if hora_param and hora_param in HORARIOS_PERU:
+            sorteo = hora_param
+        else:
+            # Auto-detectar el sorteo más próximo / activo
+            sorteo = None
             for h in HORARIOS_PERU:
-                if (hora_a_min(h)-am) > MINUTOS_BLOQUEO:
+                m = hora_a_min(h)
+                if am >= m-MINUTOS_BLOQUEO and am < m+60:
                     sorteo = h; break
-        if not sorteo:
-            sorteo = HORARIOS_PERU[-1]
+            if not sorteo:
+                for h in HORARIOS_PERU:
+                    if (hora_a_min(h)-am) > MINUTOS_BLOQUEO:
+                        sorteo = h; break
+            if not sorteo:
+                sorteo = HORARIOS_PERU[-1]
 
         with get_db() as db:
             # Get all agencies that have sold in this hour today
@@ -3103,7 +2653,14 @@ async function vender(){
 }
 
 // RESULTADOS
-function openResultados(){ openMod('mod-resultados'); }
+function openResultados(){
+  // Poner fecha de hoy por defecto al abrir
+  if(!document.getElementById('res-fecha').value){
+    document.getElementById('res-fecha').value = new Date().toISOString().split('T')[0];
+  }
+  openMod('mod-resultados');
+  cargarResultados();
+}
 function cargarResultados(){
   let f=document.getElementById('res-fecha').value; 
   if(!f)return;
@@ -3113,20 +2670,19 @@ function cargarResultados(){
   fetch('/api/resultados-fecha',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:f})})
   .then(r=>r.json())
   .then(d=>{
-    let fd=new Date(f+'T00:00:00');
+    let fd=new Date(f+'T12:00:00');
     document.getElementById('res-titulo').textContent=fd.toLocaleDateString('es-PE',{weekday:'long',day:'numeric',month:'long'}).toUpperCase();
     let html='';
-    HPERU.forEach((h,i)=>{
+    HPERU.forEach(h=>{
       let res=d.resultados[h];
-      let hv=HVEN[i];
       html+=`<div class="ri ${res?'ok':''}">
-        <span class="ri-hora">${h.replace(':00','')} <span style="color:var(--text2);font-size:.65rem">/ ${hv.replace(':00','')}</span></span>
-        ${res?`<span class="ri-animal">${res.animal} — ${res.nombre}</span>`:'<span style="color:#1e2a40;font-size:.78rem">PENDIENTE</span>'}
+        <span class="ri-hora">${h.replace(':00 AM',' AM').replace(':00 PM',' PM')}</span>
+        ${res?`<span class="ri-animal">${res.animal} — ${res.nombre}</span>`:'<span style="color:#4a6090;font-size:.78rem">PENDIENTE</span>'}
       </div>`;
     });
-    c.innerHTML=html;
+    c.innerHTML=html||'<p style="color:#4a6090;text-align:center;padding:20px;font-size:.75rem;letter-spacing:2px">SIN RESULTADOS</p>';
   })
-  .catch(()=>{c.innerHTML='<p style="color:var(--red);text-align:center">Error</p>';});
+  .catch(()=>{c.innerHTML='<p style="color:var(--red);text-align:center;padding:12px">Error de conexión</p>';});
 }
 
 // CONSULTAS
@@ -3692,24 +3248,28 @@ function cargarRA(){
   c.innerHTML='<p style="color:var(--text2);text-align:center;padding:12px;font-size:.75rem;letter-spacing:2px">CARGANDO...</p>';
   fetch('/api/resultados-fecha-admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:f})})
   .then(r=>r.json()).then(d=>{
+    if(d.error){c.innerHTML=`<p style="color:var(--red);text-align:center;padding:12px">${d.error}</p>`;return;}
     let html='';
     HORARIOS.forEach(h=>{
       let res=d.resultados[h];
       html+=`<div class="ri ${res?'ok':''}">
         <span style="color:var(--gold);font-weight:700;font-family:'Oswald',sans-serif;font-size:.82rem">${h}</span>
         <div style="display:flex;align-items:center;gap:8px">
-          ${res?`<span style="color:var(--green);font-weight:600">${res.animal} — ${res.nombre}</span>`:'<span style="color:#1e2a40;font-size:.78rem">PENDIENTE</span>'}
-          <button class="btn-edit" onclick="preRA('${h}','${f}',${res?`'${res.animal}'`:'null'})">${res?'✏️ Editar':'➕'}</button>
+          ${res?`<span style="color:var(--green);font-weight:600">${res.animal} — ${res.nombre}</span>`:'<span style="color:#4a6090;font-size:.78rem">PENDIENTE</span>'}
+          <button class="btn-edit" onclick="preRA('${h}','${f}','${res?res.animal:''}')">${res?'✏️ Editar':'➕ Cargar'}</button>
         </div>
       </div>`;
     });
     c.innerHTML=html;
-  });
+  }).catch(()=>{c.innerHTML='<p style="color:var(--red);text-align:center;padding:12px">Error de conexión</p>';});
 }
-function preRA(h,f,a){
-  document.getElementById('ra-hora').value=h;
-  document.getElementById('ra-fi').value=f;
-  if(a&&a!=='null') document.getElementById('ra-animal').value=a;
+function preRA(h, f, a){
+  document.getElementById('ra-hora').value = h;
+  document.getElementById('ra-fi').value = f;
+  if(a && a !== '') document.getElementById('ra-animal').value = a;
+  // Scroll al formulario de carga manual
+  document.querySelector('#tc-resultados .fbox:last-child').scrollIntoView({behavior:'smooth'});
+  showMsg('ra-msg', `✏️ Editando ${h} — selecciona el animal y guarda`, 'ok');
 }
 function guardarRA(){
   let hora=document.getElementById('ra-hora').value;
@@ -4239,74 +3799,14 @@ document.addEventListener('DOMContentLoaded',()=>{
 </script>
 </body></html>'''
 
-def _scheduler_auto_sorteo():
-    """
-    Hilo de fondo — verifica cada 30 segundos si hay sorteos que lanzar.
-    Dispara exactamente en el minuto +2 de cada hora de sorteo (como 0012).
-    Usa un set para no disparar el mismo sorteo dos veces en la misma sesion.
-    Lechuza #40: max 1 vez/semana, garantizada al menos 1 vez en fin de semana.
-    Saldo acumulado: el sobrante de cada sorteo se arrastra al siguiente del dia.
-    """
-    import time
-    import threading
-    disparados = set()  # (fecha, hora) ya lanzados en esta sesion
-
-    while True:
-        time.sleep(30)
-        try:
-            ahora = ahora_peru()
-            min_ahora = ahora.hour * 60 + ahora.minute
-            fecha_str = ahora.strftime("%d/%m/%Y")
-
-            for hora_str in HORARIOS_PERU:
-                min_sorteo = hora_a_min(hora_str)
-                diff = min_ahora - min_sorteo  # minutos transcurridos desde el sorteo
-                key = (fecha_str, hora_str)
-                # Disparar exactamente entre +2 y +3 minutos post-sorteo
-                if ESPERA_AUTO_MINUTOS <= diff <= (ESPERA_AUTO_MINUTOS + 1) and key not in disparados:
-                    disparados.add(key)
-                    threading.Thread(
-                        target=_lanzar_auto_sorteo_thread,
-                        args=(hora_str,),
-                        daemon=True
-                    ).start()
-
-            # Limpiar disparados viejos para no crecer indefinidamente
-            if len(disparados) > 500:
-                disparados.clear()
-
-        except Exception as e:
-            print(f"[SCHEDULER ERROR] {e}")
-
-
-def _lanzar_auto_sorteo_thread(hora_str):
-    """Wrapper que ejecuta el auto-sorteo en un hilo separado."""
-    try:
-        resultado = ejecutar_sorteo_automatico_zoolo(hora_str)
-        if resultado.get('auto'):
-            sin_premio_tag = " [SIN PREMIO]" if resultado.get('sin_premio') else ""
-            print(f"[AUTO-SORTEO] {hora_str} -> #{resultado['numero']} "
-                  f"{resultado['nombre']}{sin_premio_tag} | Margen:{resultado['margen_pct']}% "
-                  f"| Premio:S/{resultado.get('premio_pagado',0):.2f} "
-                  f"| Acumulado sig:S/{resultado.get('acumulado_arrastrado',0):.2f} "
-                  f"| Motivo:{resultado['motivo']}")
-    except Exception as e:
-        print(f"[AUTO-SORTEO ERROR] {hora_str}: {e}")
-
-
 if __name__ == '__main__':
     init_db()
-    import threading
-    threading.Thread(target=_scheduler_auto_sorteo, daemon=True).start()
     print("=" * 56)
-    print("  ZOOLO CASINO v5.0")
+    print("  ZOOLO CASINO v5.0 — RESULTADOS 100% MANUALES")
     print("=" * 56)
     print(f"  DB: {DB_PATH}")
     print(f"  Horarios: 8AM-6PM (11 sorteos hora Peru)")
-    print(f"  Margen casa: {int(MARGEN_CASA_DEFAULT*100)}%  |  Disparo auto: +{ESPERA_AUTO_MINUTOS} min")
-    print(f"  Lechuza #40: SOLO MANUAL — no sale en auto-sorteo")
-    print(f"  Animal unico por dia: SI — no se repite el mismo dia")
-    print(f"  Sin ganador si no cubre 70%: acumula al siguiente sorteo")
+    print(f"  Resultados: SOLO MANUAL — el admin carga cada resultado")
     print(f"  Admin: cuborubi / 15821462")
     print("=" * 56)
     port = int(os.environ.get('PORT', 10000))
