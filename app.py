@@ -22,7 +22,7 @@ PAGO_LECHUZA       = 70
 PAGO_ESPECIAL      = 2
 PAGO_TRIPLETA      = 60
 COMISION_AGENCIA   = 0.15
-MINUTOS_BLOQUEO    = 5  # Cierre 5 minutos antes del sorteo
+MINUTOS_BLOQUEO    = 3  # Cierre 3 minutos antes del sorteo (a los :57)
 
 # Horarios: 8AM a 6PM (11 sorteos) — hora Peru
 HORARIOS_PERU = [
@@ -268,6 +268,11 @@ def resultados_validos_para_tripleta(resultados_dia, hora_compra_ticket):
     return {h: a for h, a in resultados_dia.items() if hora_a_min(h) >= min_compra}
 
 def calcular_premio_ticket(ticket_id, db=None):
+    """
+    Calcula el premio de un ticket respetando la separación de loterías.
+    Cada jugada/tripleta solo se compara contra los resultados de SU lotería.
+    Zoolo Casino PERÚ y Zoolo Casino PLUS son 100% independientes.
+    """
     close = False
     if db is None:
         db = get_db(); close = True
@@ -277,13 +282,25 @@ def calcular_premio_ticket(ticket_id, db=None):
         fecha_ticket = parse_fecha(t['fecha'])
         if not fecha_ticket: return 0
         fecha_str = fecha_ticket.strftime("%d/%m/%Y")
-        res_rows = db.execute("SELECT hora, animal FROM resultados WHERE fecha=?", (fecha_str,)).fetchall()
-        resultados = {r['hora']: r['animal'] for r in res_rows}
+
+        # Cargar resultados de cada lotería POR SEPARADO — nunca mezclar
+        res_rows_peru = db.execute(
+            "SELECT hora, animal FROM resultados WHERE fecha=? AND loteria='peru'", (fecha_str,)
+        ).fetchall()
+        res_rows_plus = db.execute(
+            "SELECT hora, animal FROM resultados WHERE fecha=? AND loteria='plus'", (fecha_str,)
+        ).fetchall()
+        resultados_peru = {r['hora']: r['animal'] for r in res_rows_peru}
+        resultados_plus = {r['hora']: r['animal'] for r in res_rows_plus}
+
         total = 0
-        
+
+        # Jugadas — cada una usa SOLO los resultados de su propia lotería
         jugadas = db.execute("SELECT * FROM jugadas WHERE ticket_id=?", (ticket_id,)).fetchall()
         for j in jugadas:
-            wa = resultados.get(j['hora'])
+            lot_j = j['loteria'] if 'loteria' in j.keys() else 'peru'
+            res_dia = resultados_plus if lot_j == 'plus' else resultados_peru
+            wa = res_dia.get(j['hora'])
             if not wa: continue
             if j['tipo']=='animal' and str(wa)==str(j['seleccion']):
                 total += calcular_premio_animal(j['monto'], wa)
@@ -294,13 +311,17 @@ def calcular_premio_ticket(ticket_id, db=None):
                    (sel=='PAR' and num%2==0) or \
                    (sel=='IMPAR' and num%2!=0):
                     total += j['monto'] * PAGO_ESPECIAL
-        
-        # Tripletas: solo cuentan sorteos POSTERIORES a la hora de compra del ticket
-        res_validos_trip = resultados_validos_para_tripleta(resultados, fecha_ticket)
+
+        # Tripletas — cada una usa SOLO los resultados de su propia lotería
+        # Solo cuentan sorteos POSTERIORES a la hora de compra del ticket
+        res_validos_peru = resultados_validos_para_tripleta(resultados_peru, fecha_ticket)
+        res_validos_plus = resultados_validos_para_tripleta(resultados_plus, fecha_ticket)
         trips = db.execute("SELECT * FROM tripletas WHERE ticket_id=?", (ticket_id,)).fetchall()
         for tr in trips:
+            lot_tr = tr['loteria'] if 'loteria' in tr.keys() else 'peru'
+            res_validos = res_validos_plus if lot_tr == 'plus' else res_validos_peru
             nums = {tr['animal1'], tr['animal2'], tr['animal3']}
-            salidos = {a for a in res_validos_trip.values() if a in nums}
+            salidos = {a for a in res_validos.values() if a in nums}
             if len(salidos)==3:
                 total += tr['monto'] * PAGO_TRIPLETA
         return total
@@ -921,10 +942,13 @@ def anular_ticket():
             
             # Agencias pueden anular si todos los sorteos del ticket aún no cerraron
             if not session.get('es_admin'):
-                jugs = db.execute("SELECT hora FROM jugadas WHERE ticket_id=?",(t['id'],)).fetchall()
+                jugs = db.execute("SELECT hora, loteria FROM jugadas WHERE ticket_id=?",(t['id'],)).fetchall()
                 for j in jugs:
-                    if not puede_vender(j['hora']):
-                        return jsonify({'error':f"No se puede anular: el sorteo {j['hora']} ya cerró"})
+                    lot_j = j['loteria'] if 'loteria' in j.keys() else 'peru'
+                    cerrado = not puede_vender_plus(j['hora']) if lot_j == 'plus' else not puede_vender(j['hora'])
+                    if cerrado:
+                        lot_label = 'PLUS' if lot_j == 'plus' else 'PERÚ'
+                        return jsonify({'error':f"No se puede anular: el sorteo {j['hora']} ({lot_label}) ya cerró"})
             
             # Anular ticket
             db.execute("UPDATE tickets SET anulado=1 WHERE id=?",(t['id'],))
@@ -1161,6 +1185,34 @@ def editar_agencia():
         return jsonify({'status':'ok'})
     except Exception as e:
         return jsonify({'error':str(e)}),500
+
+@app.route('/admin/eliminar-agencia', methods=['POST'])
+@admin_required
+def eliminar_agencia():
+    try:
+        data = request.get_json() or {}
+        aid = data.get('id')
+        if not aid:
+            return jsonify({'error': 'ID requerido'}), 400
+        with get_db() as db:
+            ag = db.execute("SELECT id, nombre_agencia, es_admin FROM agencias WHERE id=?", (aid,)).fetchone()
+            if not ag:
+                return jsonify({'error': 'Agencia no encontrada'}), 404
+            if ag['es_admin']:
+                return jsonify({'error': 'No se puede eliminar al administrador'}), 403
+            # Verificar si tiene tickets activos (no anulados)
+            tickets_activos = db.execute(
+                "SELECT COUNT(*) as cnt FROM tickets WHERE agencia_id=? AND anulado=0", (aid,)
+            ).fetchone()['cnt']
+            if tickets_activos > 0:
+                return jsonify({'error': f'La agencia tiene {tickets_activos} ticket(s) activo(s). Anúlelos antes de eliminar.'}), 400
+            nombre = ag['nombre_agencia']
+            db.execute("DELETE FROM agencias WHERE id=? AND es_admin=0", (aid,))
+            db.commit()
+        log_audit('ELIMINAR_AGENCIA', f"Agencia id:{aid} '{nombre}' eliminada")
+        return jsonify({'status': 'ok', 'mensaje': f'Agencia {nombre} eliminada correctamente'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 # ---- TOPES ----
 @app.route('/admin/topes', methods=['GET'])
@@ -1853,7 +1905,7 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 .manual-label span{color:#f5a623}
 
 /* GRID ANIMALES */
-.animals-scroll{flex:1;overflow-y:auto;padding:4px 5px}
+.animals-scroll{flex:1;overflow-y:auto;padding:4px 5px;min-height:0}
 .animals-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:3px}
 
 /* CELDA ANIMAL */
@@ -1908,9 +1960,9 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 .monto-input{flex:1;padding:9px 8px;background:#fff;border:2px solid #d97706;border-radius:3px;color:#c47b00;font-size:1.1rem;font-family:'Oswald',sans-serif;font-weight:700;text-align:center;letter-spacing:1px}
 .monto-input:focus{outline:none;border-color:#f59e0b;box-shadow:0 0 8px rgba(245,158,11,.25)}
 
-/* TICKET */
-.ticket-sec{padding:4px 8px;border-bottom:1px solid var(--border);display:flex;flex-direction:column;min-height:0}
-.ticket-list{overflow-y:auto;min-height:40px;max-height:160px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:4px;padding:4px;margin-bottom:4px}
+/* TICKET — ahora en panel izquierdo, abajo */
+.ticket-sec{padding:4px 8px;border-top:2px solid #d97706;background:#fffbeb;display:flex;flex-direction:column;flex-shrink:0}
+.ticket-list{overflow-y:auto;min-height:60px;max-height:220px;background:#fff;border:1px solid #e2e8f0;border-radius:4px;padding:4px;margin-bottom:4px}
 .ti{display:flex;align-items:center;gap:3px;padding:4px;border-bottom:1px solid #f1f5f9;font-size:.7rem}
 .ti-desc{flex:1;color:#1e293b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.68rem}
 .ti-hora{color:#0284c7;font-size:.65rem;min-width:38px;font-family:'Oswald',sans-serif;font-weight:700}
@@ -2081,6 +2133,15 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
       <div class="animals-grid" id="animals-grid"></div>
     </div>
 
+    <!-- TICKET — panel izquierdo inferior, visible siempre -->
+    <div class="ticket-sec">
+      <div class="rlabel" style="padding:4px 0 2px;color:#854d0e;letter-spacing:2px">🎫 TICKET EN ELABORACIÓN</div>
+      <div class="ticket-list" id="ticket-list">
+        <div class="ticket-empty">TICKET VACÍO</div>
+      </div>
+      <div id="ticket-total" style="display:none" class="ticket-total"></div>
+    </div>
+
   </div>
 
   <!-- DERECHA: CONTROLES -->
@@ -2092,7 +2153,7 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
         <button id="tab-peru" onclick="cambiarLoteria('peru')" style="flex:1;padding:7px 4px;background:#1a3a90;border:2px solid #4070d0;border-radius:4px;color:#fff;font-family:'Oswald',sans-serif;font-size:.72rem;font-weight:700;letter-spacing:1px;cursor:pointer;transition:all .15s" class="active">🇵🇪 ZOOLO PERU</button>
         <button id="tab-plus" onclick="cambiarLoteria('plus')" style="flex:1;padding:7px 4px;background:#3b0764;border:2px solid #a855f7;border-radius:4px;color:#fff;font-family:'Oswald',sans-serif;font-size:.72rem;font-weight:700;letter-spacing:1px;cursor:pointer;transition:all .15s">🎰 ZOOLO PLUS</button>
       </div>
-      <div class="rlabel" id="horas-label">⏰ PERÚ — 11 Sorteos (Cierra 5 min antes)</div>
+      <div class="rlabel" id="horas-label">⏰ PERÚ — 11 Sorteos (Cierra 3 min antes (al :57))</div>
       <div class="horas-grid" id="horas-grid"></div>
       <div class="horas-btns-row">
         <button class="hsel-btn" onclick="selTodos()">☑ Todos</button>
@@ -2115,15 +2176,6 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
         <span class="monto-label">S/</span>
         <input type="number" class="monto-input" id="monto" value="1" min="0.5" step="0.5">
       </div>
-    </div>
-
-    <!-- TICKET -->
-    <div class="ticket-sec">
-      <div class="rlabel">🎫 TICKET</div>
-      <div class="ticket-list" id="ticket-list">
-        <div class="ticket-empty">TICKET VACÍO</div>
-      </div>
-      <div id="ticket-total" style="display:none" class="ticket-total"></div>
     </div>
 
     <!-- BOTONES ACCIÓN -->
@@ -2419,8 +2471,9 @@ function handleManualKeyup(e){
 
 function procesarManual(texto){
   if(!texto || !texto.trim()){ return; }
-  // Separar por puntos, comas, guiones, espacios o saltos de línea
-  let nums = texto.split(/[.,\-;\s\n]+/).map(x=>x.trim()).filter(x=>x!=='');
+  // Soporta formatos: 1.5.9.10 / 7,19,25 / 1-5-9 / 1 5 9 / mezcla
+  // Los puntos aquí son SEPARADORES no decimales (ej: 1.5.9.10 = números 1,5,9,10)
+  let nums = texto.split(/[.,\-;\s\n\/|]+/).map(x=>x.trim()).filter(x=>x!=='');
   let validos = [];
   let invalidos = [];
   
@@ -2524,8 +2577,8 @@ function cambiarLoteria(lot){
   document.getElementById('tab-peru').classList.toggle('active', lot==='peru');
   document.getElementById('tab-plus').classList.toggle('active', lot==='plus');
   let lbl = lot==='plus'
-    ? '⏰ PLUS — 12 Sorteos (Cierra 5 min antes)'
-    : '⏰ PERÚ — 11 Sorteos (Cierra 5 min antes)';
+    ? '⏰ PLUS — 12 Sorteos (Cierra 3 min antes (al :57))'
+    : '⏰ PERÚ — 11 Sorteos (Cierra 3 min antes (al :57))';
   document.getElementById('horas-label').textContent = lbl;
   renderHoras();
 }
@@ -3455,9 +3508,10 @@ tr:hover td{background:#f8fafc}
       <input type="number" id="edit-ag-com" placeholder="Comisión %" min="0" max="100" step="1">
       <input type="number" id="edit-ag-tope" placeholder="Tope taquilla S/ (0=sin límite)" min="0" step="10">
     </div>
-    <div style="display:flex;gap:6px">
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
       <button class="btn-s" onclick="guardarEditAg()">💾 GUARDAR CAMBIOS</button>
       <button class="btn-sec" onclick="document.getElementById('edit-ag-box').style.display='none'">CANCELAR</button>
+      <button class="btn-sec" onclick="eliminarAgDesdeEdit()" style="background:#7f1d1d;border-color:#ef4444;color:#fca5a5;margin-left:auto">🗑️ ELIMINAR AGENCIA</button>
     </div>
     <input type="hidden" id="edit-ag-id">
     <div id="edit-ag-msg" style="margin-top:6px"></div>
@@ -3731,7 +3785,7 @@ function cargarRiesgo(){
     document.getElementById('riesgo-info').innerHTML=
       `<span style="background:#0d1828;border:2px solid #2a4a80;border-radius:3px;padding:4px 10px;font-size:.8rem">
         ⏱ SORTEO: <b style="color:#fbbf24">${d.sorteo_objetivo||'N/A'}</b>
-        &nbsp;|&nbsp; CIERRE: <b style="color:#f87171">${d.minutos_cierre||5} min antes</b>
+        &nbsp;|&nbsp; CIERRE: <b style="color:#f87171">${d.minutos_cierre||3} min antes (al :57)</b>
         &nbsp;|&nbsp; 💰 TOTAL: <b style="color:#f87171">S/${(d.total_apostado||0).toFixed(2)}</b>
       </span>`;
     let l=document.getElementById('riesgo-lista');
@@ -4037,6 +4091,7 @@ function cargarAgs(){
         <td style="display:flex;gap:4px">
           <button class="btn-edit" onclick="abrirEditAg(${a.id},'${a.nombre_agencia}','${(a.nombre_banco||'').replace(/'/g,"\\'")}',${(a.comision*100).toFixed(0)},${a.tope_taquilla||0})">✏️ Editar</button>
           <button class="btn-sec" onclick="toggleAg(${a.id},${a.activa})" style="font-size:.7rem">${a.activa?'Desactivar':'Activar'}</button>
+          <button class="btn-sec" onclick="eliminarAg(${a.id},'${a.nombre_agencia.replace(/'/g,"\\'")}')" style="font-size:.7rem;background:#7f1d1d;border-color:#ef4444;color:#fca5a5">🗑️ Eliminar</button>
         </td>
       </tr>`;
     });
@@ -4092,6 +4147,22 @@ function crearAg(){
       cargarAgs();
     } else showMsg('ag-msg','❌ '+d.error,'err');
   });
+}
+function eliminarAgDesdeEdit(){
+  let id = document.getElementById('edit-ag-id').value;
+  let nombre = document.getElementById('edit-ag-nombre').value;
+  eliminarAg(parseInt(id), nombre);
+}
+function eliminarAg(id, nombre){
+  if(!confirm(`⚠️ ¿Eliminar la agencia "${nombre}"?\n\nEsta acción NO se puede deshacer.\nSolo se puede eliminar si no tiene tickets activos.`)) return;
+  fetch('/admin/eliminar-agencia',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:parseInt(id)})})
+  .then(r=>r.json()).then(d=>{
+    if(d.status==='ok'){
+      glMsg('✅ '+d.mensaje,'ok');
+      document.getElementById('edit-ag-box').style.display='none';
+      cargarAgs();
+    } else glMsg('❌ '+d.error,'err');
+  }).catch(()=>glMsg('❌ Error de conexión','err'));
 }
 function toggleAg(id,a){
   fetch('/admin/editar-agencia',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,activa:!a})})
