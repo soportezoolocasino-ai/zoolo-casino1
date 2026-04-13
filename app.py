@@ -7,7 +7,9 @@ ZOOLO CASINO LOCAL v3.0 — Código Optimizado
 - Repetir ticket por serial editable
 """
 
-import os, json, csv, io, sqlite3, re
+import os, json, csv, io, re
+import psycopg2
+import psycopg2.extras
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from flask import Flask, render_template_string, request, session, redirect, jsonify, Response
@@ -15,7 +17,9 @@ from collections import defaultdict
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'zoolo_local_2025_seguro')
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'zoolo_casino.db')
+DATABASE_URL = os.environ.get('DATABASE_URL', '')
+if DATABASE_URL.startswith('postgres://'):
+    DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 
 PAGO_ANIMAL_NORMAL = 35
 PAGO_LECHUZA       = 70
@@ -64,149 +68,165 @@ ROJOS = ["1","3","5","7","9","12","14","16","18","19",
          "21","23","25","27","30","32","34","36","37","39"]
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = False
+    return _DBWrap(conn)
+
+class _DBWrap:
+    """Hace que psycopg2 sea compatible con el patron with get_db() as db: de SQLite"""
+    def __init__(self, conn):
+        self._c = conn
+        self._cur = conn.cursor()
+
+    # --- context manager ---
+    def __enter__(self):
+        return self
+    def __exit__(self, exc, val, tb):
+        if exc:
+            self._c.rollback()
+        else:
+            self._c.commit()
+        self._cur.close()
+        self._c.close()
+        return False
+
+    # --- ejecutar queries ---
+    def execute(self, sql, params=None):
+        self._cur.execute(sql, params or ())
+        return self  # devuelve self para poder encadenar .fetchone()/.fetchall()
+
+    def executemany(self, sql, seq):
+        self._cur.executemany(sql, seq)
+        return self
+
+    def executescript(self, script):
+        # PostgreSQL no tiene executescript - ejecutar sentencia por sentencia
+        for stmt in script.split(';'):
+            s = stmt.strip()
+            if s:
+                try:
+                    self._cur.execute(s)
+                except Exception:
+                    self._c.rollback()
+        return self
+
+    # --- resultados como dict (compatible con sqlite3.Row) ---
+    def fetchone(self):
+        row = self._cur.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in self._cur.description]
+        return _Row(dict(zip(cols, row)))
+
+    def fetchall(self):
+        rows = self._cur.fetchall()
+        if not rows:
+            return []
+        cols = [d[0] for d in self._cur.description]
+        return [_Row(dict(zip(cols, r))) for r in rows]
+
+    # --- lastrowid usando lastval() de PostgreSQL ---
+    @property
+    def lastrowid(self):
+        self._cur.execute("SELECT lastval()")
+        return self._cur.fetchone()[0]
+
+    def commit(self):
+        self._c.commit()
+
+    def close(self):
+        self._cur.close()
+        self._c.close()
+
+    # Iteracion directa sobre resultados
+    def __iter__(self):
+        cols = [d[0] for d in self._cur.description]
+        for row in self._cur:
+            yield _Row(dict(zip(cols, row)))
+
+
+class _Row(dict):
+    """Fila compatible con sqlite3.Row: acceso por nombre y por indice"""
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return super().__getitem__(key)
+    def keys(self):
+        return super().keys()
 
 def init_db():
     with get_db() as db:
-        db.executescript("""
-        CREATE TABLE IF NOT EXISTS agencias (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            usuario TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            nombre_agencia TEXT NOT NULL,
-            nombre_banco TEXT DEFAULT '',
-            es_admin INTEGER DEFAULT 0,
-            comision REAL DEFAULT 0.15,
-            activa INTEGER DEFAULT 1,
-            tope_taquilla REAL DEFAULT 0,
-            creado TEXT DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS tickets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            serial TEXT UNIQUE NOT NULL,
-            agencia_id INTEGER NOT NULL,
-            fecha TEXT NOT NULL,
-            total REAL NOT NULL,
-            pagado INTEGER DEFAULT 0,
-            anulado INTEGER DEFAULT 0,
-            creado TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY (agencia_id) REFERENCES agencias(id)
-        );
-        CREATE TABLE IF NOT EXISTS jugadas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticket_id INTEGER NOT NULL,
-            hora TEXT NOT NULL,
-            seleccion TEXT NOT NULL,
-            monto REAL NOT NULL,
-            tipo TEXT NOT NULL,
-            FOREIGN KEY (ticket_id) REFERENCES tickets(id)
-        );
-        CREATE TABLE IF NOT EXISTS tripletas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticket_id INTEGER NOT NULL,
-            animal1 TEXT NOT NULL,
-            animal2 TEXT NOT NULL,
-            animal3 TEXT NOT NULL,
-            monto REAL NOT NULL,
-            fecha TEXT NOT NULL,
-            pagado INTEGER DEFAULT 0,
-            loteria TEXT NOT NULL DEFAULT 'peru',
-            FOREIGN KEY (ticket_id) REFERENCES tickets(id)
-        );
-        CREATE TABLE IF NOT EXISTS resultados (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            fecha TEXT NOT NULL,
-            hora TEXT NOT NULL,
-            animal TEXT NOT NULL,
-            loteria TEXT NOT NULL DEFAULT 'peru',
-            UNIQUE(fecha, hora, loteria)
-        );
-        CREATE TABLE IF NOT EXISTS topes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            hora TEXT NOT NULL,
-            numero TEXT NOT NULL,
-            monto_tope REAL NOT NULL,
-            loteria TEXT NOT NULL DEFAULT 'peru',
-            UNIQUE(hora, numero, loteria)
-        );
-        CREATE TABLE IF NOT EXISTS audit_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            agencia_id INTEGER,
-            usuario TEXT,
-            accion TEXT NOT NULL,
-            detalle TEXT,
-            ip TEXT,
-            creado TEXT DEFAULT (datetime('now'))
-        );
-        CREATE INDEX IF NOT EXISTS idx_tickets_agencia ON tickets(agencia_id);
-        CREATE INDEX IF NOT EXISTS idx_tickets_fecha ON tickets(fecha);
-        CREATE INDEX IF NOT EXISTS idx_jugadas_ticket ON jugadas(ticket_id);
-        CREATE INDEX IF NOT EXISTS idx_tripletas_ticket ON tripletas(ticket_id);
-        CREATE INDEX IF NOT EXISTS idx_resultados_fecha ON resultados(fecha);
-        CREATE INDEX IF NOT EXISTS idx_audit_logs_fecha ON audit_logs(creado);
-        """)
-        # Tablas opcionales para motor de auto-sorteo mejorado
+        # Tablas principales (SERIAL en lugar de AUTOINCREMENT, sin FOREIGN KEY inline)
+        db.execute("""CREATE TABLE IF NOT EXISTS agencias (
+            id SERIAL PRIMARY KEY, usuario TEXT UNIQUE NOT NULL, password TEXT NOT NULL,
+            nombre_agencia TEXT NOT NULL, nombre_banco TEXT DEFAULT '',
+            es_admin INTEGER DEFAULT 0, comision REAL DEFAULT 0.15,
+            activa INTEGER DEFAULT 1, tope_taquilla REAL DEFAULT 0,
+            creado TEXT DEFAULT (to_char(now(), 'YYYY-MM-DD HH24:MI:SS')))""")
+        db.execute("""CREATE TABLE IF NOT EXISTS tickets (
+            id SERIAL PRIMARY KEY, serial TEXT UNIQUE NOT NULL,
+            agencia_id INTEGER NOT NULL, fecha TEXT NOT NULL, total REAL NOT NULL,
+            pagado INTEGER DEFAULT 0, anulado INTEGER DEFAULT 0,
+            creado TEXT DEFAULT (to_char(now(), 'YYYY-MM-DD HH24:MI:SS')))""")
+        db.execute("""CREATE TABLE IF NOT EXISTS jugadas (
+            id SERIAL PRIMARY KEY, ticket_id INTEGER NOT NULL, hora TEXT NOT NULL,
+            seleccion TEXT NOT NULL, monto REAL NOT NULL, tipo TEXT NOT NULL,
+            loteria TEXT NOT NULL DEFAULT 'peru')""")
+        db.execute("""CREATE TABLE IF NOT EXISTS tripletas (
+            id SERIAL PRIMARY KEY, ticket_id INTEGER NOT NULL, animal1 TEXT NOT NULL,
+            animal2 TEXT NOT NULL, animal3 TEXT NOT NULL, monto REAL NOT NULL,
+            fecha TEXT NOT NULL, pagado INTEGER DEFAULT 0,
+            loteria TEXT NOT NULL DEFAULT 'peru')""")
+        db.execute("""CREATE TABLE IF NOT EXISTS resultados (
+            id SERIAL PRIMARY KEY, fecha TEXT NOT NULL, hora TEXT NOT NULL,
+            animal TEXT NOT NULL, loteria TEXT NOT NULL DEFAULT 'peru',
+            UNIQUE(fecha, hora, loteria))""")
+        db.execute("""CREATE TABLE IF NOT EXISTS topes (
+            id SERIAL PRIMARY KEY, hora TEXT NOT NULL, numero TEXT NOT NULL,
+            monto_tope REAL NOT NULL, loteria TEXT NOT NULL DEFAULT 'peru',
+            UNIQUE(hora, numero, loteria))""")
+        db.execute("""CREATE TABLE IF NOT EXISTS audit_logs (
+            id SERIAL PRIMARY KEY, agencia_id INTEGER, usuario TEXT,
+            accion TEXT NOT NULL, detalle TEXT, ip TEXT,
+            creado TEXT DEFAULT (to_char(now(), 'YYYY-MM-DD HH24:MI:SS')))""")
+        # Indices
+        for idx in [
+            "CREATE INDEX IF NOT EXISTS idx_tickets_agencia ON tickets(agencia_id)",
+            "CREATE INDEX IF NOT EXISTS idx_tickets_fecha ON tickets(fecha)",
+            "CREATE INDEX IF NOT EXISTS idx_jugadas_ticket ON jugadas(ticket_id)",
+            "CREATE INDEX IF NOT EXISTS idx_tripletas_ticket ON tripletas(ticket_id)",
+            "CREATE INDEX IF NOT EXISTS idx_resultados_fecha ON resultados(fecha)",
+            "CREATE INDEX IF NOT EXISTS idx_audit_logs_fecha ON audit_logs(creado)",
+        ]:
+            db.execute(idx)
+        # Tablas opcionales
         try:
-            db.executescript("""
-            CREATE TABLE IF NOT EXISTS zoolo_acumulado (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                fecha TEXT NOT NULL,
-                hora TEXT NOT NULL,
-                venta_total REAL DEFAULT 0,
-                presupuesto_premios REAL DEFAULT 0,
-                premio_pagado REAL DEFAULT 0,
-                ganancia_casa REAL DEFAULT 0,
-                saldo_acumulado REAL DEFAULT 0,
-                animal_ganador TEXT,
-                UNIQUE(fecha, hora)
-            );
-            CREATE TABLE IF NOT EXISTS zoolo_frecuencia_semanal (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                semana TEXT NOT NULL,
-                animal TEXT NOT NULL,
-                veces INTEGER DEFAULT 0,
-                UNIQUE(semana, animal)
-            );
-            """)
+            db.execute("""CREATE TABLE IF NOT EXISTS zoolo_acumulado (
+                id SERIAL PRIMARY KEY, fecha TEXT NOT NULL, hora TEXT NOT NULL,
+                venta_total REAL DEFAULT 0, presupuesto_premios REAL DEFAULT 0,
+                premio_pagado REAL DEFAULT 0, ganancia_casa REAL DEFAULT 0,
+                saldo_acumulado REAL DEFAULT 0, animal_ganador TEXT, UNIQUE(fecha, hora))""")
+            db.execute("""CREATE TABLE IF NOT EXISTS zoolo_frecuencia_semanal (
+                id SERIAL PRIMARY KEY, semana TEXT NOT NULL, animal TEXT NOT NULL,
+                veces INTEGER DEFAULT 0, UNIQUE(semana, animal))""")
             db.commit()
         except: pass
-        # Add tope_taquilla column if it doesn't exist (migration)
-        try:
-            db.execute("ALTER TABLE agencias ADD COLUMN tope_taquilla REAL DEFAULT 0")
-            db.commit()
-        except: pass
-        # Add nombre_banco column if it doesn't exist (migration)
-        try:
-            db.execute("ALTER TABLE agencias ADD COLUMN nombre_banco TEXT DEFAULT ''")
-            db.commit()
-        except: pass
-        # Migration: add loteria column to resultados
-        try:
-            db.execute("ALTER TABLE resultados ADD COLUMN loteria TEXT NOT NULL DEFAULT 'peru'")
-            db.commit()
-        except: pass
-        # Migration: add loteria column to topes
-        try:
-            db.execute("ALTER TABLE topes ADD COLUMN loteria TEXT NOT NULL DEFAULT 'peru'")
-            db.commit()
-        except: pass
-        # Migration: add loteria column to jugadas
-        try:
-            db.execute("ALTER TABLE jugadas ADD COLUMN loteria TEXT NOT NULL DEFAULT 'peru'")
-            db.commit()
-        except: pass
-        # Migration: add loteria column to tripletas
-        try:
-            db.execute("ALTER TABLE tripletas ADD COLUMN loteria TEXT NOT NULL DEFAULT 'peru'")
-            db.commit()
-        except: pass
+        # Migraciones (ignorar si ya existen)
+        for sql in [
+            "ALTER TABLE agencias ADD COLUMN tope_taquilla REAL DEFAULT 0",
+            "ALTER TABLE agencias ADD COLUMN nombre_banco TEXT DEFAULT ''",
+            "ALTER TABLE resultados ADD COLUMN loteria TEXT NOT NULL DEFAULT 'peru'",
+            "ALTER TABLE topes ADD COLUMN loteria TEXT NOT NULL DEFAULT 'peru'",
+            "ALTER TABLE jugadas ADD COLUMN loteria TEXT NOT NULL DEFAULT 'peru'",
+            "ALTER TABLE tripletas ADD COLUMN loteria TEXT NOT NULL DEFAULT 'peru'",
+        ]:
+            try:
+                db.execute(sql)
+                db.commit()
+            except: pass
         admin = db.execute("SELECT id FROM agencias WHERE es_admin=1").fetchone()
         if not admin:
-            db.execute("INSERT INTO agencias (usuario,password,nombre_agencia,es_admin,comision,activa) VALUES (?,?,?,1,0,1)",
+            db.execute("INSERT INTO agencias (usuario,password,nombre_agencia,es_admin,comision,activa) VALUES (%s,%s,%s,1,0,1)",
                        ('cuborubi','15821462','ADMINISTRADOR'))
             db.commit()
 
@@ -277,7 +297,7 @@ def calcular_premio_ticket(ticket_id, db=None):
     if db is None:
         db = get_db(); close = True
     try:
-        t = db.execute("SELECT fecha FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+        t = db.execute("SELECT fecha FROM tickets WHERE id=%s", (ticket_id,)).fetchone()
         if not t: return 0
         fecha_ticket = parse_fecha(t['fecha'])
         if not fecha_ticket: return 0
@@ -285,10 +305,10 @@ def calcular_premio_ticket(ticket_id, db=None):
 
         # Cargar resultados de cada lotería POR SEPARADO — nunca mezclar
         res_rows_peru = db.execute(
-            "SELECT hora, animal FROM resultados WHERE fecha=? AND loteria='peru'", (fecha_str,)
+            "SELECT hora, animal FROM resultados WHERE fecha=%s AND loteria='peru'", (fecha_str,)
         ).fetchall()
         res_rows_plus = db.execute(
-            "SELECT hora, animal FROM resultados WHERE fecha=? AND loteria='plus'", (fecha_str,)
+            "SELECT hora, animal FROM resultados WHERE fecha=%s AND loteria='plus'", (fecha_str,)
         ).fetchall()
         resultados_peru = {r['hora']: r['animal'] for r in res_rows_peru}
         resultados_plus = {r['hora']: r['animal'] for r in res_rows_plus}
@@ -296,7 +316,7 @@ def calcular_premio_ticket(ticket_id, db=None):
         total = 0
 
         # Jugadas — cada una usa SOLO los resultados de su propia lotería
-        jugadas = db.execute("SELECT * FROM jugadas WHERE ticket_id=?", (ticket_id,)).fetchall()
+        jugadas = db.execute("SELECT * FROM jugadas WHERE ticket_id=%s", (ticket_id,)).fetchall()
         for j in jugadas:
             lot_j = j['loteria'] if 'loteria' in j.keys() else 'peru'
             res_dia = resultados_plus if lot_j == 'plus' else resultados_peru
@@ -316,7 +336,7 @@ def calcular_premio_ticket(ticket_id, db=None):
         # Solo cuentan sorteos POSTERIORES a la hora de compra del ticket
         res_validos_peru = resultados_validos_para_tripleta(resultados_peru, fecha_ticket)
         res_validos_plus = resultados_validos_para_tripleta(resultados_plus, fecha_ticket)
-        trips = db.execute("SELECT * FROM tripletas WHERE ticket_id=?", (ticket_id,)).fetchall()
+        trips = db.execute("SELECT * FROM tripletas WHERE ticket_id=%s", (ticket_id,)).fetchall()
         for tr in trips:
             lot_tr = tr['loteria'] if 'loteria' in tr.keys() else 'peru'
             res_validos = res_validos_plus if lot_tr == 'plus' else res_validos_peru
@@ -356,7 +376,7 @@ def log_audit(accion, detalle=None):
         ip = request.remote_addr
         with get_db() as db:
             db.execute(
-                "INSERT INTO audit_logs (agencia_id, usuario, accion, detalle, ip) VALUES (?,?,?,?,?)",
+                "INSERT INTO audit_logs (agencia_id, usuario, accion, detalle, ip) VALUES (%s,%s,%s,%s,%s)",
                 (session.get('user_id'), session.get('nombre_agencia','?'), accion, detalle, ip)
             )
             db.commit()
@@ -375,7 +395,7 @@ def login():
         u = request.form.get('usuario','').strip().lower()
         p = request.form.get('password','').strip()
         with get_db() as db:
-            row = db.execute("SELECT * FROM agencias WHERE usuario=? AND password=? AND activa=1",(u,p)).fetchone()
+            row = db.execute("SELECT * FROM agencias WHERE usuario=%s AND password=%s AND activa=1",(u,p)).fetchone()
         if row:
             session['user_id'] = row['id']
             session['nombre_agencia'] = row['nombre_agencia']
@@ -429,7 +449,7 @@ def resultados_hoy():
     loteria = request.args.get('loteria', 'peru')
     horarios = HORARIOS_PLUS if loteria == 'plus' else HORARIOS_PERU
     with get_db() as db:
-        rows = db.execute("SELECT hora,animal FROM resultados WHERE fecha=? AND loteria=?",(hoy, loteria)).fetchall()
+        rows = db.execute("SELECT hora,animal FROM resultados WHERE fecha=%s AND loteria=%s",(hoy, loteria)).fetchall()
     rd = {r['hora']:{'animal':r['animal'],'nombre':ANIMALES.get(r['animal'],'?')} for r in rows}
     for h in horarios:
         if h not in rd: rd[h]=None
@@ -446,7 +466,7 @@ def resultados_fecha():
     except: fecha_obj = ahora_peru()
     fecha_str = fecha_obj.strftime("%d/%m/%Y")
     with get_db() as db:
-        rows = db.execute("SELECT hora,animal FROM resultados WHERE fecha=? AND loteria=?",(fecha_str, loteria)).fetchall()
+        rows = db.execute("SELECT hora,animal FROM resultados WHERE fecha=%s AND loteria=%s",(fecha_str, loteria)).fetchall()
     rd = {r['hora']:{'animal':r['animal'],'nombre':ANIMALES.get(r['animal'],'?')} for r in rows}
     for h in horarios:
         if h not in rd: rd[h]=None
@@ -478,11 +498,11 @@ def procesar_venta():
 
         with get_db() as db:
             # Verificar tope de taquilla
-            ag = db.execute("SELECT tope_taquilla, comision FROM agencias WHERE id=?", (agencia_id,)).fetchone()
+            ag = db.execute("SELECT tope_taquilla, comision FROM agencias WHERE id=%s", (agencia_id,)).fetchone()
             tope_taq = ag['tope_taquilla'] if ag else 0
             if tope_taq and tope_taq > 0:
                 ventas_hoy = db.execute(
-                    "SELECT COALESCE(SUM(total),0) as tot FROM tickets WHERE agencia_id=? AND anulado=0 AND fecha LIKE ?",
+                    "SELECT COALESCE(SUM(total),0) as tot FROM tickets WHERE agencia_id=%s AND anulado=0 AND fecha LIKE %s",
                     (agencia_id, hoy+'%')
                 ).fetchone()['tot']
                 if ventas_hoy + total > tope_taq:
@@ -493,7 +513,7 @@ def procesar_venta():
                 if j['tipo'] == 'animal':
                     lot = j.get('loteria','peru')
                     tope_row = db.execute(
-                        "SELECT monto_tope FROM topes WHERE hora=? AND numero=? AND loteria=?",
+                        "SELECT monto_tope FROM topes WHERE hora=%s AND numero=%s AND loteria=%s",
                         (j['hora'], j['seleccion'], lot)
                     ).fetchone()
                     if tope_row:
@@ -501,8 +521,8 @@ def procesar_venta():
                             SELECT COALESCE(SUM(jg.monto),0) as tot
                             FROM jugadas jg
                             JOIN tickets tk ON jg.ticket_id=tk.id
-                            WHERE jg.hora=? AND jg.seleccion=? AND jg.tipo='animal' AND jg.loteria=?
-                            AND tk.anulado=0 AND tk.fecha LIKE ?
+                            WHERE jg.hora=%s AND jg.seleccion=%s AND jg.tipo='animal' AND jg.loteria=%s
+                            AND tk.anulado=0 AND tk.fecha LIKE %s
                         """, (j['hora'], j['seleccion'], lot, hoy+'%')).fetchone()['tot']
                         if ya_apostado + j['monto'] > tope_row['monto_tope']:
                             nombre = ANIMALES.get(j['seleccion'], j['seleccion'])
@@ -513,18 +533,18 @@ def procesar_venta():
         fecha  = ahora_peru().strftime("%d/%m/%Y %I:%M %p")
 
         with get_db() as db:
-            cur = db.execute("INSERT INTO tickets (serial,agencia_id,fecha,total) VALUES (?,?,?,?)",
+            cur = db.execute("INSERT INTO tickets (serial,agencia_id,fecha,total) VALUES (%s,%s,%s,%s) RETURNING id",
                 (serial, agencia_id, fecha, total))
-            ticket_id = cur.lastrowid
+            ticket_id = db.fetchone()[0]
 
             for j in jugadas:
                 lot = j.get('loteria','peru')
                 if j['tipo']=='tripleta':
                     nums = j['seleccion'].split(',')
-                    db.execute("INSERT INTO tripletas (ticket_id,animal1,animal2,animal3,monto,fecha,loteria) VALUES (?,?,?,?,?,?,?)",
+                    db.execute("INSERT INTO tripletas (ticket_id,animal1,animal2,animal3,monto,fecha,loteria) VALUES (%s,%s,%s,%s,%s,%s,%s)",
                         (ticket_id, nums[0], nums[1], nums[2], j['monto'], fecha.split(' ')[0], lot))
                 else:
-                    db.execute("INSERT INTO jugadas (ticket_id,hora,seleccion,monto,tipo,loteria) VALUES (?,?,?,?,?,?)",
+                    db.execute("INSERT INTO jugadas (ticket_id,hora,seleccion,monto,tipo,loteria) VALUES (%s,%s,%s,%s,%s,%s)",
                         (ticket_id, j['hora'], j['seleccion'], j['monto'], j['tipo'], lot))
             db.commit()
 
@@ -659,14 +679,14 @@ def repetir_ticket():
             return jsonify({'error':'Serial requerido'}),400
         
         with get_db() as db:
-            t = db.execute("SELECT * FROM tickets WHERE serial=? AND agencia_id=?", 
+            t = db.execute("SELECT * FROM tickets WHERE serial=%s AND agencia_id=%s", 
                           (serial, session['user_id'])).fetchone()
             if not t:
                 return jsonify({'error':'Ticket no encontrado'}),404
             
             # Obtener jugadas
-            jugadas = db.execute("SELECT * FROM jugadas WHERE ticket_id=?", (t['id'],)).fetchall()
-            tripletas = db.execute("SELECT * FROM tripletas WHERE ticket_id=?", (t['id'],)).fetchall()
+            jugadas = db.execute("SELECT * FROM jugadas WHERE ticket_id=%s", (t['id'],)).fetchall()
+            tripletas = db.execute("SELECT * FROM tripletas WHERE ticket_id=%s", (t['id'],)).fetchall()
             
             jugadas_list = []
             for j in jugadas:
@@ -714,7 +734,7 @@ def mis_tickets():
         dtf = datetime.strptime(ff,"%Y-%m-%d").replace(hour=23,minute=59) if ff else None
         
         with get_db() as db:
-            rows = db.execute("SELECT * FROM tickets WHERE agencia_id=? AND anulado=0 ORDER BY id DESC LIMIT 500",
+            rows = db.execute("SELECT * FROM tickets WHERE agencia_id=%s AND anulado=0 ORDER BY id DESC LIMIT 500",
                             (session['user_id'],)).fetchall()
             resultado_cache = {}
             tickets_out = []
@@ -731,16 +751,16 @@ def mis_tickets():
                 cache_key_peru = fecha_str + '_peru'
                 cache_key_plus = fecha_str + '_plus'
                 if cache_key_peru not in resultado_cache:
-                    rr = db.execute("SELECT hora,animal FROM resultados WHERE fecha=? AND loteria='peru'",(fecha_str,)).fetchall()
+                    rr = db.execute("SELECT hora,animal FROM resultados WHERE fecha=%s AND loteria='peru'",(fecha_str,)).fetchall()
                     resultado_cache[cache_key_peru] = {r['hora']:r['animal'] for r in rr}
                 if cache_key_plus not in resultado_cache:
-                    rr = db.execute("SELECT hora,animal FROM resultados WHERE fecha=? AND loteria='plus'",(fecha_str,)).fetchall()
+                    rr = db.execute("SELECT hora,animal FROM resultados WHERE fecha=%s AND loteria='plus'",(fecha_str,)).fetchall()
                     resultado_cache[cache_key_plus] = {r['hora']:r['animal'] for r in rr}
 
                 res_dia_peru = resultado_cache[cache_key_peru]
                 res_dia_plus = resultado_cache[cache_key_plus]
-                jugadas_raw = db.execute("SELECT * FROM jugadas WHERE ticket_id=?",(t['id'],)).fetchall()
-                tripletas_raw = db.execute("SELECT * FROM tripletas WHERE ticket_id=?",(t['id'],)).fetchall()
+                jugadas_raw = db.execute("SELECT * FROM jugadas WHERE ticket_id=%s",(t['id'],)).fetchall()
+                tripletas_raw = db.execute("SELECT * FROM tripletas WHERE ticket_id=%s",(t['id'],)).fetchall()
                 
                 premio_total = 0
                 jugadas_det = []
@@ -814,20 +834,20 @@ def consultar_ticket_detalle():
         
         with get_db() as db:
             if session.get('es_admin'):
-                t = db.execute("SELECT * FROM tickets WHERE serial=?",(serial,)).fetchone()
+                t = db.execute("SELECT * FROM tickets WHERE serial=%s",(serial,)).fetchone()
             else:
-                t = db.execute("SELECT * FROM tickets WHERE serial=? AND agencia_id=?",
+                t = db.execute("SELECT * FROM tickets WHERE serial=%s AND agencia_id=%s",
                               (serial,session['user_id'])).fetchone()
             
             if not t: return jsonify({'error':'Ticket no encontrado'})
             t = dict(t)
             fecha_str = parse_fecha(t['fecha']).strftime("%d/%m/%Y")
-            res_rows_peru = db.execute("SELECT hora,animal FROM resultados WHERE fecha=? AND loteria='peru'",(fecha_str,)).fetchall()
-            res_rows_plus = db.execute("SELECT hora,animal FROM resultados WHERE fecha=? AND loteria='plus'",(fecha_str,)).fetchall()
+            res_rows_peru = db.execute("SELECT hora,animal FROM resultados WHERE fecha=%s AND loteria='peru'",(fecha_str,)).fetchall()
+            res_rows_plus = db.execute("SELECT hora,animal FROM resultados WHERE fecha=%s AND loteria='plus'",(fecha_str,)).fetchall()
             res_dia_peru = {r['hora']:r['animal'] for r in res_rows_peru}
             res_dia_plus = {r['hora']:r['animal'] for r in res_rows_plus}
-            jugadas_raw = db.execute("SELECT * FROM jugadas WHERE ticket_id=?",(t['id'],)).fetchall()
-            tripletas_raw = db.execute("SELECT * FROM tripletas WHERE ticket_id=?",(t['id'],)).fetchall()
+            jugadas_raw = db.execute("SELECT * FROM jugadas WHERE ticket_id=%s",(t['id'],)).fetchall()
+            tripletas_raw = db.execute("SELECT * FROM tripletas WHERE ticket_id=%s",(t['id'],)).fetchall()
         
         premio_total=0; jdet=[]
         for j in jugadas_raw:
@@ -892,7 +912,7 @@ def verificar_ticket():
     try:
         serial = request.json.get('serial')
         with get_db() as db:
-            t = db.execute("SELECT * FROM tickets WHERE serial=?",(serial,)).fetchone()
+            t = db.execute("SELECT * FROM tickets WHERE serial=%s",(serial,)).fetchone()
             if not t: return jsonify({'error':'Ticket no existe'})
             if not session.get('es_admin') and t['agencia_id']!=session['user_id']:
                 return jsonify({'error':'No autorizado'})
@@ -909,12 +929,12 @@ def pagar_ticket():
     try:
         tid = request.json.get('ticket_id')
         with get_db() as db:
-            t = db.execute("SELECT * FROM tickets WHERE id=?",(tid,)).fetchone()
+            t = db.execute("SELECT * FROM tickets WHERE id=%s",(tid,)).fetchone()
             if not t: return jsonify({'error':'Ticket no existe'})
             if not session.get('es_admin') and t['agencia_id']!=session['user_id']:
                 return jsonify({'error':'No autorizado'})
-            db.execute("UPDATE tickets SET pagado=1 WHERE id=?",(tid,))
-            db.execute("UPDATE tripletas SET pagado=1 WHERE ticket_id=?",(tid,))
+            db.execute("UPDATE tickets SET pagado=1 WHERE id=%s",(tid,))
+            db.execute("UPDATE tripletas SET pagado=1 WHERE ticket_id=%s",(tid,))
             db.commit()
         log_audit('PAGO', f"Ticket id:{tid} pagado")
         return jsonify({'status':'ok','mensaje':'Ticket pagado'})
@@ -927,7 +947,7 @@ def anular_ticket():
     try:
         serial = request.json.get('serial')
         with get_db() as db:
-            t = db.execute("SELECT * FROM tickets WHERE serial=?",(serial,)).fetchone()
+            t = db.execute("SELECT * FROM tickets WHERE serial=%s",(serial,)).fetchone()
             if not t: return jsonify({'error':'Ticket no existe'})
             
             # Verificar permisos
@@ -942,7 +962,7 @@ def anular_ticket():
             
             # Agencias pueden anular si todos los sorteos del ticket aún no cerraron
             if not session.get('es_admin'):
-                jugs = db.execute("SELECT hora, loteria FROM jugadas WHERE ticket_id=?",(t['id'],)).fetchall()
+                jugs = db.execute("SELECT hora, loteria FROM jugadas WHERE ticket_id=%s",(t['id'],)).fetchall()
                 for j in jugs:
                     lot_j = j['loteria'] if 'loteria' in j.keys() else 'peru'
                     cerrado = not puede_vender_plus(j['hora']) if lot_j == 'plus' else not puede_vender(j['hora'])
@@ -951,7 +971,7 @@ def anular_ticket():
                         return jsonify({'error':f"No se puede anular: el sorteo {j['hora']} ({lot_label}) ya cerró"})
             
             # Anular ticket
-            db.execute("UPDATE tickets SET anulado=1 WHERE id=?",(t['id'],))
+            db.execute("UPDATE tickets SET anulado=1 WHERE id=%s",(t['id'],))
             db.commit()
             
         log_audit('ANULACION', f"Ticket serial:{serial} anulado")
@@ -965,9 +985,9 @@ def caja_agencia():
     try:
         hoy = ahora_peru().strftime("%d/%m/%Y")
         with get_db() as db:
-            tickets = db.execute("SELECT * FROM tickets WHERE agencia_id=? AND anulado=0 AND fecha LIKE ?",
+            tickets = db.execute("SELECT * FROM tickets WHERE agencia_id=%s AND anulado=0 AND fecha LIKE %s",
                                 (session['user_id'], hoy+'%')).fetchall()
-            ag = db.execute("SELECT comision FROM agencias WHERE id=?",(session['user_id'],)).fetchone()
+            ag = db.execute("SELECT comision FROM agencias WHERE id=%s",(session['user_id'],)).fetchone()
             com_pct = ag['comision'] if ag else COMISION_AGENCIA
             
             ventas=0; premios_pagados=0; pendientes=0
@@ -1002,9 +1022,9 @@ def caja_historico():
         dtf = datetime.strptime(ff,"%Y-%m-%d").replace(hour=23,minute=59)
         
         with get_db() as db:
-            ag = db.execute("SELECT comision FROM agencias WHERE id=?",(session['user_id'],)).fetchone()
+            ag = db.execute("SELECT comision FROM agencias WHERE id=%s",(session['user_id'],)).fetchone()
             com_pct = ag['comision'] if ag else COMISION_AGENCIA
-            tickets = db.execute("SELECT * FROM tickets WHERE agencia_id=? AND anulado=0 ORDER BY id DESC LIMIT 2000",
+            tickets = db.execute("SELECT * FROM tickets WHERE agencia_id=%s AND anulado=0 ORDER BY id DESC LIMIT 2000",
                                 (session['user_id'],)).fetchall()
         
         dias={}; tv=0; tp=0
@@ -1076,7 +1096,7 @@ def guardar_resultado():
 
         with get_db() as db:
             ya_salio = db.execute(
-                "SELECT hora FROM resultados WHERE fecha=? AND animal=? AND hora!=? AND loteria=?",
+                "SELECT hora FROM resultados WHERE fecha=%s AND animal=%s AND hora!=%s AND loteria=%s",
                 (fecha, animal, hora, loteria)
             ).fetchone()
             if ya_salio:
@@ -1088,8 +1108,8 @@ def guardar_resultado():
                 }), 400
 
             db.execute("""
-                INSERT INTO resultados (fecha,hora,animal,loteria) VALUES (?,?,?,?)
-                ON CONFLICT(fecha,hora,loteria) DO UPDATE SET animal=excluded.animal
+                INSERT INTO resultados (fecha,hora,animal,loteria) VALUES (%s,%s,%s,%s)
+                ON CONFLICT(fecha,hora,loteria) DO UPDATE SET animal=EXCLUDED.animal
             """,(fecha, hora, animal, loteria))
             db.commit()
 
@@ -1120,7 +1140,7 @@ def resultados_fecha_admin():
         fecha_str = ahora_peru().strftime("%d/%m/%Y")
 
     with get_db() as db:
-        rows = db.execute("SELECT hora,animal FROM resultados WHERE fecha=? AND loteria=?",(fecha_str, loteria)).fetchall()
+        rows = db.execute("SELECT hora,animal FROM resultados WHERE fecha=%s AND loteria=%s",(fecha_str, loteria)).fetchall()
 
     rd={r['hora']:{'animal':r['animal'],'nombre':ANIMALES.get(r['animal'],'?')} for r in rows}
     for h in horarios:
@@ -1148,12 +1168,12 @@ def crear_agencia():
             return jsonify({'error':'Complete todos los campos'}),400
         
         with get_db() as db:
-            ex = db.execute("SELECT id FROM agencias WHERE usuario=?",(u,)).fetchone()
+            ex = db.execute("SELECT id FROM agencias WHERE usuario=%s",(u,)).fetchone()
             if ex: 
                 return jsonify({'error':'Usuario ya existe'}),400
             db.execute("""
                 INSERT INTO agencias (usuario,password,nombre_agencia,nombre_banco,es_admin,comision,activa) 
-                VALUES (?,?,?,?,0,?,1)
+                VALUES (%s,%s,%s,%s,0,%s,1)
             """,(u,p,n,nb,COMISION_AGENCIA))
             db.commit()
         
@@ -1170,15 +1190,15 @@ def editar_agencia():
         
         with get_db() as db:
             if 'nombre_banco' in data:
-                db.execute("UPDATE agencias SET nombre_banco=? WHERE id=? AND es_admin=0",(data['nombre_banco'],aid))
+                db.execute("UPDATE agencias SET nombre_banco=%s WHERE id=%s AND es_admin=0",(data['nombre_banco'],aid))
             if 'password' in data and data['password']:
-                db.execute("UPDATE agencias SET password=? WHERE id=? AND es_admin=0",(data['password'],aid))
+                db.execute("UPDATE agencias SET password=%s WHERE id=%s AND es_admin=0",(data['password'],aid))
             if 'comision' in data:
-                db.execute("UPDATE agencias SET comision=? WHERE id=? AND es_admin=0",(float(data['comision'])/100,aid))
+                db.execute("UPDATE agencias SET comision=%s WHERE id=%s AND es_admin=0",(float(data['comision'])/100,aid))
             if 'activa' in data:
-                db.execute("UPDATE agencias SET activa=? WHERE id=? AND es_admin=0",(1 if data['activa'] else 0,aid))
+                db.execute("UPDATE agencias SET activa=%s WHERE id=%s AND es_admin=0",(1 if data['activa'] else 0,aid))
             if 'tope_taquilla' in data:
-                db.execute("UPDATE agencias SET tope_taquilla=? WHERE id=? AND es_admin=0",(float(data['tope_taquilla']),aid))
+                db.execute("UPDATE agencias SET tope_taquilla=%s WHERE id=%s AND es_admin=0",(float(data['tope_taquilla']),aid))
             db.commit()
         
         log_audit('EDITAR_AGENCIA', f"Agencia id:{aid} modificada")
@@ -1195,19 +1215,19 @@ def eliminar_agencia():
         if not aid:
             return jsonify({'error': 'ID requerido'}), 400
         with get_db() as db:
-            ag = db.execute("SELECT id, nombre_agencia, es_admin FROM agencias WHERE id=?", (aid,)).fetchone()
+            ag = db.execute("SELECT id, nombre_agencia, es_admin FROM agencias WHERE id=%s", (aid,)).fetchone()
             if not ag:
                 return jsonify({'error': 'Agencia no encontrada'}), 404
             if ag['es_admin']:
                 return jsonify({'error': 'No se puede eliminar al administrador'}), 403
             # Verificar si tiene tickets activos (no anulados)
             tickets_activos = db.execute(
-                "SELECT COUNT(*) as cnt FROM tickets WHERE agencia_id=? AND anulado=0", (aid,)
+                "SELECT COUNT(*) as cnt FROM tickets WHERE agencia_id=%s AND anulado=0", (aid,)
             ).fetchone()['cnt']
             if tickets_activos > 0:
                 return jsonify({'error': f'La agencia tiene {tickets_activos} ticket(s) activo(s). Anúlelos antes de eliminar.'}), 400
             nombre = ag['nombre_agencia']
-            db.execute("DELETE FROM agencias WHERE id=? AND es_admin=0", (aid,))
+            db.execute("DELETE FROM agencias WHERE id=%s AND es_admin=0", (aid,))
             db.commit()
         log_audit('ELIMINAR_AGENCIA', f"Agencia id:{aid} '{nombre}' eliminada")
         return jsonify({'status': 'ok', 'mensaje': f'Agencia {nombre} eliminada correctamente'})
@@ -1225,14 +1245,14 @@ def get_topes():
         hoy = ahora_peru().strftime("%d/%m/%Y")
         with get_db() as db:
             topes_rows = db.execute(
-                "SELECT numero, monto_tope FROM topes WHERE hora=? AND loteria=? ORDER BY CAST(numero AS INTEGER) ASC",
+                "SELECT numero, monto_tope FROM topes WHERE hora=%s AND loteria=%s ORDER BY CAST(numero AS INTEGER) ASC",
                 (hora, loteria)
             ).fetchall()
             jugadas_rows = db.execute("""
                 SELECT jg.seleccion, COALESCE(SUM(jg.monto),0) as apostado
                 FROM jugadas jg
                 JOIN tickets tk ON jg.ticket_id=tk.id
-                WHERE jg.hora=? AND jg.tipo='animal' AND jg.loteria=? AND tk.anulado=0 AND tk.fecha LIKE ?
+                WHERE jg.hora=%s AND jg.tipo='animal' AND jg.loteria=%s AND tk.anulado=0 AND tk.fecha LIKE %s
                 GROUP BY jg.seleccion
                 ORDER BY CAST(jg.seleccion AS INTEGER) ASC
             """, (hora, loteria, hoy+'%')).fetchall()
@@ -1269,12 +1289,12 @@ def guardar_tope():
             return jsonify({'error':'Número inválido'}),400
         with get_db() as db:
             if monto <= 0:
-                db.execute("DELETE FROM topes WHERE hora=? AND numero=? AND loteria=?", (hora, numero, loteria))
+                db.execute("DELETE FROM topes WHERE hora=%s AND numero=%s AND loteria=%s", (hora, numero, loteria))
                 log_audit('TOPE_LIBRE', f"Hora:{hora} Num:{numero} Lot:{loteria} puesto en libre")
             else:
                 db.execute("""
-                    INSERT INTO topes (hora, numero, monto_tope, loteria) VALUES (?,?,?,?)
-                    ON CONFLICT(hora,numero,loteria) DO UPDATE SET monto_tope=excluded.monto_tope
+                    INSERT INTO topes (hora, numero, monto_tope, loteria) VALUES (%s,%s,%s,%s)
+                    ON CONFLICT(hora,numero,loteria) DO UPDATE SET monto_tope=EXCLUDED.monto_tope
                 """, (hora, numero, monto, loteria))
                 log_audit('TOPE_SET', f"Hora:{hora} Num:{numero}-{ANIMALES[numero]} Lot:{loteria} Tope:S/{monto}")
             db.commit()
@@ -1293,7 +1313,7 @@ def limpiar_topes():
         if hora not in horarios_validos:
             return jsonify({'error':'Hora inválida'}),400
         with get_db() as db:
-            db.execute("DELETE FROM topes WHERE hora=? AND loteria=?", (hora, loteria))
+            db.execute("DELETE FROM topes WHERE hora=%s AND loteria=%s", (hora, loteria))
             db.commit()
         log_audit('TOPES_LIMPIAR', f"Todos los topes de {hora} ({loteria}) eliminados")
         return jsonify({'status':'ok','mensaje':f'Topes de {hora} ({loteria}) eliminados'})
@@ -1333,7 +1353,7 @@ def riesgo():
                 FROM agencias ag
                 JOIN tickets tk ON ag.id=tk.agencia_id
                 JOIN jugadas jg ON tk.id=jg.ticket_id
-                WHERE jg.hora=? AND jg.loteria=? AND tk.anulado=0 AND tk.fecha LIKE ?
+                WHERE jg.hora=%s AND jg.loteria=%s AND tk.anulado=0 AND tk.fecha LIKE %s
                 ORDER BY ag.nombre_agencia
             """, (sorteo, loteria, hoy+'%')).fetchall()
 
@@ -1341,12 +1361,12 @@ def riesgo():
                 SELECT jg.seleccion, COALESCE(SUM(jg.monto),0) as apostado
                 FROM jugadas jg
                 JOIN tickets tk ON jg.ticket_id=tk.id
-                WHERE jg.hora=? AND jg.tipo='animal' AND jg.loteria=? AND tk.anulado=0 AND tk.fecha LIKE ?
+                WHERE jg.hora=%s AND jg.tipo='animal' AND jg.loteria=%s AND tk.anulado=0 AND tk.fecha LIKE %s
                 GROUP BY jg.seleccion
                 ORDER BY CAST(jg.seleccion AS INTEGER) ASC
             """, (sorteo, loteria, hoy+'%')).fetchall()
 
-            topes_rows = db.execute("SELECT numero, monto_tope FROM topes WHERE hora=? AND loteria=?", (sorteo, loteria)).fetchall()
+            topes_rows = db.execute("SELECT numero, monto_tope FROM topes WHERE hora=%s AND loteria=%s", (sorteo, loteria)).fetchall()
             topes_map = {r['numero']: r['monto_tope'] for r in topes_rows}
 
         total = sum(r['apostado'] for r in jugadas_rows)
@@ -1393,11 +1413,11 @@ def riesgo_agencia():
                 SELECT jg.seleccion, jg.tipo, COALESCE(SUM(jg.monto),0) as apostado, COUNT(*) as cnt
                 FROM jugadas jg
                 JOIN tickets tk ON jg.ticket_id=tk.id
-                WHERE tk.agencia_id=? AND jg.hora=? AND tk.anulado=0 AND tk.fecha LIKE ?
+                WHERE tk.agencia_id=%s AND jg.hora=%s AND tk.anulado=0 AND tk.fecha LIKE %s
                 GROUP BY jg.seleccion, jg.tipo
                 ORDER BY CAST(jg.seleccion AS INTEGER) ASC
             """, (agencia_id, hora, hoy+'%')).fetchall()
-            ag = db.execute("SELECT nombre_agencia FROM agencias WHERE id=?", (agencia_id,)).fetchone()
+            ag = db.execute("SELECT nombre_agencia FROM agencias WHERE id=%s", (agencia_id,)).fetchone()
         result = []
         for j in jugadas:
             mult = PAGO_LECHUZA if j['seleccion']=="40" else PAGO_ANIMAL_NORMAL
@@ -1429,13 +1449,13 @@ def reporte_agencia_horas():
         dti = datetime.strptime(fi, "%Y-%m-%d")
         dtf = datetime.strptime(ff, "%Y-%m-%d").replace(hour=23, minute=59)
         with get_db() as db:
-            ag = db.execute("SELECT nombre_agencia, usuario FROM agencias WHERE id=?", (agencia_id,)).fetchone()
+            ag = db.execute("SELECT nombre_agencia, usuario FROM agencias WHERE id=%s", (agencia_id,)).fetchone()
             jugadas_rows = db.execute("""
                 SELECT jg.hora, jg.seleccion, jg.tipo, jg.monto,
                        tk.fecha, tk.serial
                 FROM jugadas jg
                 JOIN tickets tk ON jg.ticket_id=tk.id
-                WHERE tk.agencia_id=? AND tk.anulado=0
+                WHERE tk.agencia_id=%s AND tk.anulado=0
                 ORDER BY tk.fecha DESC
             """, (agencia_id,)).fetchall()
         # Group by hour
@@ -1488,7 +1508,7 @@ def get_audit_logs():
                 SELECT al.*, ag.nombre_agencia
                 FROM audit_logs al
                 LEFT JOIN agencias ag ON al.agencia_id=ag.id
-                ORDER BY al.id DESC LIMIT ?
+                ORDER BY al.id DESC LIMIT %s
             """, (limit,)).fetchall()
         result = []
         for r in rows:
@@ -1515,7 +1535,7 @@ def reporte_agencias():
         hoy = ahora_peru().strftime("%d/%m/%Y")
         with get_db() as db:
             ags = db.execute("SELECT * FROM agencias WHERE es_admin=0").fetchall()
-            tickets = db.execute("SELECT * FROM tickets WHERE anulado=0 AND fecha LIKE ?",(hoy+'%',)).fetchall()
+            tickets = db.execute("SELECT * FROM tickets WHERE anulado=0 AND fecha LIKE %s",(hoy+'%',)).fetchall()
         
         data=[]; tv=tp=tc=0
         for ag in ags:
@@ -1560,10 +1580,10 @@ def tripletas_hoy():
                 SELECT tr.*,tk.serial,tk.agencia_id,tk.fecha as fecha_ticket
                 FROM tripletas tr 
                 JOIN tickets tk ON tr.ticket_id=tk.id 
-                WHERE tr.fecha=?
+                WHERE tr.fecha=%s
             """,(hoy,)).fetchall()
-            res_rows_peru=db.execute("SELECT hora,animal FROM resultados WHERE fecha=? AND loteria='peru'",(hoy,)).fetchall()
-            res_rows_plus=db.execute("SELECT hora,animal FROM resultados WHERE fecha=? AND loteria='plus'",(hoy,)).fetchall()
+            res_rows_peru=db.execute("SELECT hora,animal FROM resultados WHERE fecha=%s AND loteria='peru'",(hoy,)).fetchall()
+            res_rows_plus=db.execute("SELECT hora,animal FROM resultados WHERE fecha=%s AND loteria='plus'",(hoy,)).fetchall()
             res_dia_peru={r['hora']:r['animal'] for r in res_rows_peru}
             res_dia_plus={r['hora']:r['animal'] for r in res_rows_plus}
             ags={ag['id']:ag['nombre_agencia'] for ag in db.execute("SELECT id,nombre_agencia FROM agencias").fetchall()}
@@ -4269,7 +4289,8 @@ if __name__ == '__main__':
     print("=" * 60)
     print("  ZOOLO CASINO v6.0 — DOS LOTERÍAS")
     print("=" * 60)
-    print(f"  DB: {DB_PATH}")
+    db_status = 'OK' if DATABASE_URL else 'NO CONFIGURADA!'
+    print(f"  DB: PostgreSQL (DATABASE_URL: {db_status})")
     print(f"  ZOOLO CASINO PERU:  11 sorteos 8AM-6PM  (hora Lima)")
     print(f"  ZOOLO CASINO PLUS:  12 sorteos 8AM-7PM  (hora Caracas)")
     print(f"  Resultados: SOLO MANUAL — el admin carga cada resultado")
