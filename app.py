@@ -16,11 +16,21 @@ from flask import Flask, render_template_string, request, session, redirect, jso
 from collections import defaultdict
 
 app = Flask(__name__)
+_db_ready = False
 app.secret_key = os.environ.get('SECRET_KEY', 'zoolo_local_2025_seguro')
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
-
+    
+@app.before_request
+def setup():
+    global _db_ready
+    if not _db_ready:
+        try:
+            init_db()
+            _db_ready = True
+        except Exception as e:
+            print(f"init_db error: {e}")
 PAGO_ANIMAL_NORMAL = 35
 PAGO_LECHUZA       = 70
 PAGO_ESPECIAL      = 2
@@ -4283,11 +4293,7 @@ document.addEventListener('DOMContentLoaded',()=>{
 });
 </script>
 </body></html>'''
-# Inicializar tablas al arrancar con gunicorn
-try:
-    init_db()
-except Exception as e:
-    print(f"init_db error: {e}")
+
 if __name__ == '__main__':
     init_db()
     print("=" * 60)
