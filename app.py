@@ -21,6 +21,13 @@ DATABASE_URL = os.environ.get('DATABASE_URL', '')
 if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 
+# Inicializar tablas al arrancar (necesario para gunicorn en Render)
+with app.app_context():
+    try:
+        init_db()
+    except Exception as e:
+        print(f"init_db error: {e}")
+
 PAGO_ANIMAL_NORMAL = 35
 PAGO_LECHUZA       = 70
 PAGO_ESPECIAL      = 2
