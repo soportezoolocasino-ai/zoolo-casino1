@@ -21,16 +21,11 @@ app.secret_key = os.environ.get('SECRET_KEY', 'zoolo_local_2025_seguro')
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
-    
 @app.before_request
 def setup():
     global _db_ready
-    if not _db_ready:
-        try:
-            init_db()
-            _db_ready = True
-        except Exception as e:
-            print(f"init_db error: {e}")
+    _db_ready = True    
+
 PAGO_ANIMAL_NORMAL = 35
 PAGO_LECHUZA       = 70
 PAGO_ESPECIAL      = 2
