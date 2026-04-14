@@ -142,6 +142,9 @@ class _DBWrap:
     def commit(self):
         self._c.commit()
 
+    def rollback(self):
+        self._c.rollback()
+
     def close(self):
         self._cur.close()
         self._c.close()
@@ -225,7 +228,8 @@ def init_db():
             try:
                 db.execute(sql)
                 db.commit()
-            except: pass
+            except:
+                db.rollback()
         admin = db.execute("SELECT id FROM agencias WHERE es_admin=1").fetchone()
         if not admin:
             # FIX 4d: contraseña del admin inicial también hasheada
