@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-ZOOLO CASINO LOCAL v3.0 — Código Optimizado
-- Tripleta válida solo día actual (9am-6pm)
-- Cierre a 2 minutos del sorteo
-- Jugada manual por texto (pegar números)
-- Repetir ticket por serial editable
+ZOOLO CASINO LOCAL v3.1 — Código Corregido
+Fixes aplicados:
+  1. init_db() se llama automáticamente en before_request (funciona en Gunicorn/Render)
+  2. RETURNING id leído por nombre de columna, no por índice
+  3. Bucles de N conexiones → una sola conexión reutilizada
+  4. Contraseñas hasheadas con SHA-256 + secret_key (no texto plano)
 """
 
-import os, json, csv, io, re
+import os, json, csv, io, re, hashlib
 import psycopg2
 import psycopg2.extras
 from datetime import datetime, timedelta, timezone
@@ -21,25 +22,28 @@ app.secret_key = os.environ.get('SECRET_KEY', 'zoolo_local_2025_seguro')
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+
+# FIX 1: before_request inicializa la DB si todavía no lo hizo
+# (en Gunicorn/Render el bloque __main__ nunca se ejecuta)
 @app.before_request
 def setup():
     global _db_ready
-    _db_ready = True    
+    if not _db_ready:
+        init_db()
+        _db_ready = True
 
 PAGO_ANIMAL_NORMAL = 35
 PAGO_LECHUZA       = 70
 PAGO_ESPECIAL      = 2
 PAGO_TRIPLETA      = 60
 COMISION_AGENCIA   = 0.15
-MINUTOS_BLOQUEO    = 3  # Cierre 3 minutos antes del sorteo (a los :57)
+MINUTOS_BLOQUEO    = 3
 
-# Horarios: 8AM a 6PM (11 sorteos) — hora Peru
 HORARIOS_PERU = [
     "08:00 AM","09:00 AM","10:00 AM","11:00 AM","12:00 PM",
     "01:00 PM","02:00 PM","03:00 PM","04:00 PM","05:00 PM","06:00 PM"
 ]
 
-# Horarios Plus: 8AM a 7PM (12 sorteos) — hora Venezuela (UTC-4)
 HORARIOS_PLUS = [
     "08:00 AM","09:00 AM","10:00 AM","11:00 AM","12:00 PM",
     "01:00 PM","02:00 PM","03:00 PM","04:00 PM","05:00 PM","06:00 PM","07:00 PM"
@@ -72,18 +76,21 @@ COLORES = {
 ROJOS = ["1","3","5","7","9","12","14","16","18","19",
          "21","23","25","27","30","32","34","36","37","39"]
 
+# ─── Helpers de hash ───────────────────────────────────────────────────────────
+def hash_password(plain):
+    """SHA-256 + secret_key como sal. Siempre usar esta función."""
+    return hashlib.sha256((plain + app.secret_key).encode()).hexdigest()
+
 def get_db():
     conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = False
     return _DBWrap(conn)
 
 class _DBWrap:
-    """Hace que psycopg2 sea compatible con el patron with get_db() as db: de SQLite"""
     def __init__(self, conn):
         self._c = conn
         self._cur = conn.cursor()
 
-    # --- context manager ---
     def __enter__(self):
         return self
     def __exit__(self, exc, val, tb):
@@ -95,17 +102,15 @@ class _DBWrap:
         self._c.close()
         return False
 
-    # --- ejecutar queries ---
     def execute(self, sql, params=None):
         self._cur.execute(sql, params or ())
-        return self  # devuelve self para poder encadenar .fetchone()/.fetchall()
+        return self
 
     def executemany(self, sql, seq):
         self._cur.executemany(sql, seq)
         return self
 
     def executescript(self, script):
-        # PostgreSQL no tiene executescript - ejecutar sentencia por sentencia
         for stmt in script.split(';'):
             s = stmt.strip()
             if s:
@@ -115,7 +120,6 @@ class _DBWrap:
                     self._c.rollback()
         return self
 
-    # --- resultados como dict (compatible con sqlite3.Row) ---
     def fetchone(self):
         row = self._cur.fetchone()
         if row is None:
@@ -130,7 +134,6 @@ class _DBWrap:
         cols = [d[0] for d in self._cur.description]
         return [_Row(dict(zip(cols, r))) for r in rows]
 
-    # --- lastrowid usando lastval() de PostgreSQL ---
     @property
     def lastrowid(self):
         self._cur.execute("SELECT lastval()")
@@ -143,7 +146,6 @@ class _DBWrap:
         self._cur.close()
         self._c.close()
 
-    # Iteracion directa sobre resultados
     def __iter__(self):
         cols = [d[0] for d in self._cur.description]
         for row in self._cur:
@@ -151,7 +153,6 @@ class _DBWrap:
 
 
 class _Row(dict):
-    """Fila compatible con sqlite3.Row: acceso por nombre y por indice"""
     def __getitem__(self, key):
         if isinstance(key, int):
             return list(self.values())[key]
@@ -161,7 +162,6 @@ class _Row(dict):
 
 def init_db():
     with get_db() as db:
-        # Tablas principales (SERIAL en lugar de AUTOINCREMENT, sin FOREIGN KEY inline)
         db.execute("""CREATE TABLE IF NOT EXISTS agencias (
             id SERIAL PRIMARY KEY, usuario TEXT UNIQUE NOT NULL, password TEXT NOT NULL,
             nombre_agencia TEXT NOT NULL, nombre_banco TEXT DEFAULT '',
@@ -194,7 +194,6 @@ def init_db():
             id SERIAL PRIMARY KEY, agencia_id INTEGER, usuario TEXT,
             accion TEXT NOT NULL, detalle TEXT, ip TEXT,
             creado TEXT DEFAULT (to_char(now(), 'YYYY-MM-DD HH24:MI:SS')))""")
-        # Indices
         for idx in [
             "CREATE INDEX IF NOT EXISTS idx_tickets_agencia ON tickets(agencia_id)",
             "CREATE INDEX IF NOT EXISTS idx_tickets_fecha ON tickets(fecha)",
@@ -204,7 +203,6 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_audit_logs_fecha ON audit_logs(creado)",
         ]:
             db.execute(idx)
-        # Tablas opcionales
         try:
             db.execute("""CREATE TABLE IF NOT EXISTS zoolo_acumulado (
                 id SERIAL PRIMARY KEY, fecha TEXT NOT NULL, hora TEXT NOT NULL,
@@ -216,7 +214,6 @@ def init_db():
                 veces INTEGER DEFAULT 0, UNIQUE(semana, animal))""")
             db.commit()
         except: pass
-        # Migraciones (ignorar si ya existen)
         for sql in [
             "ALTER TABLE agencias ADD COLUMN tope_taquilla REAL DEFAULT 0",
             "ALTER TABLE agencias ADD COLUMN nombre_banco TEXT DEFAULT ''",
@@ -231,8 +228,10 @@ def init_db():
             except: pass
         admin = db.execute("SELECT id FROM agencias WHERE es_admin=1").fetchone()
         if not admin:
+            # FIX 4d: contraseña del admin inicial también hasheada
+            ph_admin = hash_password('15821462')
             db.execute("INSERT INTO agencias (usuario,password,nombre_agencia,es_admin,comision,activa) VALUES (%s,%s,%s,1,0,1)",
-                       ('cuborubi','15821462','ADMINISTRADOR'))
+                       ('cuborubi', ph_admin, 'ADMINISTRADOR'))
             db.commit()
 
 def ahora_peru():
@@ -280,24 +279,12 @@ def calcular_premio_animal(monto, num):
     return monto * (PAGO_LECHUZA if str(num)=="40" else PAGO_ANIMAL_NORMAL)
 
 def resultados_validos_para_tripleta(resultados_dia, hora_compra_ticket):
-    """
-    Filtra resultados_dia {hora: animal} devolviendo solo los sorteos
-    POSTERIORES O IGUALES a la hora de compra del ticket.
-    Los sorteos que ya habian ocurrido cuando se compro la tripleta
-    NO cuentan para completarla.
-    hora_compra_ticket: objeto datetime con la hora de compra.
-    """
     if hora_compra_ticket is None:
         return resultados_dia
     min_compra = hora_compra_ticket.hour * 60 + hora_compra_ticket.minute
     return {h: a for h, a in resultados_dia.items() if hora_a_min(h) >= min_compra}
 
 def calcular_premio_ticket(ticket_id, db=None):
-    """
-    Calcula el premio de un ticket respetando la separación de loterías.
-    Cada jugada/tripleta solo se compara contra los resultados de SU lotería.
-    Zoolo Casino PERÚ y Zoolo Casino PLUS son 100% independientes.
-    """
     close = False
     if db is None:
         db = get_db(); close = True
@@ -308,7 +295,6 @@ def calcular_premio_ticket(ticket_id, db=None):
         if not fecha_ticket: return 0
         fecha_str = fecha_ticket.strftime("%d/%m/%Y")
 
-        # Cargar resultados de cada lotería POR SEPARADO — nunca mezclar
         res_rows_peru = db.execute(
             "SELECT hora, animal FROM resultados WHERE fecha=%s AND loteria='peru'", (fecha_str,)
         ).fetchall()
@@ -320,7 +306,6 @@ def calcular_premio_ticket(ticket_id, db=None):
 
         total = 0
 
-        # Jugadas — cada una usa SOLO los resultados de su propia lotería
         jugadas = db.execute("SELECT * FROM jugadas WHERE ticket_id=%s", (ticket_id,)).fetchall()
         for j in jugadas:
             lot_j = j['loteria'] if 'loteria' in j.keys() else 'peru'
@@ -337,8 +322,6 @@ def calcular_premio_ticket(ticket_id, db=None):
                    (sel=='IMPAR' and num%2!=0):
                     total += j['monto'] * PAGO_ESPECIAL
 
-        # Tripletas — cada una usa SOLO los resultados de su propia lotería
-        # Solo cuentan sorteos POSTERIORES a la hora de compra del ticket
         res_validos_peru = resultados_validos_para_tripleta(resultados_peru, fecha_ticket)
         res_validos_plus = resultados_validos_para_tripleta(resultados_plus, fecha_ticket)
         trips = db.execute("SELECT * FROM tripletas WHERE ticket_id=%s", (ticket_id,)).fetchall()
@@ -399,8 +382,10 @@ def login():
     if request.method=='POST':
         u = request.form.get('usuario','').strip().lower()
         p = request.form.get('password','').strip()
+        # FIX 4b: comparar contra hash, no texto plano
+        ph = hash_password(p)
         with get_db() as db:
-            row = db.execute("SELECT * FROM agencias WHERE usuario=%s AND password=%s AND activa=1",(u,p)).fetchone()
+            row = db.execute("SELECT * FROM agencias WHERE usuario=%s AND password=%s AND activa=1",(u,ph)).fetchone()
         if row:
             session['user_id'] = row['id']
             session['nombre_agencia'] = row['nombre_agencia']
@@ -485,11 +470,9 @@ def procesar_venta():
         jugadas = data.get('jugadas', [])
         if not jugadas: return jsonify({'error':'Ticket vacío'}),400
 
-        # Separar jugadas por lotería
         jugadas_peru = [j for j in jugadas if j.get('loteria','peru') == 'peru']
         jugadas_plus = [j for j in jugadas if j.get('loteria','peru') == 'plus']
 
-        # Validar horarios bloqueados — cada lotería con su zona horaria
         for j in jugadas_peru:
             if j['tipo']!='tripleta' and not puede_vender(j['hora']):
                 return jsonify({'error':f"PERU — Sorteo {j['hora']} ya cerró (5 min antes)"}),400
@@ -502,7 +485,6 @@ def procesar_venta():
         total = sum(j['monto'] for j in jugadas)
 
         with get_db() as db:
-            # Verificar tope de taquilla
             ag = db.execute("SELECT tope_taquilla, comision FROM agencias WHERE id=%s", (agencia_id,)).fetchone()
             tope_taq = ag['tope_taquilla'] if ag else 0
             if tope_taq and tope_taq > 0:
@@ -513,7 +495,6 @@ def procesar_venta():
                 if ventas_hoy + total > tope_taq:
                     return jsonify({'error':f'Tope de taquilla alcanzado. Límite: S/{tope_taq}, vendido hoy: S/{ventas_hoy:.2f}'}),400
 
-            # Verificar topes por número — considerando lotería
             for j in jugadas:
                 if j['tipo'] == 'animal':
                     lot = j.get('loteria','peru')
@@ -534,13 +515,13 @@ def procesar_venta():
                             lot_label = 'PLUS' if lot=='plus' else 'PERU'
                             return jsonify({'error':f'Tope alcanzado para {j["seleccion"]}-{nombre} en {j["hora"]} ({lot_label}). Disponible: S/{tope_row["monto_tope"]-ya_apostado:.2f}'}),400
 
-        serial = generar_serial()
-        fecha  = ahora_peru().strftime("%d/%m/%Y %I:%M %p")
+            serial = generar_serial()
+            fecha  = ahora_peru().strftime("%d/%m/%Y %I:%M %p")
 
-        with get_db() as db:
-            cur = db.execute("INSERT INTO tickets (serial,agencia_id,fecha,total) VALUES (%s,%s,%s,%s) RETURNING id",
+            # FIX 2: leer id por nombre de columna, no por índice
+            db.execute("INSERT INTO tickets (serial,agencia_id,fecha,total) VALUES (%s,%s,%s,%s) RETURNING id",
                 (serial, agencia_id, fecha, total))
-            ticket_id = db.fetchone()[0]
+            ticket_id = db.fetchone()['id']
 
             for j in jugadas:
                 lot = j.get('loteria','peru')
@@ -563,19 +544,16 @@ def procesar_venta():
             return h.replace(' ','')
 
         def fmt_h_plus_ticket(h):
-            """Returns 'Xam VEN - Yam PERU' where Y = X-1h (Venezuela is UTC-4, Peru UTC-5)."""
             m2 = re.match(r'(\d+):(\d+) (AM|PM)', h.strip())
             if not m2: return h.replace(' ','')
             hh, mm, ap = int(m2.group(1)), m2.group(2), m2.group(3)
             ven_label = f"{hh}{ap}" if mm=='00' else f"{hh}:{mm}{ap}"
-            # Convert to 24h, subtract 1 hour, back to 12h for Peru label
             h24 = hh % 12 + (12 if ap=='PM' else 0)
             peru_h24 = (h24 - 1) % 24
             peru_ap = 'PM' if peru_h24 >= 12 else 'AM'
             peru_hh = peru_h24 % 12 or 12
             peru_label = f"{peru_hh}{peru_ap}" if mm=='00' else f"{peru_hh}:{mm}{peru_ap}"
             return f"{ven_label} VEN - {peru_label} PERU"
-
 
         nombre_banco = session.get('nombre_banco', '').strip()
         sep_banco = f"-----------{nombre_banco}-----------" if nombre_banco else "------------------------"
@@ -587,7 +565,6 @@ def procesar_venta():
                   sep_banco,
                   ""]
 
-        # Jugadas PERU
         jpoh_peru = defaultdict(list)
         for j in jugadas_peru:
             if j['tipo']!='tripleta': jpoh_peru[j['hora']].append(j)
@@ -606,7 +583,6 @@ def procesar_venta():
             lineas.append(" ".join(items))
             lineas.append("")
 
-        # Jugadas PLUS
         jpoh_plus = defaultdict(list)
         for j in jugadas_plus:
             if j['tipo']!='tripleta': jpoh_plus[j['hora']].append(j)
@@ -625,7 +601,6 @@ def procesar_venta():
             lineas.append(" ".join(items))
             lineas.append("")
 
-        # Tripletas
         ahora_dt = ahora_peru()
         trips_peru = [j for j in jugadas_peru if j['tipo']=='tripleta']
         trips_plus = [j for j in jugadas_plus if j['tipo']=='tripleta']
@@ -677,22 +652,17 @@ def procesar_venta():
 @app.route('/api/repetir-ticket', methods=['POST'])
 @agencia_required
 def repetir_ticket():
-    """Obtiene datos de un ticket por serial para repetirlo"""
     try:
         serial = request.json.get('serial')
         if not serial:
             return jsonify({'error':'Serial requerido'}),400
-        
         with get_db() as db:
-            t = db.execute("SELECT * FROM tickets WHERE serial=%s AND agencia_id=%s", 
+            t = db.execute("SELECT * FROM tickets WHERE serial=%s AND agencia_id=%s",
                           (serial, session['user_id'])).fetchone()
             if not t:
                 return jsonify({'error':'Ticket no encontrado'}),404
-            
-            # Obtener jugadas
             jugadas = db.execute("SELECT * FROM jugadas WHERE ticket_id=%s", (t['id'],)).fetchall()
             tripletas = db.execute("SELECT * FROM tripletas WHERE ticket_id=%s", (t['id'],)).fetchall()
-            
             jugadas_list = []
             for j in jugadas:
                 jugadas_list.append({
@@ -702,7 +672,6 @@ def repetir_ticket():
                     'monto': j['monto'],
                     'nombre': ANIMALES.get(j['seleccion'], j['seleccion']) if j['tipo']=='animal' else j['seleccion']
                 })
-            
             trips_list = []
             for tr in tripletas:
                 lot_tr = tr['loteria'] if 'loteria' in tr.keys() else 'peru'
@@ -715,7 +684,6 @@ def repetir_ticket():
                     'seleccion': f"{tr['animal1']},{tr['animal2']},{tr['animal3']}",
                     'loteria': lot_tr
                 })
-            
             return jsonify({
                 'status': 'ok',
                 'ticket_original': {
@@ -725,7 +693,6 @@ def repetir_ticket():
                 },
                 'jugadas': jugadas_list + trips_list
             })
-            
     except Exception as e:
         return jsonify({'error':str(e)}),500
 
@@ -737,13 +704,11 @@ def mis_tickets():
         fi = data.get('fecha_inicio'); ff = data.get('fecha_fin'); est = data.get('estado','todos')
         dti = datetime.strptime(fi,"%Y-%m-%d") if fi else None
         dtf = datetime.strptime(ff,"%Y-%m-%d").replace(hour=23,minute=59) if ff else None
-        
         with get_db() as db:
             rows = db.execute("SELECT * FROM tickets WHERE agencia_id=%s AND anulado=0 ORDER BY id DESC LIMIT 500",
                             (session['user_id'],)).fetchall()
             resultado_cache = {}
             tickets_out = []
-            
             for t in rows:
                 dt = parse_fecha(t['fecha'])
                 if not dt: continue
@@ -751,7 +716,6 @@ def mis_tickets():
                 if dtf and dt>dtf: continue
                 if est=='pagados' and not t['pagado']: continue
                 if est=='pendientes' and t['pagado']: continue
-                
                 fecha_str = dt.strftime("%d/%m/%Y")
                 cache_key_peru = fecha_str + '_peru'
                 cache_key_plus = fecha_str + '_plus'
@@ -761,15 +725,12 @@ def mis_tickets():
                 if cache_key_plus not in resultado_cache:
                     rr = db.execute("SELECT hora,animal FROM resultados WHERE fecha=%s AND loteria='plus'",(fecha_str,)).fetchall()
                     resultado_cache[cache_key_plus] = {r['hora']:r['animal'] for r in rr}
-
                 res_dia_peru = resultado_cache[cache_key_peru]
                 res_dia_plus = resultado_cache[cache_key_plus]
                 jugadas_raw = db.execute("SELECT * FROM jugadas WHERE ticket_id=%s",(t['id'],)).fetchall()
                 tripletas_raw = db.execute("SELECT * FROM tripletas WHERE ticket_id=%s",(t['id'],)).fetchall()
-                
                 premio_total = 0
                 jugadas_det = []
-                
                 for j in jugadas_raw:
                     lot_j = j['loteria'] if 'loteria' in j.keys() else 'peru'
                     res_dia = res_dia_plus if lot_j == 'plus' else res_dia_peru
@@ -793,7 +754,6 @@ def mis_tickets():
                         'gano':gano,'premio':round(pj,2),
                         'loteria': lot_j
                     })
-                
                 trips_det = []
                 res_validos_trip_peru = resultados_validos_para_tripleta(res_dia_peru, dt)
                 res_validos_trip_plus = resultados_validos_para_tripleta(res_dia_plus, dt)
@@ -811,16 +771,13 @@ def mis_tickets():
                         'monto':tr['monto'],'salieron':salidos,'gano':gano_t,'premio':round(pt,2),
                         'pagado':bool(tr['pagado']),'loteria':lot_tr
                     })
-                
                 if est=='por_pagar' and (t['pagado'] or premio_total==0): continue
-                
                 tickets_out.append({
                     'id':t['id'],'serial':t['serial'],'fecha':t['fecha'],
                     'total':t['total'],'pagado':bool(t['pagado']),
                     'premio_calculado':round(premio_total,2),
                     'jugadas':jugadas_det,'tripletas':trips_det
                 })
-        
         tv = sum(t['total'] for t in tickets_out)
         return jsonify({
             'status':'ok',
@@ -836,14 +793,12 @@ def consultar_ticket_detalle():
     try:
         serial = (request.get_json() or {}).get('serial')
         if not serial: return jsonify({'error':'Serial requerido'}),400
-        
         with get_db() as db:
             if session.get('es_admin'):
                 t = db.execute("SELECT * FROM tickets WHERE serial=%s",(serial,)).fetchone()
             else:
                 t = db.execute("SELECT * FROM tickets WHERE serial=%s AND agencia_id=%s",
                               (serial,session['user_id'])).fetchone()
-            
             if not t: return jsonify({'error':'Ticket no encontrado'})
             t = dict(t)
             fecha_str = parse_fecha(t['fecha']).strftime("%d/%m/%Y")
@@ -853,7 +808,6 @@ def consultar_ticket_detalle():
             res_dia_plus = {r['hora']:r['animal'] for r in res_rows_plus}
             jugadas_raw = db.execute("SELECT * FROM jugadas WHERE ticket_id=%s",(t['id'],)).fetchall()
             tripletas_raw = db.execute("SELECT * FROM tripletas WHERE ticket_id=%s",(t['id'],)).fetchall()
-        
         premio_total=0; jdet=[]
         for j in jugadas_raw:
             lot_j = j['loteria'] if 'loteria' in j.keys() else 'peru'
@@ -878,7 +832,6 @@ def consultar_ticket_detalle():
                 'gano':gano,'premio':round(pj,2),
                 'loteria': lot_j
             })
-        
         tdet=[]
         fecha_ticket_dt = parse_fecha(t['fecha'])
         res_validos_trip_peru = resultados_validos_para_tripleta(res_dia_peru, fecha_ticket_dt)
@@ -898,7 +851,6 @@ def consultar_ticket_detalle():
                 'monto':tr['monto'],'salieron':salidos,'gano':gano_t,
                 'premio':round(pt,2),'pagado':bool(tr['pagado']),'loteria':lot_tr
             })
-        
         return jsonify({
             'status':'ok',
             'ticket':{
@@ -954,18 +906,12 @@ def anular_ticket():
         with get_db() as db:
             t = db.execute("SELECT * FROM tickets WHERE serial=%s",(serial,)).fetchone()
             if not t: return jsonify({'error':'Ticket no existe'})
-            
-            # Verificar permisos
             if not session.get('es_admin') and t['agencia_id']!=session['user_id']:
                 return jsonify({'error':'No autorizado'})
-            
-            if t['pagado']: 
+            if t['pagado']:
                 return jsonify({'error':'Ya pagado, no se puede anular'})
-            
             if t['anulado']:
                 return jsonify({'error':'Ticket ya estaba anulado'})
-            
-            # Agencias pueden anular si todos los sorteos del ticket aún no cerraron
             if not session.get('es_admin'):
                 jugs = db.execute("SELECT hora, loteria FROM jugadas WHERE ticket_id=%s",(t['id'],)).fetchall()
                 for j in jugs:
@@ -974,11 +920,8 @@ def anular_ticket():
                     if cerrado:
                         lot_label = 'PLUS' if lot_j == 'plus' else 'PERÚ'
                         return jsonify({'error':f"No se puede anular: el sorteo {j['hora']} ({lot_label}) ya cerró"})
-            
-            # Anular ticket
             db.execute("UPDATE tickets SET anulado=1 WHERE id=%s",(t['id'],))
             db.commit()
-            
         log_audit('ANULACION', f"Ticket serial:{serial} anulado")
         return jsonify({'status':'ok','mensaje':'Ticket anulado correctamente'})
     except Exception as e:
@@ -994,16 +937,14 @@ def caja_agencia():
                                 (session['user_id'], hoy+'%')).fetchall()
             ag = db.execute("SELECT comision FROM agencias WHERE id=%s",(session['user_id'],)).fetchone()
             com_pct = ag['comision'] if ag else COMISION_AGENCIA
-            
             ventas=0; premios_pagados=0; pendientes=0
             for t in tickets:
                 ventas += t['total']
                 p = calcular_premio_ticket(t['id'],db)
-                if t['pagado']: 
+                if t['pagado']:
                     premios_pagados+=p
-                elif p>0: 
+                elif p>0:
                     pendientes+=1
-        
         return jsonify({
             'ventas':round(ventas,2),
             'premios':round(premios_pagados,2),
@@ -1022,32 +963,28 @@ def caja_historico():
         data = request.get_json()
         fi,ff = data.get('fecha_inicio'), data.get('fecha_fin')
         if not fi or not ff: return jsonify({'error':'Fechas requeridas'}),400
-        
         dti = datetime.strptime(fi,"%Y-%m-%d")
         dtf = datetime.strptime(ff,"%Y-%m-%d").replace(hour=23,minute=59)
-        
         with get_db() as db:
             ag = db.execute("SELECT comision FROM agencias WHERE id=%s",(session['user_id'],)).fetchone()
             com_pct = ag['comision'] if ag else COMISION_AGENCIA
             tickets = db.execute("SELECT * FROM tickets WHERE agencia_id=%s AND anulado=0 ORDER BY id DESC LIMIT 2000",
                                 (session['user_id'],)).fetchall()
-        
-        dias={}; tv=0; tp=0
-        for t in tickets:
-            dt=parse_fecha(t['fecha'])
-            if not dt or dt<dti or dt>dtf: continue
-            dk=dt.strftime("%d/%m/%Y")
-            if dk not in dias: 
-                dias[dk]={'ventas':0,'tickets':0,'premios':0}
-            dias[dk]['ventas']+=t['total']
-            dias[dk]['tickets']+=1
-            tv+=t['total']
-            with get_db() as db2: 
-                p=calcular_premio_ticket(t['id'],db2)
-            if t['pagado']: 
-                dias[dk]['premios']+=p
-                tp+=p
-        
+            # FIX 3g: reutilizar db en el bucle, no abrir N conexiones
+            dias={}; tv=0; tp=0
+            for t in tickets:
+                dt=parse_fecha(t['fecha'])
+                if not dt or dt<dti or dt>dtf: continue
+                dk=dt.strftime("%d/%m/%Y")
+                if dk not in dias:
+                    dias[dk]={'ventas':0,'tickets':0,'premios':0}
+                dias[dk]['ventas']+=t['total']
+                dias[dk]['tickets']+=1
+                tv+=t['total']
+                p=calcular_premio_ticket(t['id'],db)
+                if t['pagado']:
+                    dias[dk]['premios']+=p
+                    tp+=p
         resumen=[]
         for dk in sorted(dias.keys()):
             d=dias[dk]
@@ -1060,7 +997,6 @@ def caja_historico():
                 'comision':round(cd,2),
                 'balance':round(d['ventas']-d['premios']-cd,2)
             })
-        
         tc=tv*com_pct
         return jsonify({
             'resumen_por_dia':resumen,
@@ -1083,22 +1019,16 @@ def guardar_resultado():
         animal = request.form.get('animal','').strip()
         fi = request.form.get('fecha','').strip()
         loteria = request.form.get('loteria','peru').strip()
-
         if animal not in ANIMALES:
             return jsonify({'error':'Animal inválido'}),400
-
         horarios_validos = HORARIOS_PLUS if loteria == 'plus' else HORARIOS_PERU
         if hora not in horarios_validos:
             return jsonify({'error':'Hora inválida para esta lotería'}),400
-
         if fi:
-            try:
-                fecha = datetime.strptime(fi,"%Y-%m-%d").strftime("%d/%m/%Y")
-            except:
-                fecha = ahora_peru().strftime("%d/%m/%Y")
+            try: fecha = datetime.strptime(fi,"%Y-%m-%d").strftime("%d/%m/%Y")
+            except: fecha = ahora_peru().strftime("%d/%m/%Y")
         else:
             fecha = ahora_peru().strftime("%d/%m/%Y")
-
         with get_db() as db:
             ya_salio = db.execute(
                 "SELECT hora FROM resultados WHERE fecha=%s AND animal=%s AND hora!=%s AND loteria=%s",
@@ -1111,26 +1041,16 @@ def guardar_resultado():
                     'error': f'⚠️ El animal {animal}-{nombre_animal} ya salió hoy en {lot_label} en el sorteo de {ya_salio["hora"]}. '
                              f'Un animal no puede repetirse el mismo día.'
                 }), 400
-
             db.execute("""
                 INSERT INTO resultados (fecha,hora,animal,loteria) VALUES (%s,%s,%s,%s)
                 ON CONFLICT(fecha,hora,loteria) DO UPDATE SET animal=EXCLUDED.animal
             """,(fecha, hora, animal, loteria))
             db.commit()
-
         lot_label = 'PLUS' if loteria=='plus' else 'PERU'
         log_audit('RESULTADO', f"Loteria:{lot_label} Fecha:{fecha} Hora:{hora} Animal:{animal} ({ANIMALES[animal]})")
-        return jsonify({
-            'status':'ok',
-            'mensaje':f'[{lot_label}] {hora} = {animal} ({ANIMALES[animal]})',
-            'fecha':fecha
-        })
+        return jsonify({'status':'ok','mensaje':f'[{lot_label}] {hora} = {animal} ({ANIMALES[animal]})','fecha':fecha})
     except Exception as e:
         return jsonify({'error':str(e)}),500
-
-
-
-
 
 @app.route('/api/resultados-fecha-admin', methods=['POST'])
 @admin_required
@@ -1139,18 +1059,13 @@ def resultados_fecha_admin():
     fs = data.get('fecha')
     loteria = data.get('loteria', 'peru')
     horarios = HORARIOS_PLUS if loteria == 'plus' else HORARIOS_PERU
-    try:
-        fecha_str = datetime.strptime(fs,"%Y-%m-%d").strftime("%d/%m/%Y")
-    except:
-        fecha_str = ahora_peru().strftime("%d/%m/%Y")
-
+    try: fecha_str = datetime.strptime(fs,"%Y-%m-%d").strftime("%d/%m/%Y")
+    except: fecha_str = ahora_peru().strftime("%d/%m/%Y")
     with get_db() as db:
         rows = db.execute("SELECT hora,animal FROM resultados WHERE fecha=%s AND loteria=%s",(fecha_str, loteria)).fetchall()
-
     rd={r['hora']:{'animal':r['animal'],'nombre':ANIMALES.get(r['animal'],'?')} for r in rows}
     for h in horarios:
         if h not in rd: rd[h]=None
-
     return jsonify({'status':'ok','fecha_consulta':fecha_str,'resultados':rd})
 
 @app.route('/admin/lista-agencias')
@@ -1168,20 +1083,19 @@ def crear_agencia():
         p = request.form.get('password','').strip()
         n = request.form.get('nombre','').strip()
         nb = request.form.get('nombre_banco','').strip()
-        
-        if not u or not p or not n: 
+        if not u or not p or not n:
             return jsonify({'error':'Complete todos los campos'}),400
-        
         with get_db() as db:
             ex = db.execute("SELECT id FROM agencias WHERE usuario=%s",(u,)).fetchone()
-            if ex: 
+            if ex:
                 return jsonify({'error':'Usuario ya existe'}),400
+            # FIX 4c: guardar hash, no texto plano
+            ph = hash_password(p)
             db.execute("""
-                INSERT INTO agencias (usuario,password,nombre_agencia,nombre_banco,es_admin,comision,activa) 
+                INSERT INTO agencias (usuario,password,nombre_agencia,nombre_banco,es_admin,comision,activa)
                 VALUES (%s,%s,%s,%s,0,%s,1)
-            """,(u,p,n,nb,COMISION_AGENCIA))
+            """,(u,ph,n,nb,COMISION_AGENCIA))
             db.commit()
-        
         return jsonify({'status':'ok','mensaje':f'Agencia {n} creada'})
     except Exception as e:
         return jsonify({'error':str(e)}),500
@@ -1192,12 +1106,13 @@ def editar_agencia():
     try:
         data = request.get_json() or {}
         aid = data.get('id')
-        
         with get_db() as db:
             if 'nombre_banco' in data:
                 db.execute("UPDATE agencias SET nombre_banco=%s WHERE id=%s AND es_admin=0",(data['nombre_banco'],aid))
             if 'password' in data and data['password']:
-                db.execute("UPDATE agencias SET password=%s WHERE id=%s AND es_admin=0",(data['password'],aid))
+                # FIX 4e: guardar hash al cambiar contraseña
+                ph = hash_password(data['password'])
+                db.execute("UPDATE agencias SET password=%s WHERE id=%s AND es_admin=0",(ph,aid))
             if 'comision' in data:
                 db.execute("UPDATE agencias SET comision=%s WHERE id=%s AND es_admin=0",(float(data['comision'])/100,aid))
             if 'activa' in data:
@@ -1205,7 +1120,6 @@ def editar_agencia():
             if 'tope_taquilla' in data:
                 db.execute("UPDATE agencias SET tope_taquilla=%s WHERE id=%s AND es_admin=0",(float(data['tope_taquilla']),aid))
             db.commit()
-        
         log_audit('EDITAR_AGENCIA', f"Agencia id:{aid} modificada")
         return jsonify({'status':'ok'})
     except Exception as e:
@@ -1225,7 +1139,6 @@ def eliminar_agencia():
                 return jsonify({'error': 'Agencia no encontrada'}), 404
             if ag['es_admin']:
                 return jsonify({'error': 'No se puede eliminar al administrador'}), 403
-            # Verificar si tiene tickets activos (no anulados)
             tickets_activos = db.execute(
                 "SELECT COUNT(*) as cnt FROM tickets WHERE agencia_id=%s AND anulado=0", (aid,)
             ).fetchone()['cnt']
@@ -1239,7 +1152,6 @@ def eliminar_agencia():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ---- TOPES ----
 @app.route('/admin/topes', methods=['GET'])
 @admin_required
 def get_topes():
@@ -1325,7 +1237,6 @@ def limpiar_topes():
     except Exception as e:
         return jsonify({'error':str(e)}),500
 
-# ---- RIESGO MEJORADO ----
 @app.route('/admin/riesgo')
 @admin_required
 def riesgo():
@@ -1335,7 +1246,6 @@ def riesgo():
         horarios = HORARIOS_PLUS if loteria == 'plus' else HORARIOS_PERU
         now = ahora_venezuela() if loteria == 'plus' else ahora_peru()
         am  = now.hour*60+now.minute
-
         hora_param = request.args.get('hora', '').strip()
         if hora_param and hora_param in horarios:
             sorteo = hora_param
@@ -1351,7 +1261,6 @@ def riesgo():
                         sorteo = h; break
             if not sorteo:
                 sorteo = horarios[-1]
-
         with get_db() as db:
             agencias_hora = db.execute("""
                 SELECT DISTINCT ag.id, ag.nombre_agencia, ag.usuario
@@ -1361,7 +1270,6 @@ def riesgo():
                 WHERE jg.hora=%s AND jg.loteria=%s AND tk.anulado=0 AND tk.fecha LIKE %s
                 ORDER BY ag.nombre_agencia
             """, (sorteo, loteria, hoy+'%')).fetchall()
-
             jugadas_rows = db.execute("""
                 SELECT jg.seleccion, COALESCE(SUM(jg.monto),0) as apostado
                 FROM jugadas jg
@@ -1370,10 +1278,8 @@ def riesgo():
                 GROUP BY jg.seleccion
                 ORDER BY CAST(jg.seleccion AS INTEGER) ASC
             """, (sorteo, loteria, hoy+'%')).fetchall()
-
             topes_rows = db.execute("SELECT numero, monto_tope FROM topes WHERE hora=%s AND loteria=%s", (sorteo, loteria)).fetchall()
             topes_map = {r['numero']: r['monto_tope'] for r in topes_rows}
-
         total = sum(r['apostado'] for r in jugadas_rows)
         riesgo_d = {}
         for r in jugadas_rows:
@@ -1389,7 +1295,6 @@ def riesgo():
                 'tope': topes_map.get(sel, 0),
                 'libre': sel not in topes_map
             }
-
         return jsonify({
             'riesgo': riesgo_d,
             'sorteo_objetivo': sorteo,
@@ -1405,7 +1310,6 @@ def riesgo():
 @app.route('/admin/riesgo-agencia', methods=['POST'])
 @admin_required
 def riesgo_agencia():
-    """Detalle de jugadas de una agencia específica para una hora"""
     try:
         data = request.get_json() or {}
         agencia_id = data.get('agencia_id')
@@ -1439,11 +1343,9 @@ def riesgo_agencia():
     except Exception as e:
         return jsonify({'error':str(e)}),500
 
-# ---- REPORTE AGENCIA POR HORA ----
 @app.route('/admin/reporte-agencia-horas', methods=['POST'])
 @admin_required
 def reporte_agencia_horas():
-    """Ventas de una agencia desglosadas por hora de sorteo en un rango de fechas"""
     try:
         data = request.get_json() or {}
         agencia_id = data.get('agencia_id')
@@ -1456,14 +1358,12 @@ def reporte_agencia_horas():
         with get_db() as db:
             ag = db.execute("SELECT nombre_agencia, usuario FROM agencias WHERE id=%s", (agencia_id,)).fetchone()
             jugadas_rows = db.execute("""
-                SELECT jg.hora, jg.seleccion, jg.tipo, jg.monto,
-                       tk.fecha, tk.serial
+                SELECT jg.hora, jg.seleccion, jg.tipo, jg.monto, tk.fecha, tk.serial
                 FROM jugadas jg
                 JOIN tickets tk ON jg.ticket_id=tk.id
                 WHERE tk.agencia_id=%s AND tk.anulado=0
                 ORDER BY tk.fecha DESC
             """, (agencia_id,)).fetchall()
-        # Group by hour
         por_hora = {}
         for j in jugadas_rows:
             dt = parse_fecha(j['fecha'])
@@ -1474,14 +1374,12 @@ def reporte_agencia_horas():
             nombre = ANIMALES.get(j['seleccion'], j['seleccion']) if j['tipo']=='animal' else j['seleccion']
             por_hora[h]['total'] = round(por_hora[h]['total'] + j['monto'], 2)
             por_hora[h]['conteo'] += 1
-            # Group seleccion within hour
             found = next((x for x in por_hora[h]['jugadas'] if x['seleccion']==j['seleccion'] and x['tipo']==j['tipo']), None)
             if found:
                 found['apostado'] = round(found['apostado'] + j['monto'], 2)
                 found['cnt'] += 1
             else:
                 por_hora[h]['jugadas'].append({'seleccion':j['seleccion'],'nombre':nombre,'tipo':j['tipo'],'apostado':round(j['monto'],2),'cnt':1})
-        # Sort hours by schedule order
         resumen = []
         for h in HORARIOS_PERU:
             if h in por_hora:
@@ -1498,7 +1396,6 @@ def reporte_agencia_horas():
     except Exception as e:
         return jsonify({'error':str(e)}),500
 
-# ---- AUDIT LOGS ----
 @app.route('/admin/audit-logs', methods=['POST'])
 @admin_required
 def get_audit_logs():
@@ -1541,28 +1438,26 @@ def reporte_agencias():
         with get_db() as db:
             ags = db.execute("SELECT * FROM agencias WHERE es_admin=0").fetchall()
             tickets = db.execute("SELECT * FROM tickets WHERE anulado=0 AND fecha LIKE %s",(hoy+'%',)).fetchall()
-        
-        data=[]; tv=tp=tc=0
-        for ag in ags:
-            mts=[t for t in tickets if t['agencia_id']==ag['id']]
-            ventas=sum(t['total'] for t in mts); pp=0
-            for t in mts:
-                with get_db() as db2: 
-                    p=calcular_premio_ticket(t['id'],db2)
-                if t['pagado']: 
-                    pp+=p
-            com=ventas*ag['comision']
-            data.append({
-                'nombre':ag['nombre_agencia'],
-                'usuario':ag['usuario'],
-                'ventas':round(ventas,2),
-                'premios_pagados':round(pp,2),
-                'comision':round(com,2),
-                'balance':round(ventas-pp-com,2),
-                'tickets':len(mts)
-            })
-            tv+=ventas; tp+=pp; tc+=com
-        
+            # FIX 3: una sola conexión para todos los cálculos de premios
+            data=[]; tv=tp=tc=0
+            for ag in ags:
+                mts=[t for t in tickets if t['agencia_id']==ag['id']]
+                ventas=sum(t['total'] for t in mts); pp=0
+                for t in mts:
+                    p=calcular_premio_ticket(t['id'],db)
+                    if t['pagado']:
+                        pp+=p
+                com=ventas*ag['comision']
+                data.append({
+                    'nombre':ag['nombre_agencia'],
+                    'usuario':ag['usuario'],
+                    'ventas':round(ventas,2),
+                    'premios_pagados':round(pp,2),
+                    'comision':round(com,2),
+                    'balance':round(ventas-pp-com,2),
+                    'tickets':len(mts)
+                })
+                tv+=ventas; tp+=pp; tc+=com
         return jsonify({
             'agencias':data,
             'global':{
@@ -1583,8 +1478,8 @@ def tripletas_hoy():
         with get_db() as db:
             trips=db.execute("""
                 SELECT tr.*,tk.serial,tk.agencia_id,tk.fecha as fecha_ticket
-                FROM tripletas tr 
-                JOIN tickets tk ON tr.ticket_id=tk.id 
+                FROM tripletas tr
+                JOIN tickets tk ON tr.ticket_id=tk.id
                 WHERE tr.fecha=%s
             """,(hoy,)).fetchall()
             res_rows_peru=db.execute("SELECT hora,animal FROM resultados WHERE fecha=%s AND loteria='peru'",(hoy,)).fetchall()
@@ -1592,21 +1487,18 @@ def tripletas_hoy():
             res_dia_peru={r['hora']:r['animal'] for r in res_rows_peru}
             res_dia_plus={r['hora']:r['animal'] for r in res_rows_plus}
             ags={ag['id']:ag['nombre_agencia'] for ag in db.execute("SELECT id,nombre_agencia FROM agencias").fetchall()}
-        
         out=[]; ganadoras=0
         for tr in trips:
             lot_tr = tr['loteria'] if 'loteria' in tr.keys() else 'peru'
             res_dia = res_dia_plus if lot_tr == 'plus' else res_dia_peru
             nums={tr['animal1'],tr['animal2'],tr['animal3']}
             fecha_compra_dt = parse_fecha(tr['fecha_ticket'])
-            # Hora desde la que cuentan los sorteos para esta tripleta
             hora_compra_str = fecha_compra_dt.strftime("%I:%M %p").lstrip('0') if fecha_compra_dt else '?'
             res_validos = resultados_validos_para_tripleta(res_dia, fecha_compra_dt)
             salidos=list(dict.fromkeys([a for a in res_validos.values() if a in nums]))
-            # Todos los números que ya salieron en el día para esta lotería (para mostrar contexto)
             todos_salidos = list(dict.fromkeys(res_dia.values()))
             gano=len(salidos)==3
-            if gano: 
+            if gano:
                 ganadoras+=1
             out.append({
                 'id':tr['id'],
@@ -1625,7 +1517,6 @@ def tripletas_hoy():
                 'sorteos_validos': len(res_validos),
                 'sorteos_totales': len(res_dia)
             })
-        
         return jsonify({
             'tripletas':out,
             'total':len(out),
@@ -1639,62 +1530,51 @@ def tripletas_hoy():
 @admin_required
 def exportar_csv():
     try:
-        data=request.get_json(); 
-        fi=data.get('fecha_inicio'); 
+        data=request.get_json()
+        fi=data.get('fecha_inicio')
         ff=data.get('fecha_fin')
         dti=datetime.strptime(fi,"%Y-%m-%d")
         dtf=datetime.strptime(ff,"%Y-%m-%d").replace(hour=23,minute=59)
-        
         with get_db() as db:
             ags=db.execute("SELECT * FROM agencias WHERE es_admin=0").fetchall()
             all_t=db.execute("SELECT * FROM tickets WHERE anulado=0 ORDER BY id DESC LIMIT 50000").fetchall()
-        
-        stats={ag['id']:{
-            'nombre':ag['nombre_agencia'],
-            'usuario':ag['usuario'],
-            'tickets':0,
-            'ventas':0,
-            'premios':0,
-            'comision_pct':ag['comision']
-        } for ag in ags}
-        
-        for t in all_t:
-            dt=parse_fecha(t['fecha'])
-            if not dt or dt<dti or dt>dtf: continue
-            aid=t['agencia_id']
-            if aid not in stats: continue
-            stats[aid]['tickets']+=1
-            stats[aid]['ventas']+=t['total']
-            if t['pagado']:
-                with get_db() as db2: 
-                    stats[aid]['premios']+=calcular_premio_ticket(t['id'],db2)
-        
-        out=io.StringIO(); 
+            stats={ag['id']:{
+                'nombre':ag['nombre_agencia'],
+                'usuario':ag['usuario'],
+                'tickets':0,
+                'ventas':0,
+                'premios':0,
+                'comision_pct':ag['comision']
+            } for ag in ags}
+            # FIX 6: una sola conexión para el bucle
+            for t in all_t:
+                dt=parse_fecha(t['fecha'])
+                if not dt or dt<dti or dt>dtf: continue
+                aid=t['agencia_id']
+                if aid not in stats: continue
+                stats[aid]['tickets']+=1
+                stats[aid]['ventas']+=t['total']
+                if t['pagado']:
+                    stats[aid]['premios']+=calcular_premio_ticket(t['id'],db)
+        out=io.StringIO()
         w=csv.writer(out)
         w.writerow(['REPORTE ZOOLO CASINO'])
         w.writerow([f'Periodo: {fi} al {ff}'])
         w.writerow([])
         w.writerow(['Agencia','Usuario','Tickets','Ventas','Premios','Comision','Balance'])
-        
         tv=0
         for s in sorted(stats.values(),key=lambda x:x['ventas'],reverse=True):
             if s['tickets']==0: continue
             com=s['ventas']*s['comision_pct']
             w.writerow([
-                s['nombre'],
-                s['usuario'],
-                s['tickets'],
-                round(s['ventas'],2),
-                round(s['premios'],2),
-                round(com,2),
-                round(s['ventas']-s['premios']-com,2)
+                s['nombre'], s['usuario'], s['tickets'],
+                round(s['ventas'],2), round(s['premios'],2),
+                round(com,2), round(s['ventas']-s['premios']-com,2)
             ])
             tv+=s['ventas']
-        
         w.writerow([])
         w.writerow(['TOTAL','',sum(s['tickets'] for s in stats.values()),round(tv,2),'','',''])
         out.seek(0)
-        
         return Response(
             out.getvalue(),
             mimetype='text/csv',
@@ -1710,47 +1590,42 @@ def estadisticas_rango():
         data=request.get_json()
         fi=data.get('fecha_inicio')
         ff=data.get('fecha_fin')
-        if not fi or not ff: 
+        if not fi or not ff:
             return jsonify({'error':'Fechas requeridas'}),400
-        
         dti=datetime.strptime(fi,"%Y-%m-%d")
         dtf=datetime.strptime(ff,"%Y-%m-%d").replace(hour=23,minute=59)
-        
         with get_db() as db:
             all_t=db.execute("SELECT * FROM tickets WHERE anulado=0 ORDER BY id DESC LIMIT 10000").fetchall()
-        
-        dias={}; total_v=total_p=total_t=0
-        for t in all_t:
-            dt=parse_fecha(t['fecha'])
-            if not dt or dt<dti or dt>dtf: continue
-            dk=dt.strftime("%d/%m/%Y")
-            if dk not in dias: 
-                dias[dk]={'ventas':0,'tickets':0,'ids':[]}
-            dias[dk]['ventas']+=t['total']
-            dias[dk]['tickets']+=1
-            dias[dk]['ids'].append(t['id'])
-            total_v+=t['total']
-            total_t+=1
-        
-        resumen=[]
-        total_p=0
-        for dk in sorted(dias.keys()):
-            d=dias[dk]
-            prem=0
-            for tid in d['ids']:
-                with get_db() as db2: 
-                    prem+=calcular_premio_ticket(tid,db2)
-            total_p+=prem
-            cd=d['ventas']*COMISION_AGENCIA
-            resumen.append({
-                'fecha':dk,
-                'ventas':round(d['ventas'],2),
-                'premios':round(prem,2),
-                'comisiones':round(cd,2),
-                'balance':round(d['ventas']-prem-cd,2),
-                'tickets':d['tickets']
-            })
-        
+            dias={}; total_v=total_p=total_t=0
+            for t in all_t:
+                dt=parse_fecha(t['fecha'])
+                if not dt or dt<dti or dt>dtf: continue
+                dk=dt.strftime("%d/%m/%Y")
+                if dk not in dias:
+                    dias[dk]={'ventas':0,'tickets':0,'ids':[]}
+                dias[dk]['ventas']+=t['total']
+                dias[dk]['tickets']+=1
+                dias[dk]['ids'].append(t['id'])
+                total_v+=t['total']
+                total_t+=1
+            # FIX 4: una sola conexión para calcular premios
+            resumen=[]
+            total_p=0
+            for dk in sorted(dias.keys()):
+                d=dias[dk]
+                prem=0
+                for tid in d['ids']:
+                    prem+=calcular_premio_ticket(tid,db)
+                total_p+=prem
+                cd=d['ventas']*COMISION_AGENCIA
+                resumen.append({
+                    'fecha':dk,
+                    'ventas':round(d['ventas'],2),
+                    'premios':round(prem,2),
+                    'comisiones':round(cd,2),
+                    'balance':round(d['ventas']-prem-cd,2),
+                    'tickets':d['tickets']
+                })
         tc=total_v*COMISION_AGENCIA
         return jsonify({
             'resumen_por_dia':resumen,
@@ -1772,36 +1647,31 @@ def reporte_agencias_rango():
         data=request.get_json()
         fi=data.get('fecha_inicio')
         ff=data.get('fecha_fin')
-        if not fi or not ff: 
+        if not fi or not ff:
             return jsonify({'error':'Fechas requeridas'}),400
-        
         dti=datetime.strptime(fi,"%Y-%m-%d")
         dtf=datetime.strptime(ff,"%Y-%m-%d").replace(hour=23,minute=59)
-        
         with get_db() as db:
             ags=db.execute("SELECT * FROM agencias WHERE es_admin=0").fetchall()
             all_t=db.execute("SELECT * FROM tickets WHERE anulado=0 ORDER BY id DESC LIMIT 50000").fetchall()
-        
-        stats={ag['id']:{
-            'nombre':ag['nombre_agencia'],
-            'usuario':ag['usuario'],
-            'tickets':0,
-            'ventas':0,
-            'premios_teoricos':0,
-            'comision_pct':ag['comision']
-        } for ag in ags}
-        
-        for t in all_t:
-            dt=parse_fecha(t['fecha'])
-            if not dt or dt<dti or dt>dtf: continue
-            aid=t['agencia_id']
-            if aid not in stats: continue
-            stats[aid]['tickets']+=1
-            stats[aid]['ventas']+=t['total']
-            with get_db() as db2: 
-                p=calcular_premio_ticket(t['id'],db2)
-            stats[aid]['premios_teoricos']+=p
-        
+            stats={ag['id']:{
+                'nombre':ag['nombre_agencia'],
+                'usuario':ag['usuario'],
+                'tickets':0,
+                'ventas':0,
+                'premios_teoricos':0,
+                'comision_pct':ag['comision']
+            } for ag in ags}
+            # FIX 5: una sola conexión para el bucle
+            for t in all_t:
+                dt=parse_fecha(t['fecha'])
+                if not dt or dt<dti or dt>dtf: continue
+                aid=t['agencia_id']
+                if aid not in stats: continue
+                stats[aid]['tickets']+=1
+                stats[aid]['ventas']+=t['total']
+                p=calcular_premio_ticket(t['id'],db)
+                stats[aid]['premios_teoricos']+=p
         out=[]
         for s in stats.values():
             if s['tickets']==0: continue
@@ -1811,14 +1681,11 @@ def reporte_agencias_rango():
             s['ventas']=round(s['ventas'],2)
             s['premios_teoricos']=round(s['premios_teoricos'],2)
             out.append(s)
-        
         out.sort(key=lambda x:x['ventas'],reverse=True)
         tv=sum(x['ventas'] for x in out)
-        
         if tv>0:
-            for x in out: 
+            for x in out:
                 x['porcentaje_ventas']=round(x['ventas']/tv*100,1)
-        
         total={
             'tickets':sum(x['tickets'] for x in out),
             'ventas':round(tv,2),
@@ -1826,7 +1693,6 @@ def reporte_agencias_rango():
             'comision':round(sum(x['comision'] for x in out),2),
             'balance':round(sum(x['balance'] for x in out),2)
         }
-        
         return jsonify({
             'agencias':out,
             'total':total,
@@ -4289,17 +4155,18 @@ document.addEventListener('DOMContentLoaded',()=>{
 </script>
 </body></html>'''
 
+
 if __name__ == '__main__':
     init_db()
     print("=" * 60)
-    print("  ZOOLO CASINO v6.0 — DOS LOTERÍAS")
+    print("  ZOOLO CASINO v3.1 — CORRECCIONES APLICADAS")
+    print("=" * 60)
+    print("  [FIX 1] init_db() automático en before_request")
+    print("  [FIX 2] RETURNING id leído por nombre de columna")
+    print("  [FIX 3] Bucles de N conexiones → conexión única")
+    print("  [FIX 4] Contraseñas con SHA-256 + secret_key")
     print("=" * 60)
     db_status = 'OK' if DATABASE_URL else 'NO CONFIGURADA!'
     print(f"  DB: PostgreSQL (DATABASE_URL: {db_status})")
-    print(f"  ZOOLO CASINO PERU:  11 sorteos 8AM-6PM  (hora Lima)")
-    print(f"  ZOOLO CASINO PLUS:  12 sorteos 8AM-7PM  (hora Caracas)")
-    print(f"  Resultados: SOLO MANUAL — el admin carga cada resultado")
-    print(f"  Admin: cuborubi / 15821462")
-    print("=" * 60)
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
