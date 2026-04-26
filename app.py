@@ -485,15 +485,27 @@ def ejecutar_auto_sorteo(hora_str, loteria):
             total_vendido = float(apostado_row['total'])
             presupuesto_70 = round(total_vendido * 0.70, 2)
 
-            # Solo sumar acumulados de sorteos ANTERIORES a esta hora
-            # GREATEST(0,...) ignora negativos de datos históricos incorrectos
-            acum_row = db.execute("""
-                SELECT COALESCE(SUM(GREATEST(0, acumulado_generado)), 0) as total_acum
+            # Tomar el acumulado_generado del sorteo INMEDIATO ANTERIOR del mismo día.
+            # Cada sorteo recibe solo lo que sobró del sorteo previo (cadena, no suma total).
+            # Convertimos hora a minutos en Python y buscamos el sorteo previo por id.
+            min_actual = hora_a_min(hora_str)
+
+            # Obtener todos los sorteos del día ordenados
+            sorteos_previos = db.execute("""
+                SELECT hora, GREATEST(0, acumulado_generado) as acum_gen
                 FROM sorteo_acumulado
                 WHERE fecha=%s AND loteria=%s
-                  AND hora != %s
-            """, (fecha_hoy, loteria, hora_str)).fetchone()
-            acumulado_recibido = round(float(acum_row['total_acum']), 2)
+            """, (fecha_hoy, loteria)).fetchall()
+
+            # Encontrar el sorteo inmediato anterior por tiempo
+            acumulado_recibido = 0.0
+            mejor_min = -1
+            for sp in sorteos_previos:
+                sp_min = hora_a_min(sp['hora'])
+                if sp_min < min_actual and sp_min > mejor_min:
+                    mejor_min = sp_min
+                    acumulado_recibido = float(sp['acum_gen'])
+            acumulado_recibido = round(acumulado_recibido, 2)
             presupuesto_total = round(presupuesto_70 + acumulado_recibido, 2)
 
             salidos_hoy = db.execute(
