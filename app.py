@@ -1664,8 +1664,10 @@ def reporte_7030():
             total_premio_dia += premio
             total_casa_dia += para_casa
 
-        # Acumulado fin de jornada: suma de lo que sobró en cada sorteo (siempre >= 0)
-        total_acumulado_fin = round(sum(max(0, s['presupuesto_total'] - s['premio_pagado']) for s in sorteos if s['realizado']), 2)
+        # Acumulado fin de jornada = presupuesto 70% total - premios pagados total
+        # Positivo = hay fondo acumulado para próximos sorteos
+        # Negativo = se pagó más de lo presupuestado (déficit)
+        total_acumulado_fin = round(total_presupuesto_dia - total_premio_dia, 2)
 
         return jsonify({
             'status': 'ok',
@@ -3184,7 +3186,7 @@ function cargar7030(){
   <div class="sc"><h3>CASA 30% BRUTO</h3><p class="g">S/${t.para_casa_30.toFixed(2)}</p></div>
 </div>
 <div class="sgrid" style="grid-template-columns:repeat(3,1fr);margin-top:8px">
-  <div class="sc"><h3>ACUM. FIN JORNADA</h3><p style="color:#7c3aed">S/${Math.max(0, t.acumulado_fin_jornada).toFixed(2)}</p></div>
+  <div class="sc"><h3>ACUM. FIN JORNADA</h3><p style="color:${t.acumulado_fin_jornada>=0?'#7c3aed':'#dc2626'}">S/${t.acumulado_fin_jornada.toFixed(2)}</p></div>
   <div class="sc"><h3>% PAGADO</h3><p class="${t.pct_pagado>70?'r':'g'}">${t.pct_pagado}%</p></div>
   <div class="sc"><h3>% CASA</h3><p class="g">${t.pct_casa}%</p></div>
 </div>
@@ -3207,7 +3209,7 @@ function cargar7030(){
         <td style="color:#7c3aed">S/${s.acum_recibido.toFixed(2)}</td>
         <td style="color:var(--gold)" ${presCol}>S/${s.presupuesto_total.toFixed(2)}</td>
         <td style="color:var(--red)">S/${s.premio_pagado.toFixed(2)}</td>
-        <td style="color:var(--green)">S/${Math.max(0, s.saldo_acumulado !== undefined ? s.saldo_acumulado : s.presupuesto_total - s.premio_pagado).toFixed(2)}</td>
+        <td style="color:${(s.saldo_acumulado !== undefined ? s.saldo_acumulado : s.presupuesto_total - s.premio_pagado) >= 0 ? 'var(--green)' : 'var(--red)'}">S/${(s.saldo_acumulado !== undefined ? s.saldo_acumulado : s.presupuesto_total - s.premio_pagado).toFixed(2)}</td>
         <td style="color:#22c55e">S/${s.para_casa_30.toFixed(2)}</td>
         <td>${modoBadge}</td>
       </tr>`;
