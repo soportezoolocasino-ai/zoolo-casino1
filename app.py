@@ -1679,7 +1679,7 @@ def reporte_7030():
                 'para_casa_30': round(total_casa_dia, 2),
                 'acumulado_fin_jornada': total_acumulado_fin,
                 'pct_pagado': round(total_premio_dia / total_vendido_dia * 100, 1) if total_vendido_dia > 0 else 0,
-                'pct_casa': round((total_vendido_dia - total_premio_dia) / total_vendido_dia * 100, 1) if total_vendido_dia > 0 else 0,
+                'pct_casa': round(max(0, total_vendido_dia - total_premio_dia) / total_vendido_dia * 100, 1) if total_vendido_dia > 0 else 0,
             }
         })
     except Exception as e:
@@ -3184,7 +3184,7 @@ function cargar7030(){
   <div class="sc"><h3>CASA 30% BRUTO</h3><p class="g">S/${t.para_casa_30.toFixed(2)}</p></div>
 </div>
 <div class="sgrid" style="grid-template-columns:repeat(3,1fr);margin-top:8px">
-  <div class="sc"><h3>ACUM. FIN JORNADA</h3><p style="color:#7c3aed">S/${t.acumulado_fin_jornada.toFixed(2)}</p></div>
+  <div class="sc"><h3>ACUM. FIN JORNADA</h3><p style="color:#7c3aed">S/${Math.max(0, t.acumulado_fin_jornada).toFixed(2)}</p></div>
   <div class="sc"><h3>% PAGADO</h3><p class="${t.pct_pagado>70?'r':'g'}">${t.pct_pagado}%</p></div>
   <div class="sc"><h3>% CASA</h3><p class="g">${t.pct_casa}%</p></div>
 </div>
@@ -3207,7 +3207,7 @@ function cargar7030(){
         <td style="color:#7c3aed">S/${s.acum_recibido.toFixed(2)}</td>
         <td style="color:var(--gold)" ${presCol}>S/${s.presupuesto_total.toFixed(2)}</td>
         <td style="color:var(--red)">S/${s.premio_pagado.toFixed(2)}</td>
-        <td style="color:var(--green)">S/${s.acum_generado.toFixed(2)}</td>
+        <td style="color:var(--green)">S/${Math.max(0, s.saldo_acumulado !== undefined ? s.saldo_acumulado : s.presupuesto_total - s.premio_pagado).toFixed(2)}</td>
         <td style="color:#22c55e">S/${s.para_casa_30.toFixed(2)}</td>
         <td>${modoBadge}</td>
       </tr>`;
