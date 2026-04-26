@@ -485,11 +485,14 @@ def ejecutar_auto_sorteo(hora_str, loteria):
             total_vendido = float(apostado_row['total'])
             presupuesto_70 = round(total_vendido * 0.70, 2)
 
+            # Solo sumar acumulados de sorteos ANTERIORES a esta hora
+            # GREATEST(0,...) ignora negativos de datos históricos incorrectos
             acum_row = db.execute("""
-                SELECT COALESCE(SUM(acumulado_generado), 0) as total_acum
+                SELECT COALESCE(SUM(GREATEST(0, acumulado_generado)), 0) as total_acum
                 FROM sorteo_acumulado
                 WHERE fecha=%s AND loteria=%s
-            """, (fecha_hoy, loteria)).fetchone()
+                  AND hora != %s
+            """, (fecha_hoy, loteria, hora_str)).fetchone()
             acumulado_recibido = round(float(acum_row['total_acum']), 2)
             presupuesto_total = round(presupuesto_70 + acumulado_recibido, 2)
 
