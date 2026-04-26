@@ -538,38 +538,61 @@ def ejecutar_auto_sorteo(hora_str, loteria):
                 mult = PAGO_LECHUZA if num_str == "40" else PAGO_ANIMAL_NORMAL
                 return round(ap * mult + pago_especial_para(num_str), 2)
 
-            candidatos_jugados = []
-            for num in ANIMALES_AUTO:
-                if num in animales_ya_salidos: continue
-                pago = pago_total_si_sale(num)
-                if pago <= presupuesto_total:
-                    candidatos_jugados.append((num, pago))
+            # ── SELECCIÓN DE ANIMAL — REGLA DE ORO ──────────────────────────────
+            # El acumulado NUNCA puede quedar negativo.
+            # Solo se paga premio si el pago cabe dentro del presupuesto_total.
+            # Si ningún animal jugado cabe → elegir un animal NO jugado (premio=0).
+            # Solo si todos los animales disponibles fueron jugados y ninguno cabe
+            # → elegir el de menor pago (caso extremo, rarísimo en práctica).
 
             animal_elegido = None
             premio_a_pagar = 0
 
-            if candidatos_jugados:
-                con_apuestas = [(n, p) for n, p in candidatos_jugados if n in apostado_map and apostado_map[n] > 0]
-                sin_apuestas = [(n, p) for n, p in candidatos_jugados if n not in apostado_map or apostado_map[n] == 0]
+            # Candidatos que caben: pago <= presupuesto_total (acumulado no queda negativo)
+            candidatos_caben = []
+            for num in ANIMALES_AUTO:
+                if num in animales_ya_salidos: continue
+                pago = pago_total_si_sale(num)
+                if pago <= presupuesto_total:
+                    candidatos_caben.append((num, pago))
+
+            if candidatos_caben:
+                # Preferir animales CON apuestas (más interesante para jugadores)
+                con_apuestas = [(n, p) for n, p in candidatos_caben
+                                if n in apostado_map and apostado_map[n] > 0]
+                sin_apuestas = [(n, p) for n, p in candidatos_caben
+                                if n not in apostado_map or apostado_map[n] == 0]
                 if con_apuestas:
                     elegido = random.choice(con_apuestas)
                     animal_elegido = elegido[0]
                     premio_a_pagar = elegido[1]
                 else:
+                    # Solo hay animales sin apuestas que caben → premio=0
                     elegido = random.choice(sin_apuestas)
                     animal_elegido = elegido[0]
                     premio_a_pagar = 0
             else:
-                no_jugados = [n for n in ANIMALES_AUTO if n not in apostado_map and n not in animales_ya_salidos]
+                # Ningún animal cabe en el presupuesto_total.
+                # Elegir animal NO jugado (premio garantizado = 0, acumulado crece).
+                no_jugados = [n for n in ANIMALES_AUTO
+                              if n not in apostado_map and n not in animales_ya_salidos]
                 if no_jugados:
                     animal_elegido = random.choice(no_jugados)
                     premio_a_pagar = 0
+                    logger.info(f"[AUTO-SORTEO] Presupuesto insuficiente para {hora_str} {loteria} "
+                                f"(pres={presupuesto_total:.2f}) — eligiendo no-jugado, acumulando.")
                 else:
-                    disponibles = [(n, pago_total_si_sale(n)) for n in ANIMALES_AUTO if n not in animales_ya_salidos]
+                    # Caso extremo: todos los animales fueron jugados y ninguno cabe.
+                    # Elegir el de MENOR pago para minimizar el déficit.
+                    # Esto no debería ocurrir en operación normal.
+                    disponibles = [(n, pago_total_si_sale(n)) for n in ANIMALES_AUTO
+                                   if n not in animales_ya_salidos]
                     if disponibles:
                         disponibles.sort(key=lambda x: x[1])
                         animal_elegido = disponibles[0][0]
                         premio_a_pagar = disponibles[0][1]
+                        logger.warning(f"[AUTO-SORTEO] CASO EXTREMO {hora_str} {loteria}: "
+                                       f"todos jugados y ninguno cabe. Menor pago: S/{premio_a_pagar:.2f}")
 
             if not animal_elegido:
                 logger.error(f"[AUTO-SORTEO] No se pudo elegir animal para {hora_str} {loteria}")
@@ -581,7 +604,10 @@ def ejecutar_auto_sorteo(hora_str, loteria):
                 ON CONFLICT(fecha, hora, loteria) DO UPDATE SET animal=EXCLUDED.animal
             """, (fecha_hoy, hora_str, animal_elegido, loteria))
 
-            acumulado_generado = round(max(0, presupuesto_70 - premio_a_pagar), 2)
+            # Acumulado generado = lo que sobra del presupuesto total tras pagar el premio.
+            # = presupuesto_70 + acumulado_recibido - premio_a_pagar
+            # La selección de animal garantiza que este valor >= 0.
+            acumulado_generado = round(max(0, presupuesto_total - premio_a_pagar), 2)
 
             db.execute("""
                 INSERT INTO sorteo_acumulado
@@ -1609,12 +1635,13 @@ def reporte_7030():
             else:
                 premio = 0
                 acum_recibido = 0
-                acum_generado = presupuesto_70  # si no hay registro, todo va al acumulado
+                acum_generado = presupuesto_70  # sin datos aún, todo al acumulado
                 modo = 'manual' if animal else 'pendiente'
 
             presupuesto_total = round(presupuesto_70 + acum_recibido, 2)
             para_casa = round(vendido * 0.30, 2)
-            saldo_casa = round(presupuesto_total - premio, 2)
+            # saldo_acumulado: lo que sobra del presupuesto total tras el premio (>= 0 siempre)
+            saldo_acumulado_sorteo = round(max(0, presupuesto_total - premio), 2)
 
             sorteos.append({
                 'hora': hora,
@@ -1627,7 +1654,7 @@ def reporte_7030():
                 'premio_pagado': premio,
                 'acum_generado': acum_generado,
                 'para_casa_30': para_casa,
-                'saldo_casa': saldo_casa,
+                'saldo_acumulado': saldo_acumulado_sorteo,
                 'modo': modo,
                 'realizado': animal is not None
             })
@@ -1637,7 +1664,8 @@ def reporte_7030():
             total_premio_dia += premio
             total_casa_dia += para_casa
 
-        total_acumulado_fin = round(total_presupuesto_dia - total_premio_dia, 2)
+        # Acumulado fin de jornada: suma de lo que sobró en cada sorteo (siempre >= 0)
+        total_acumulado_fin = round(sum(max(0, s['presupuesto_total'] - s['premio_pagado']) for s in sorteos if s['realizado']), 2)
 
         return jsonify({
             'status': 'ok',
