@@ -3133,6 +3133,11 @@ function guardarResultado(){let hora=document.getElementById('res-hora').value,f
 function forzarAutoSorteo(){let hora=document.getElementById('res-hora').value,loteria=lotRes;if(!hora){showMsg('msg-res','Selecciona la hora','err');return;}if(!confirm(`¿Ejecutar auto-sorteo para ${hora} (${loteria.toUpperCase()})? Esto elegirá el animal automáticamente con lógica 70/30.`))return;fetch('/admin/forzar-autosorteo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hora:hora,loteria:loteria})}).then(r=>r.json()).then(d=>{if(d.status==='ok'){showMsg('msg-res',`✅ Auto-sorteo: ${d.mensaje}`,'ok');cargarResultadosAdmin();}else showMsg('msg-res',d.error||'Error','err');}).catch(()=>showMsg('msg-res','Error de conexión','err'));}
 
 // ── RIESGO ────────────────────────────────────────────────────────────────────
+// ── Selector horario resultados ───────────────────────────────────────────────
+function fillHorasRes(){let h=document.getElementById('res-hora');if(!h)return;let lista=lotRes==='plus'?HPLUS:HPERU;h.innerHTML=lista.map(x=>'<option value="'+x+'">'+x+'</option>').join('');if(!h.value&&lista.length)h.value=lista[0];}
+
+function selLotRes(l){lotRes=l;document.getElementById('lot-res-peru').classList.toggle('active',l==='peru');document.getElementById('lot-res-plus').classList.toggle('active',l==='plus');fillHorasRes();cargarSecuencia();}
+
 function selLotRiesgo(l){lotRiesgo=l;document.getElementById('lot-riesgo-peru').classList.toggle('active',l==='peru');document.getElementById('lot-riesgo-plus').classList.toggle('active',l==='plus');fillHorasRiesgo();cargarRiesgo();}
 
 function fillHorasRiesgo(){let s=document.getElementById('risk-hora');if(!s)return;let lista=lotRiesgo==='plus'?HPLUS:HPERU;s.innerHTML=lista.map(x=>'<option value="'+x+'">'+ x+'</option>').join('');if(!s.value&&lista.length)s.value=lista[0];}
