@@ -621,12 +621,11 @@ def ejecutar_auto_sorteo(hora_str, loteria):
             # 6. Obtener último animal que salió hoy para aplicar secuencia
             ultimo_animal = None
             if animales_ya_salidos:
-                # Buscar el resultado más reciente del día
-                ultimos = db.execute("""
-                    SELECT animal FROM resultados
-                    WHERE fecha=%s AND loteria=%s
-                    ORDER BY hora DESC
-                """, (fecha_hoy, loteria)).fetchall()
+                todos_hoy = db.execute(
+                    "SELECT animal, hora FROM resultados WHERE fecha=%s AND loteria=%s",
+                    (fecha_hoy, loteria)
+                ).fetchall()
+                ultimos = sorted(todos_hoy, key=lambda r: hora_a_min(r['hora']), reverse=True)
                 if ultimos:
                     ultimo_animal = ultimos[0]['animal']
 
@@ -1584,13 +1583,14 @@ def secuencia_sugerida():
         # Usar hora correcta según lotería
         fecha = ahora_venezuela().strftime("%d/%m/%Y") if loteria == 'plus' else ahora_peru().strftime("%d/%m/%Y")
         with get_db() as db:
-            ultimo = db.execute("""
+            todos = db.execute("""
                 SELECT animal, hora FROM resultados
                 WHERE fecha=%s AND loteria=%s
-                ORDER BY hora DESC LIMIT 1
-            """, (fecha, loteria)).fetchone()
-        if not ultimo:
+            """, (fecha, loteria)).fetchall()
+        if not todos:
             return jsonify({'status': 'ok', 'ultimo': None, 'sugeridos': [], 'mensaje': 'Sin resultados hoy'})
+        # Ordenar por hora real (no string sort) para obtener el último
+        ultimo = max(todos, key=lambda r: hora_a_min(r['hora']))
         ultimo_animal = ultimo['animal']
         ultima_hora = ultimo['hora']
         sugeridos = get_secuencia(ultimo_animal)
@@ -3129,9 +3129,9 @@ fetch('/api/resultados-fecha-admin',{method:'POST',headers:{'Content-Type':'appl
   renderLista(dpl.resultados,document.getElementById('res-lista-plus'),HPLUS);
   }).catch(()=>{});}
 
-function guardarResultado(){let hora=document.getElementById('res-hora').value,fecha=document.getElementById('res-fecha').value,animal=animalSel,loteria=lotRes;if(!animal){showMsg('msg-res','Selecciona un animal','err');return;}if(!hora){showMsg('msg-res','Selecciona la hora','err');return;}let fd=new FormData();fd.append('hora',hora);fd.append('animal',animal);fd.append('loteria',loteria);if(fecha)fd.append('fecha',fecha);fetch('/admin/guardar-resultado',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{if(d.status==='ok'){showMsg('msg-res',`✅ ${d.mensaje} [${d.fecha}]`,'ok');animalSel=null;renderAMG();document.getElementById('animal-sel-preview').textContent='';cargarResultadosAdmin();}else showMsg('msg-res',d.error,'err');}).catch(()=>showMsg('msg-res','Error','err'));}
+function guardarResultado(){let hora=document.getElementById('res-hora').value,fecha=document.getElementById('res-fecha').value,animal=animalSel,loteria=lotRes;if(!animal){showMsg('msg-res','Selecciona un animal','err');return;}if(!hora){showMsg('msg-res','Selecciona la hora','err');return;}let fd=new FormData();fd.append('hora',hora);fd.append('animal',animal);fd.append('loteria',loteria);if(fecha)fd.append('fecha',fecha);fetch('/admin/guardar-resultado',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{if(d.status==='ok'){showMsg('msg-res',`✅ ${d.mensaje} [${d.fecha}]`,'ok');animalSel=null;renderAMG();document.getElementById('animal-sel-preview').textContent='';cargarResultadosAdmin();cargarSecuencia();}else showMsg('msg-res',d.error,'err');}).catch(()=>showMsg('msg-res','Error','err'));}
 
-function forzarAutoSorteo(){let hora=document.getElementById('res-hora').value,loteria=lotRes;if(!hora){showMsg('msg-res','Selecciona la hora','err');return;}if(!confirm(`¿Ejecutar auto-sorteo para ${hora} (${loteria.toUpperCase()})? Esto elegirá el animal automáticamente con lógica 70/30.`))return;fetch('/admin/forzar-autosorteo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hora:hora,loteria:loteria})}).then(r=>r.json()).then(d=>{if(d.status==='ok'){showMsg('msg-res',`✅ Auto-sorteo: ${d.mensaje}`,'ok');cargarResultadosAdmin();}else showMsg('msg-res',d.error||'Error','err');}).catch(()=>showMsg('msg-res','Error de conexión','err'));}
+function forzarAutoSorteo(){let hora=document.getElementById('res-hora').value,loteria=lotRes;if(!hora){showMsg('msg-res','Selecciona la hora','err');return;}if(!confirm(`¿Ejecutar auto-sorteo para ${hora} (${loteria.toUpperCase()})? Esto elegirá el animal automáticamente con lógica 70/30.`))return;fetch('/admin/forzar-autosorteo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hora:hora,loteria:loteria})}).then(r=>r.json()).then(d=>{if(d.status==='ok'){showMsg('msg-res',`✅ Auto-sorteo: ${d.mensaje}`,'ok');cargarResultadosAdmin();cargarSecuencia();}else showMsg('msg-res',d.error||'Error','err');}).catch(()=>showMsg('msg-res','Error de conexión','err'));}
 
 // ── RIESGO ────────────────────────────────────────────────────────────────────
 // ── Selector horario resultados ───────────────────────────────────────────────
@@ -3238,7 +3238,7 @@ function init(){
     else{_secuencias['plus']=[];}
     lotRes=_tmpLot;
   }).catch(()=>{lotRes=_tmpLot;});
-  setInterval(function(){cargarSecuencia();let _l=lotRes;lotRes=lotRes==='peru'?'plus':'peru';cargarSecuencia();lotRes=_l;},120000);
+  setInterval(function(){let _l=lotRes;lotRes='peru';cargarSecuencia();setTimeout(function(){lotRes='plus';cargarSecuencia();setTimeout(function(){lotRes=_l;renderAMG();},500);},500);},30000);
   setInterval(cargarEstadoAutoSorteo,30000);
 }
 
