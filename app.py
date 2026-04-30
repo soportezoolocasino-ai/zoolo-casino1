@@ -3101,7 +3101,7 @@ function showTab(id){
   let tabs=document.querySelectorAll('.tab');
   let tabMap={resultados:0,riesgo:1,setentaytreinta:2,agencias:3,topes:4,reportes:5,tripletas:6,auditoria:7};
   if(tabMap[id]!==undefined)tabs[tabMap[id]].classList.add('active');
-  if(id==='riesgo')cargarRiesgo();
+  if(id==='riesgo'){fillHorasRiesgo();cargarRiesgo();}
   if(id==='tripletas')cargarTripletas();
   if(id==='agencias')listarAgencias();
 }
@@ -3135,7 +3135,7 @@ function forzarAutoSorteo(){let hora=document.getElementById('res-hora').value,l
 // ── RIESGO ────────────────────────────────────────────────────────────────────
 function selLotRiesgo(l){lotRiesgo=l;document.getElementById('lot-riesgo-peru').classList.toggle('active',l==='peru');document.getElementById('lot-riesgo-plus').classList.toggle('active',l==='plus');fillHorasRiesgo();cargarRiesgo();}
 
-function fillHorasRiesgo(){let s=document.getElementById('risk-hora'),lista=lotRiesgo==='plus'?HPLUS:HPERU;s.innerHTML=lista.map(x=>`<option>${x}</option>`).join('');}
+function fillHorasRiesgo(){let s=document.getElementById('risk-hora');if(!s)return;let lista=lotRiesgo==='plus'?HPLUS:HPERU;s.innerHTML=lista.map(x=>'<option value="'+x+'">'+ x+'</option>').join('');if(!s.value&&lista.length)s.value=lista[0];}
 
 function cargarRiesgo(){let hora=document.getElementById('risk-hora').value,lot=lotRiesgo;if(!hora)return;fetch(`/admin/riesgo?hora=${encodeURIComponent(hora)}&loteria=${lot}`).then(r=>r.json()).then(d=>{
   let sm=document.getElementById('riesgo-summary');
