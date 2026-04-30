@@ -2943,7 +2943,7 @@ input:focus,select:focus{outline:none;border-color:var(--blue)}
         <div class="animals-mini-grid" id="amg"></div>
       </div>
     </div>
-    <div id="seq-info" style="margin-bottom:6px;min-height:16px;padding:4px 6px;background:rgba(34,197,94,.05);border-radius:3px;border:1px solid rgba(34,197,94,.1)"></div>
+    <div id="seq-info" style="display:none"></div>
     <div id="animal-sel-preview" style="margin-bottom:10px;color:var(--gold);font-family:'Oswald',sans-serif;font-size:.85rem;min-height:20px;text-align:center"></div>
     <div id="msg-res" class="msg"></div>
     <div style="display:flex;gap:8px">
@@ -3113,9 +3113,9 @@ setInterval(actualizarClockAdmin,1000);actualizarClockAdmin();
 
 // ── ANIMALES mini-grid ────────────────────────────────────────────────────────
 let _secuenciaSugerida=[];let _secuencias={'peru':[],'plus':[]};
-function renderAMG(){let g=document.getElementById('amg');g.innerHTML='';ORDEN.forEach(k=>{if(!ANIMALES[k])return;let esSug=_secuenciaSugerida.indexOf(k)>=0;let d=document.createElement('div');d.className='amg-card'+(k===animalSel?' sel':'')+(esSug?' sug':'');if(esSug)d.style.cssText='background:#0a2a18;border-color:#22c55e;box-shadow:0 0 8px rgba(34,197,94,.4)';d.innerHTML='<div class="anum">'+k+'</div><div class="anom">'+ANIMALES[k].substring(0,5)+(esSug?'<span style="color:#22c55e;font-size:.5rem;display:block">★SEQ</span>':'')+'</div>';d.onclick=()=>{animalSel=k;renderAMG();document.getElementById('animal-sel-preview').textContent='✅ '+k+' — '+ANIMALES[k];};g.appendChild(d);});}
+function renderAMG(){let g=document.getElementById('amg');g.innerHTML='';ORDEN.forEach(k=>{if(!ANIMALES[k])return;let d=document.createElement('div');d.className='amg-card'+(k===animalSel?' sel':'');d.innerHTML='<div class="anum">'+k+'</div><div class="anom">'+ANIMALES[k].substring(0,5)+'</div>';d.onclick=()=>{animalSel=k;renderAMG();document.getElementById('animal-sel-preview').textContent='✅ '+k+' — '+ANIMALES[k];};g.appendChild(d);});}
 
-function cargarSecuencia(){let lot=lotRes;fetch('/admin/secuencia-sugerida?loteria='+lot).then(r=>r.json()).then(d=>{if(d.status==='ok'&&d.sugeridos.length){_secuencias[lot]=d.sugeridos.map(x=>x.num);_secuenciaSugerida=_secuencias[lotRes];let div=document.getElementById('seq-info');if(div){let txt=d.sugeridos.map(x=>x.num+'-'+x.nombre).join(', ');div.innerHTML='<span style="color:#22c55e;font-size:.7rem;font-weight:700">⭐ SEQ '+lot.toUpperCase()+' de '+d.ultimo+'-'+d.ultimo_nombre+': '+txt+'</span>';}}else{_secuencias[lot]=[];_secuenciaSugerida=[];}renderAMG();}).catch(()=>{});}
+function cargarSecuencia(){let lot=lotRes;fetch('/admin/secuencia-sugerida?loteria='+lot).then(r=>r.json()).then(d=>{if(d.status==='ok'&&d.sugeridos.length){_secuencias[lot]=d.sugeridos.map(x=>x.num);}else{_secuencias[lot]=[];}}).catch(()=>{});}
 function cargarResultadosAdmin(){let f=document.getElementById('res-fecha').value;if(!f)return;Promise.all([
 fetch('/api/resultados-fecha-admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:f,loteria:'peru'})}).then(r=>r.json()),
 fetch('/api/resultados-fecha-admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:f,loteria:'plus'})}).then(r=>r.json())
