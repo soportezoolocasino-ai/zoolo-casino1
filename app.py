@@ -1581,7 +1581,8 @@ def secuencia_sugerida():
     """Retorna los 7 animales sugeridos por la secuencia basándose en el último resultado."""
     try:
         loteria = request.args.get('loteria', 'peru')
-        fecha = ahora_peru().strftime("%d/%m/%Y")
+        # Usar hora correcta según lotería
+        fecha = ahora_venezuela().strftime("%d/%m/%Y") if loteria == 'plus' else ahora_peru().strftime("%d/%m/%Y")
         with get_db() as db:
             ultimo = db.execute("""
                 SELECT animal, hora FROM resultados
@@ -3111,10 +3112,10 @@ function actualizarClockAdmin(){let now=new Date(),utcMs=now.getTime()+now.getTi
 setInterval(actualizarClockAdmin,1000);actualizarClockAdmin();
 
 // ── ANIMALES mini-grid ────────────────────────────────────────────────────────
-let _secuenciaSugerida=[];
+let _secuenciaSugerida=[];let _secuencias={'peru':[],'plus':[]};
 function renderAMG(){let g=document.getElementById('amg');g.innerHTML='';ORDEN.forEach(k=>{if(!ANIMALES[k])return;let esSug=_secuenciaSugerida.indexOf(k)>=0;let d=document.createElement('div');d.className='amg-card'+(k===animalSel?' sel':'')+(esSug?' sug':'');if(esSug)d.style.cssText='background:#0a2a18;border-color:#22c55e;box-shadow:0 0 8px rgba(34,197,94,.4)';d.innerHTML='<div class="anum">'+k+'</div><div class="anom">'+ANIMALES[k].substring(0,5)+(esSug?'<span style="color:#22c55e;font-size:.5rem;display:block">★SEQ</span>':'')+'</div>';d.onclick=()=>{animalSel=k;renderAMG();document.getElementById('animal-sel-preview').textContent='✅ '+k+' — '+ANIMALES[k];};g.appendChild(d);});}
 
-function cargarSecuencia(){let lot=lotRes;fetch('/admin/secuencia-sugerida?loteria='+lot).then(r=>r.json()).then(d=>{if(d.status==='ok'&&d.sugeridos.length){_secuenciaSugerida=d.sugeridos.map(x=>x.num);let div=document.getElementById('seq-info');if(div){let txt=d.sugeridos.map(x=>x.num+'-'+x.nombre).join(', ');div.innerHTML='<span style="color:#22c55e;font-size:.7rem;font-weight:700">⭐ SEQ de '+d.ultimo+'-'+d.ultimo_nombre+': '+txt+'</span>';}}else{_secuenciaSugerida=[];}renderAMG();}).catch(()=>{});}
+function cargarSecuencia(){let lot=lotRes;fetch('/admin/secuencia-sugerida?loteria='+lot).then(r=>r.json()).then(d=>{if(d.status==='ok'&&d.sugeridos.length){_secuencias[lot]=d.sugeridos.map(x=>x.num);_secuenciaSugerida=_secuencias[lotRes];let div=document.getElementById('seq-info');if(div){let txt=d.sugeridos.map(x=>x.num+'-'+x.nombre).join(', ');div.innerHTML='<span style="color:#22c55e;font-size:.7rem;font-weight:700">⭐ SEQ '+lot.toUpperCase()+' de '+d.ultimo+'-'+d.ultimo_nombre+': '+txt+'</span>';}}else{_secuencias[lot]=[];_secuenciaSugerida=[];}renderAMG();}).catch(()=>{});}
 function cargarResultadosAdmin(){let f=document.getElementById('res-fecha').value;if(!f)return;Promise.all([
 fetch('/api/resultados-fecha-admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:f,loteria:'peru'})}).then(r=>r.json()),
 fetch('/api/resultados-fecha-admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:f,loteria:'plus'})}).then(r=>r.json())
@@ -3136,7 +3137,7 @@ function forzarAutoSorteo(){let hora=document.getElementById('res-hora').value,l
 // ── Selector horario resultados ───────────────────────────────────────────────
 function fillHorasRes(){let h=document.getElementById('res-hora');if(!h)return;let lista=lotRes==='plus'?HPLUS:HPERU;h.innerHTML=lista.map(x=>'<option value="'+x+'">'+x+'</option>').join('');if(!h.value&&lista.length)h.value=lista[0];}
 
-function selLotRes(l){lotRes=l;document.getElementById('lot-res-peru').classList.toggle('active',l==='peru');document.getElementById('lot-res-plus').classList.toggle('active',l==='plus');fillHorasRes();cargarSecuencia();}
+function selLotRes(l){lotRes=l;document.getElementById('lot-res-peru').classList.toggle('active',l==='peru');document.getElementById('lot-res-plus').classList.toggle('active',l==='plus');fillHorasRes();_secuenciaSugerida=_secuencias[l]||[];renderAMG();cargarSecuencia();}
 
 function selLotRiesgo(l){lotRiesgo=l;document.getElementById('lot-riesgo-peru').classList.toggle('active',l==='peru');document.getElementById('lot-riesgo-plus').classList.toggle('active',l==='plus');fillHorasRiesgo();cargarRiesgo();}
 
@@ -3227,9 +3228,18 @@ function init(){
   renderAMG();
   cargarResultadosAdmin();
   cargarEstadoAutoSorteo();
+  // Cargar secuencia para ambas loterías al iniciar
   cargarSecuencia();
+  // También cargar PLUS en segundo plano
+  let _tmpLot=lotRes;
+  lotRes='plus';
+  fetch('/admin/secuencia-sugerida?loteria=plus').then(r=>r.json()).then(d=>{
+    if(d.status==='ok'&&d.sugeridos.length){_secuencias['plus']=d.sugeridos.map(x=>x.num);}
+    else{_secuencias['plus']=[];}
+    lotRes=_tmpLot;
+  }).catch(()=>{lotRes=_tmpLot;});
+  setInterval(function(){cargarSecuencia();let _l=lotRes;lotRes=lotRes==='peru'?'plus':'peru';cargarSecuencia();lotRes=_l;},120000);
   setInterval(cargarEstadoAutoSorteo,30000);
-  setInterval(cargarSecuencia,120000);
 }
 
 // ── Auto-sorteo toggle ────────────────────────────────────────────────────────
