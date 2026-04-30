@@ -3231,6 +3231,27 @@ function init(){
   setInterval(cargarEstadoAutoSorteo,30000);
   setInterval(cargarSecuencia,120000);
 }
+
+// ── Auto-sorteo toggle ────────────────────────────────────────────────────────
+function actualizarEstadoToggle(estado){
+  var btn=document.getElementById('toggle-auto-btn');
+  if(!btn)return;
+  if(estado==='on'){btn.className='toggle-btn on';btn.textContent='▶ ACTIVADO';}
+  else{btn.className='toggle-btn off';btn.textContent='⏸ DESACTIVADO';}
+}
+function cargarEstadoAutoSorteo(){
+  fetch('/admin/estado-autosorteo').then(function(r){return r.json();}).then(function(d){actualizarEstadoToggle(d.estado);}).catch(function(){});
+}
+function toggleAutoSorteo(){
+  var btn=document.getElementById('toggle-auto-btn');
+  var nuevoEstado=btn.classList.contains('on')?'off':'on';
+  fetch('/admin/toggle-autosorteo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({estado:nuevoEstado})})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.status==='ok'){actualizarEstadoToggle(d.estado);showMsg('msg-res',d.mensaje,'ok');}
+      else showMsg('msg-res',d.error||'Error','err');
+    }).catch(function(){showMsg('msg-res','Error de conexión','err');});
+}
 document.addEventListener('DOMContentLoaded',init);
 </script>
 </body></html>'''
