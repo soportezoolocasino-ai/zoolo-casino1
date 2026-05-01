@@ -2526,6 +2526,95 @@ def reporte_agencias_rango():
         return jsonify({'error':str(e)}),500
 
 
+
+@app.route('/public/resultados-hoy')
+def public_resultados_hoy():
+    """Ruta pública para zoolocasino.com — sin login requerido."""
+    try:
+        hoy_peru = ahora_peru().strftime("%d/%m/%Y")
+        hoy_ven  = ahora_venezuela().strftime("%d/%m/%Y")
+
+        with get_db() as db:
+            # PERU results
+            peru_rows = db.execute(
+                "SELECT hora, animal FROM resultados WHERE fecha=%s AND loteria='peru'",
+                (hoy_peru,)
+            ).fetchall()
+            # PLUS (Venezuela) results
+            plus_rows = db.execute(
+                "SELECT hora, animal FROM resultados WHERE fecha=%s AND loteria='plus'",
+                (hoy_ven,)
+            ).fetchall()
+
+        # Map hora string to index matching PERU_TIMES in frontend
+        # PERU_TIMES in frontend: ["08:00","09:00",...,"18:00"] (24h format)
+        # Flask stores: "08:00 AM", "01:00 PM" etc.
+        def hora_to_24h(hora_str):
+            try:
+                dt = datetime.strptime(hora_str.strip(), "%I:%M %p")
+                return dt.strftime("%H:%M")
+            except:
+                return hora_str
+
+        peru_map  = {hora_to_24h(r['hora']): r['animal'] for r in peru_rows}
+        plus_map  = {hora_to_24h(r['hora']): r['animal'] for r in plus_rows}
+
+        return jsonify({
+            'status': 'ok',
+            'fecha_peru': hoy_peru,
+            'fecha_venezuela': hoy_ven,
+            'peru': peru_map,
+            'venezuela': plus_map,
+            'updated_at': ahora_peru().strftime("%d/%m/%Y %I:%M %p")
+        }), 200, {
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'no-cache'
+        }
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/public/resultados-fecha')
+def public_resultados_fecha():
+    """Resultados de una fecha específica para zoolocasino.com."""
+    try:
+        fecha_param = request.args.get('fecha')  # YYYY-MM-DD
+        if not fecha_param:
+            fecha_peru = ahora_peru().strftime("%d/%m/%Y")
+            fecha_ven  = ahora_venezuela().strftime("%d/%m/%Y")
+        else:
+            dt = datetime.strptime(fecha_param, "%Y-%m-%d")
+            fecha_peru = dt.strftime("%d/%m/%Y")
+            fecha_ven  = dt.strftime("%d/%m/%Y")
+
+        with get_db() as db:
+            peru_rows = db.execute(
+                "SELECT hora, animal FROM resultados WHERE fecha=%s AND loteria='peru'",
+                (fecha_peru,)
+            ).fetchall()
+            plus_rows = db.execute(
+                "SELECT hora, animal FROM resultados WHERE fecha=%s AND loteria='plus'",
+                (fecha_ven,)
+            ).fetchall()
+
+        def hora_to_24h(hora_str):
+            try:
+                dt = datetime.strptime(hora_str.strip(), "%I:%M %p")
+                return dt.strftime("%H:%M")
+            except:
+                return hora_str
+
+        peru_map = {hora_to_24h(r['hora']): r['animal'] for r in peru_rows}
+        plus_map = {hora_to_24h(r['hora']): r['animal'] for r in plus_rows}
+
+        return jsonify({
+            'status': 'ok',
+            'fecha': fecha_param or ahora_peru().strftime("%Y-%m-%d"),
+            'peru': peru_map,
+            'venezuela': plus_map,
+        }), 200, {'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache'}
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 # ===================== HTML — LOGIN (sin cambios) =====================
 LOGIN_HTML = '''<!DOCTYPE html>
 <html><head>
