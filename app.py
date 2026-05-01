@@ -552,7 +552,7 @@ def ejecutar_auto_sorteo(hora_str, loteria):
                 FROM jugadas jg
                 JOIN tickets tk ON jg.ticket_id = tk.id
                 WHERE jg.hora=%s AND jg.loteria=%s AND tk.anulado=0 AND SUBSTR(tk.fecha, 1, 10) = %s
-            """, (hora_str, loteria, fecha_hoy + '%')).fetchone()
+            """, (hora_str, loteria, fecha_hoy)).fetchone()
             total_vendido = float(apostado_row['total'])
             presupuesto_70 = round(total_vendido * 0.70, 2)
 
@@ -581,7 +581,7 @@ def ejecutar_auto_sorteo(hora_str, loteria):
                 WHERE jg.hora=%s AND jg.tipo='animal' AND jg.loteria=%s
                   AND tk.anulado=0 AND SUBSTR(tk.fecha, 1, 10) = %s
                 GROUP BY jg.seleccion
-            """, (hora_str, loteria, fecha_hoy + '%')).fetchall()
+            """, (hora_str, loteria, fecha_hoy)).fetchall()
 
             apostado_map = {r['seleccion']: float(r['apostado']) for r in apostado_por_animal}
 
@@ -593,7 +593,7 @@ def ejecutar_auto_sorteo(hora_str, loteria):
                 WHERE jg.hora=%s AND jg.tipo='especial' AND jg.loteria=%s
                   AND tk.anulado=0 AND SUBSTR(tk.fecha, 1, 10) = %s
                 GROUP BY jg.seleccion
-            """, (hora_str, loteria, fecha_hoy + '%')).fetchall()
+            """, (hora_str, loteria, fecha_hoy)).fetchall()
 
             esp_map = {r['seleccion']: float(r['apostado']) for r in especiales}
 
@@ -707,7 +707,7 @@ def ejecutar_auto_sorteo(hora_str, loteria):
                     (fecha_hoy, hora_str, animal_elegido, loteria))
 
             # 8. Calcular acumulado generado para el siguiente sorteo
-            acumulado_generado = round(max(0, presupuesto_70 - premio_a_pagar), 2)
+            acumulado_generado = round(max(0, presupuesto_total - premio_a_pagar), 2)
 
             # 9. Guardar registro en sorteo_acumulado
             if USE_SQLITE:
@@ -1747,7 +1747,7 @@ def reporte_7030():
                 JOIN tickets tk ON jg.ticket_id = tk.id
                 WHERE SUBSTR(tk.fecha, 1, 10) = %s AND jg.loteria=%s AND tk.anulado=0
                 GROUP BY jg.hora
-            """, (fecha + '%', loteria)).fetchall()
+            """, (fecha, loteria)).fetchall()
             vendido_map = {r['hora']: float(r['total']) for r in total_por_hora}
 
         sorteos = []
@@ -1788,7 +1788,7 @@ def reporte_7030():
                                 FROM jugadas jg JOIN tickets tk ON jg.ticket_id=tk.id
                                 WHERE jg.hora=%s AND jg.seleccion=%s AND jg.tipo='animal'
                                 AND jg.loteria=%s AND tk.anulado=0 AND SUBSTR(tk.fecha, 1, 10) = %s
-                            """, (hora, animal, loteria, fecha+'%')).fetchone()
+                            """, (hora, animal, loteria, fecha)).fetchone()
                             ap_animal = float(ap_row['ap']) if ap_row else 0
                         mult = 70 if animal == '40' else 35
                         premio = round(ap_animal * mult, 2)
@@ -1801,7 +1801,7 @@ def reporte_7030():
                                     WHERE jg.hora=%s AND jg.tipo='especial' AND jg.loteria=%s
                                     AND tk.anulado=0 AND SUBSTR(tk.fecha, 1, 10) = %s
                                     GROUP BY jg.seleccion
-                                """, (hora, loteria, fecha+'%')).fetchall()
+                                """, (hora, loteria, fecha)).fetchall()
                             esp_map_h = {r['seleccion']: float(r['monto']) for r in esp_rows}
                             if animal not in ['0','00']:
                                 num = int(animal)
