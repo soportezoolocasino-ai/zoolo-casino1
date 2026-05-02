@@ -557,12 +557,19 @@ def ejecutar_auto_sorteo(hora_str, loteria):
             presupuesto_70 = round(total_vendido * 0.70, 2)
 
             # 3. Obtener acumulado de sorteos anteriores del mismo día
-            acum_row = db.execute("""
-                SELECT COALESCE(SUM(acumulado_generado), 0) as total_acum
-                FROM sorteo_acumulado
+            # Obtener el acumulado generado por el ÚLTIMO sorteo del día
+            # (cadena: cada sorteo recibe lo que dejó el sorteo anterior)
+            todos_acum = db.execute("""
+                SELECT hora, acumulado_generado FROM sorteo_acumulado
                 WHERE fecha=%s AND loteria=%s
-            """, (fecha_hoy, loteria)).fetchone()
-            acumulado_recibido = round(float(acum_row['total_acum']), 2)
+            """, (fecha_hoy, loteria)).fetchall()
+
+            if todos_acum:
+                # Ordenar por hora real y tomar el último
+                ultimo_acum = max(todos_acum, key=lambda r: hora_a_min(r['hora']))
+                acumulado_recibido = round(float(ultimo_acum['acumulado_generado']), 2)
+            else:
+                acumulado_recibido = 0.0
 
             presupuesto_total = round(presupuesto_70 + acumulado_recibido, 2)
 
@@ -1650,6 +1657,37 @@ def guardar_resultado():
         return jsonify({'error':str(e)}),500
 
 # ── NUEVO v4.0: Toggle auto-sorteo ───────────────────────────────────────────
+@app.route('/admin/borrar-resultado', methods=['POST'])
+@admin_required
+def borrar_resultado():
+    try:
+        data = request.get_json() or {}
+        hora = data.get('hora')
+        fecha = data.get('fecha')
+        loteria = data.get('loteria', 'peru')
+        if not hora or not fecha:
+            return jsonify({'error': 'Faltan parámetros'}), 400
+        # Convertir fecha de YYYY-MM-DD a DD/MM/YYYY
+        try:
+            fecha = datetime.strptime(fecha, "%Y-%m-%d").strftime("%d/%m/%Y")
+        except:
+            pass
+        with get_db() as db:
+            db.execute(
+                "DELETE FROM resultados WHERE fecha=%s AND hora=%s AND loteria=%s",
+                (fecha, hora, loteria)
+            )
+            # También borrar el registro de sorteo_acumulado
+            db.execute(
+                "DELETE FROM sorteo_acumulado WHERE fecha=%s AND hora=%s AND loteria=%s",
+                (fecha, hora, loteria)
+            )
+            db.commit()
+        log_audit(f"Resultado borrado: {fecha} {hora} {loteria}")
+        return jsonify({'status': 'ok', 'mensaje': f'Resultado {hora} borrado'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/admin/toggle-autosorteo', methods=['POST'])
 @admin_required
 def toggle_autosorteo():
@@ -3209,14 +3247,62 @@ function cargarResultadosAdmin(){let f=document.getElementById('res-fecha').valu
 fetch('/api/resultados-fecha-admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:f,loteria:'peru'})}).then(r=>r.json()),
 fetch('/api/resultados-fecha-admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:f,loteria:'plus'})}).then(r=>r.json())
 ]).then(([dp,dpl])=>{
-  let renderLista=(data,lista,horarios)=>{
-    lista.innerHTML='';horarios.forEach(h=>{let res=data[h];let d=document.createElement('div');
-    d.style.cssText=`padding:5px 8px;border-radius:3px;font-size:.72rem;display:flex;justify-content:space-between;align-items:center;background:${res?'rgba(46,204,113,.06)':'var(--card)'};border:1px solid ${res?'rgba(46,204,113,.2)':'var(--border)'}`;
-    d.innerHTML=`<span style="color:var(--teal);font-family:'Oswald',sans-serif;font-size:.7rem;font-weight:700">${h.replace(':00 ','')}</span>${res?`<span style="color:#4ade80;font-weight:700">${res.animal} — ${res.nombre}</span>`:'<span style="color:var(--text2);font-size:.65rem">PENDIENTE</span>'}`;
-    lista.appendChild(d);});};
-  renderLista(dp.resultados,document.getElementById('res-lista-peru'),HPERU);
-  renderLista(dpl.resultados,document.getElementById('res-lista-plus'),HPLUS);
+  let renderLista=(data,lista,horarios,lot)=>{
+    lista.innerHTML='';
+    horarios.forEach(function(h){
+      var res=data[h];
+      var d=document.createElement('div');
+      d.style.cssText='padding:5px 8px;border-radius:3px;font-size:.72rem;display:flex;align-items:center;gap:4px;background:'+(res?'rgba(46,204,113,.06)':'var(--card)')+';border:1px solid '+(res?'rgba(46,204,113,.2)':'var(--border)');
+      var hs=document.createElement('span');
+      hs.style.cssText='color:var(--teal);font-family:Oswald,sans-serif;font-size:.7rem;font-weight:700;min-width:46px';
+      hs.textContent=h.replace(':00 ','');
+      var rs=document.createElement('span');
+      rs.style.cssText='flex:1;font-weight:'+(res?'700':'400')+';color:'+(res?'#4ade80':'var(--text2)')+';font-size:'+(res?'.72rem':'.65rem');
+      rs.textContent=res?res.animal+' - '+res.nombre:'PENDIENTE';
+      d.appendChild(hs);d.appendChild(rs);
+      if(res){
+        (function(hora,loteria){
+          var be=document.createElement('button');
+          be.textContent='Editar';
+          be.style.cssText='background:rgba(251,191,36,.15);border:1px solid rgba(251,191,36,.3);color:var(--gold);border-radius:3px;padding:2px 6px;font-size:.58rem;cursor:pointer';
+          be.onclick=function(){editarResultado(hora,loteria);};
+          var bd=document.createElement('button');
+          bd.textContent='Borrar';
+          bd.style.cssText='background:rgba(231,76,60,.15);border:1px solid rgba(231,76,60,.3);color:var(--red);border-radius:3px;padding:2px 6px;font-size:.58rem;cursor:pointer';
+          bd.onclick=function(){borrarResultado(hora,loteria);};
+          d.appendChild(be);d.appendChild(bd);
+        })(h,lot);
+      }
+      lista.appendChild(d);
+    });
+  }
+  renderLista(dp.resultados,document.getElementById('res-lista-peru'),HPERU,'peru');
+  renderLista(dpl.resultados,document.getElementById('res-lista-plus'),HPLUS,'plus');
   }).catch(()=>{});}
+
+function borrarResultado(hora, lot){
+  if(!confirm('¿Borrar resultado de '+hora+' ('+lot.toUpperCase()+')?')) return;
+  let fecha=document.getElementById('res-fecha').value;
+  fetch('/admin/borrar-resultado',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({hora:hora,fecha:fecha,loteria:lot})})
+  .then(r=>r.json()).then(d=>{
+    if(d.status==='ok'){showMsg('msg-res','✅ '+d.mensaje,'ok');cargarResultadosAdmin();cargarSecuencia();}
+    else showMsg('msg-res',d.error||'Error','err');
+  }).catch(()=>showMsg('msg-res','Error de conexión','err'));
+}
+
+function editarResultado(hora, lot){
+  // Seleccionar la lotería correcta
+  if(lot==='peru'){selLotRes('peru');}else{selLotRes('plus');}
+  // Seleccionar la hora en el dropdown
+  let sel=document.getElementById('res-hora');
+  for(let i=0;i<sel.options.length;i++){
+    if(sel.options[i].value===hora){sel.selectedIndex=i;break;}
+  }
+  // Scroll al formulario de guardar
+  document.getElementById('res-hora').scrollIntoView({behavior:'smooth',block:'center'});
+  showMsg('msg-res','✏️ Selecciona el animal nuevo y guarda','ok');
+}
 
 function guardarResultado(){let hora=document.getElementById('res-hora').value,fecha=document.getElementById('res-fecha').value,animal=animalSel,loteria=lotRes;if(!animal){showMsg('msg-res','Selecciona un animal','err');return;}if(!hora){showMsg('msg-res','Selecciona la hora','err');return;}let fd=new FormData();fd.append('hora',hora);fd.append('animal',animal);fd.append('loteria',loteria);if(fecha)fd.append('fecha',fecha);fetch('/admin/guardar-resultado',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{if(d.status==='ok'){showMsg('msg-res',`✅ ${d.mensaje} [${d.fecha}]`,'ok');animalSel=null;renderAMG();document.getElementById('animal-sel-preview').textContent='';cargarResultadosAdmin();cargarSecuencia();}else showMsg('msg-res',d.error,'err');}).catch(()=>showMsg('msg-res','Error','err'));}
 
