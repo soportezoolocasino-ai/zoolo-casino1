@@ -3402,24 +3402,28 @@ function cargarEstadisticas(){
     body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin})})
   .then(r=>r.json()).then(d=>{
     let t=d.totales;
-    let html='<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:12px 0">'
-      +'<div class="stat-box"><div class="stat-label">VENTAS</div><div class="stat-val">S/'+t.ventas.toFixed(2)+'</div></div>'
+    let ventasAnim=round2(t.ventas-(t.tripletas||0));
+    let html='<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin:12px 0">'
+      +'<div class="stat-box"><div class="stat-label">VENTAS ANIMALES</div><div class="stat-val">S/'+ventasAnim.toFixed(2)+'</div></div>'
       +'<div class="stat-box"><div class="stat-label">TRIPLETAS</div><div class="stat-val" style="color:#c084fc">S/'+(t.tripletas||0).toFixed(2)+'</div></div>'
+      +'<div class="stat-box"><div class="stat-label">TOTAL INGRESOS</div><div class="stat-val" style="color:var(--gold)">S/'+t.ventas.toFixed(2)+'</div></div>'
       +'<div class="stat-box"><div class="stat-label">PREMIOS</div><div class="stat-val r">S/'+t.premios.toFixed(2)+'</div></div>'
       +'<div class="stat-box"><div class="stat-label">COMISIONES</div><div class="stat-val">S/'+t.comisiones.toFixed(2)+'</div></div>'
-      +'<div class="stat-box" style="grid-column:1/-1"><div class="stat-label">BALANCE</div><div class="stat-val" style="color:'+(t.balance>=0?'var(--green)':'var(--red)')+'">S/'+t.balance.toFixed(2)+'</div></div>'
+      +'<div class="stat-box"><div class="stat-label">BALANCE</div><div class="stat-val" style="color:'+(t.balance>=0?'var(--green)':'var(--red)')+'">S/'+t.balance.toFixed(2)+'</div></div>'
       +'</div>';
     html+='<table class="tbl"><thead><tr>'
-      +'<th>Fecha</th><th>Tickets</th><th>Ventas</th><th style="color:#c084fc">Tripletas</th>'
-      +'<th>Premios</th><th>Comisiones</th><th>Balance</th>'
+      +'<th>Fecha</th><th>Tickets</th><th>V.Animales</th><th style="color:#c084fc">Tripletas</th>'
+      +'<th style="color:var(--gold)">Total</th><th>Premios</th><th>Comisiones</th><th>Balance</th>'
       +'</tr></thead><tbody>';
     d.resumen_por_dia.forEach(function(r){
       var bc=r.balance>=0?'var(--green)':'var(--red)';
+      var vAnim=round2(r.ventas-(r.tripletas||0));
       html+='<tr>'
         +'<td>'+r.fecha+'</td>'
         +'<td>'+r.tickets+'</td>'
-        +'<td>S/'+r.ventas.toFixed(2)+'</td>'
+        +'<td>S/'+vAnim.toFixed(2)+'</td>'
         +'<td style="color:#c084fc">S/'+(r.tripletas||0).toFixed(2)+'</td>'
+        +'<td style="color:var(--gold);font-weight:700">S/'+r.ventas.toFixed(2)+'</td>'
         +'<td style="color:var(--red)">S/'+r.premios.toFixed(2)+'</td>'
         +'<td>S/'+r.comisiones.toFixed(2)+'</td>'
         +'<td style="color:'+bc+';font-weight:700">S/'+r.balance.toFixed(2)+'</td>'
@@ -3428,6 +3432,7 @@ function cargarEstadisticas(){
     html+='</tbody></table>';
     document.getElementById('rep-periodo').innerHTML=html;
   });}
+function round2(n){return Math.round(n*100)/100;}
 
 function cargarReporteAgencias(){let ini=document.getElementById('rep-ini').value,fin=document.getElementById('rep-fin').value;if(!ini||!fin){alert('Seleccione fechas');return;}fetch('/admin/reporte-agencias-rango',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json()).then(d=>{let html=`<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:12px 0"><div class="stat-box"><div class="stat-label">TOTAL VENTAS</div><div class="stat-val">S/${d.total.ventas.toFixed(2)}</div></div><div class="stat-box"><div class="stat-label">PREMIOS</div><div class="stat-val r">S/${d.total.premios.toFixed(2)}</div></div><div class="stat-box"><div class="stat-label">COMISIONES</div><div class="stat-val">S/${d.total.comision.toFixed(2)}</div></div><div class="stat-box"><div class="stat-label">BALANCE</div><div class="stat-val ${d.total.balance>=0?'g':'r'}">S/${d.total.balance.toFixed(2)}</div></div></div>`;html+='<table class="tbl"><thead><tr><th>Agencia</th><th>Tickets</th><th>Ventas</th><th>% del Total</th><th>Premios</th><th>Comisión</th><th>Balance</th></tr></thead><tbody>';d.agencias.forEach(a=>{let bc=a.balance>=0?'var(--green)':'var(--red)';html+=`<tr><td><span style="color:var(--gold)">${a.nombre}</span><br><span style="color:var(--text2);font-size:.65rem">${a.usuario}</span></td><td>${a.tickets}</td><td>S/${a.ventas.toFixed(2)}</td><td style="color:var(--text2)">${a.porcentaje_ventas||0}%</td><td style="color:var(--red)">S/${a.premios_teoricos.toFixed(2)}</td><td>S/${a.comision.toFixed(2)}</td><td style="color:${bc};font-family:'Oswald',sans-serif">S/${a.balance.toFixed(2)}</td></tr>`;});html+='</tbody></table>';document.getElementById('rep-periodo').innerHTML=html;});}
 function exportarCSV(){let ini=document.getElementById('rep-ini').value,fin=document.getElementById('rep-fin').value;if(!ini||!fin){alert('Seleccione fechas');return;}fetch('/admin/exportar-csv',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.blob()).then(blob=>{let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`reporte_${ini}_${fin}.csv`;a.click();});}
