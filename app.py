@@ -557,19 +557,28 @@ def ejecutar_auto_sorteo(hora_str, loteria):
             presupuesto_70 = round(total_vendido * 0.70, 2)
 
             # 3. Obtener acumulado de sorteos anteriores del mismo día
-            # Obtener el acumulado generado por el ÚLTIMO sorteo del día
-            # (cadena: cada sorteo recibe lo que dejó el sorteo anterior)
-            todos_acum = db.execute("""
-                SELECT hora, acumulado_generado FROM sorteo_acumulado
+            # Calcular acumulado recibido reconstruyendo la cadena completa del día
+            # (igual que el reporte, para que ambos sean consistentes)
+            # Esto evita que borrar/editar un resultado rompa el acumulado
+            sorteos_previos = db.execute("""
+                SELECT hora, total_vendido, premio_pagado
+                FROM sorteo_acumulado
                 WHERE fecha=%s AND loteria=%s
             """, (fecha_hoy, loteria)).fetchall()
 
-            if todos_acum:
-                # Ordenar por hora real y tomar el último
-                ultimo_acum = max(todos_acum, key=lambda r: hora_a_min(r['hora']))
-                acumulado_recibido = round(float(ultimo_acum['acumulado_generado']), 2)
-            else:
-                acumulado_recibido = 0.0
+            # Ordenar por hora real
+            sorteos_previos_ord = sorted(sorteos_previos, key=lambda r: hora_a_min(r['hora']))
+
+            # Reconstruir la cadena desde el inicio del día
+            acum_cadena = 0.0
+            for sp in sorteos_previos_ord:
+                vend_sp = float(sp['total_vendido'])
+                prem_sp = float(sp['premio_pagado'])
+                p70_sp = round(vend_sp * 0.70, 2)
+                pres_sp = round(p70_sp + acum_cadena, 2)
+                acum_cadena = round(max(0, pres_sp - prem_sp), 2)
+
+            acumulado_recibido = acum_cadena
 
             presupuesto_total = round(presupuesto_70 + acumulado_recibido, 2)
 
@@ -1803,14 +1812,13 @@ def reporte_7030():
             presupuesto_70 = round(vendido * 0.70, 2)
 
             if hora in acum_map:
-                # Registro oficial del auto-sorteo — usar sus datos
+                # Registro oficial — solo tomar el premio pagado real
+                # El acumulado se recalcula siempre en cadena para evitar datos corruptos
                 a = acum_map[hora]
                 premio = float(a['premio_pagado'])
-                acum_recibido = float(a['acumulado_recibido'])
-                acum_generado = float(a['acumulado_generado'])
                 modo = a['modo']
-                # Sincronizar acumulado corriente con lo que realmente quedó
-                acum_corriente = acum_generado
+                # Siempre calcular acum_recibido desde la cadena actual
+                acum_recibido = round(acum_corriente, 2)
             else:
                 # Sin registro oficial — calcular dinámicamente
                 acum_recibido = round(acum_corriente, 2)
@@ -1862,14 +1870,12 @@ def reporte_7030():
                     premio = 0
                     modo = 'pendiente'
 
-                acum_generado = round(max(0, presupuesto_70 - premio + acum_recibido - acum_recibido), 2)
-                # Si no se pagó premio, el 70% pasa al siguiente sorteo
-                # max(0,...) evita acumulado negativo si premio > presupuesto (ej: Lechuza x70)
-                acum_generado = round(max(0, presupuesto_70 - premio), 2)
-                acum_corriente = round(max(0, acum_corriente + acum_generado - (premio - presupuesto_70 if premio > presupuesto_70 else 0)), 2)
-                acum_corriente = max(0, acum_corriente)
+                # acum_generado se calcula correctamente después del if/else
 
             presupuesto_total = round(presupuesto_70 + acum_recibido, 2)
+            # Recalcular acum_generado siempre en cadena
+            acum_generado = round(max(0, presupuesto_total - premio), 2)
+            acum_corriente = acum_generado  # cadena: pasa al siguiente sorteo
             para_casa = round(vendido * 0.30, 2)
 
             sorteos.append({
