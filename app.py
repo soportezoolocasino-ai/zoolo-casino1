@@ -315,6 +315,17 @@ def init_db():
             id {pk}, ticket_id INTEGER NOT NULL, hora TEXT NOT NULL,
             seleccion TEXT NOT NULL, monto REAL NOT NULL, tipo TEXT NOT NULL,
             loteria TEXT NOT NULL DEFAULT 'peru')""")
+        db.execute("""CREATE TABLE IF NOT EXISTS numeros_bloqueados (
+            id INTEGER PRIMARY KEY,
+            numero TEXT NOT NULL,
+            loteria TEXT NOT NULL DEFAULT 'peru',
+            UNIQUE(numero, loteria))""" if USE_SQLITE else """CREATE TABLE IF NOT EXISTS numeros_bloqueados (
+            id SERIAL PRIMARY KEY,
+            numero TEXT NOT NULL,
+            loteria TEXT NOT NULL DEFAULT 'peru',
+            UNIQUE(numero, loteria))""")
+        db.commit()
+
         db.execute(f"""CREATE TABLE IF NOT EXISTS tripletas (
             id {pk}, ticket_id INTEGER NOT NULL, animal1 TEXT NOT NULL,
             animal2 TEXT NOT NULL, animal3 TEXT NOT NULL, monto REAL NOT NULL,
@@ -653,10 +664,19 @@ def ejecutar_auto_sorteo(hora_str, loteria):
 
             logger.info(f"[SECUENCIA] Último:{ultimo_animal} → Prioridad:{secuencia_valida}")
 
-            # 7. Candidatos elegibles: no repetidos hoy, dentro del presupuesto
+            # Cargar números bloqueados para esta lotería
+            bloqueados_rows = db.execute(
+                "SELECT numero FROM numeros_bloqueados WHERE loteria=%s",
+                (loteria,)
+            ).fetchall()
+            numeros_bloqueados = {r['numero'] for r in bloqueados_rows}
+
+            # 7. Candidatos elegibles: no repetidos hoy, no bloqueados, dentro del presupuesto
             candidatos_jugados = []
             for num in ANIMALES_AUTO:
                 if num in animales_ya_salidos:
+                    continue
+                if num in numeros_bloqueados:
                     continue
                 pago = pago_total_si_sale(num)
                 if pago <= presupuesto_total:
@@ -2670,6 +2690,59 @@ def public_resultados_fecha():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
+@app.route('/admin/numeros-bloqueados', methods=['GET'])
+@admin_required
+def get_numeros_bloqueados():
+    try:
+        loteria = request.args.get('loteria', 'peru')
+        with get_db() as db:
+            rows = db.execute(
+                "SELECT numero FROM numeros_bloqueados WHERE loteria=%s ORDER BY numero",
+                (loteria,)
+            ).fetchall()
+        return jsonify({'status': 'ok', 'bloqueados': [r['numero'] for r in rows]})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/numeros-bloqueados/toggle', methods=['POST'])
+@admin_required
+def toggle_numero_bloqueado():
+    try:
+        data = request.get_json() or {}
+        numero = str(data.get('numero', ''))
+        loteria = data.get('loteria', 'peru')
+        if numero not in [str(i) for i in range(0, 41)] + ['00']:
+            return jsonify({'error': 'Número inválido'}), 400
+        with get_db() as db:
+            existe = db.execute(
+                "SELECT id FROM numeros_bloqueados WHERE numero=%s AND loteria=%s",
+                (numero, loteria)
+            ).fetchone()
+            if existe:
+                db.execute(
+                    "DELETE FROM numeros_bloqueados WHERE numero=%s AND loteria=%s",
+                    (numero, loteria)
+                )
+                accion = 'desbloqueado'
+            else:
+                if USE_SQLITE:
+                    db.execute(
+                        "INSERT OR IGNORE INTO numeros_bloqueados (numero, loteria) VALUES (?,?)",
+                        (numero, loteria)
+                    )
+                else:
+                    db.execute(
+                        "INSERT INTO numeros_bloqueados (numero, loteria) VALUES (%s,%s) ON CONFLICT(numero, loteria) DO NOTHING",
+                        (numero, loteria)
+                    )
+                accion = 'bloqueado'
+            db.commit()
+        log_audit(f"Número {numero} {accion} en {loteria}")
+        return jsonify({'status': 'ok', 'accion': accion, 'numero': numero})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 # ===================== HTML — LOGIN (sin cambios) =====================
 LOGIN_HTML = '''<!DOCTYPE html>
 <html><head>
@@ -3088,6 +3161,20 @@ input:focus,select:focus{outline:none;border-color:var(--blue)}
       </div>
     </div>
     <div id="seq-info" style="display:none"></div>
+
+    <!-- Panel Números Bloqueados -->
+    <div style="margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <span style="color:var(--red);font-family:Oswald,sans-serif;font-size:.75rem;font-weight:700">🚫 NÚMEROS BLOQUEADOS</span>
+        <div style="display:flex;gap:6px">
+          <button onclick="selLotBloq('peru')" id="bloq-btn-peru" class="tag info active" style="cursor:pointer;font-size:.6rem;padding:2px 8px">PERÚ</button>
+          <button onclick="selLotBloq('plus')" id="bloq-btn-plus" class="tag" style="cursor:pointer;font-size:.6rem;padding:2px 8px;border-color:#7c3aed;color:#c084fc">PLUS</button>
+        </div>
+      </div>
+      <div id="bloq-grid" style="display:grid;grid-template-columns:repeat(7,1fr);gap:3px;margin-bottom:6px"></div>
+      <div id="bloq-info" style="font-size:.62rem;color:var(--text2);text-align:center">Toca un número para bloquearlo / desbloquearlo</div>
+    </div>
+
     <div id="animal-sel-preview" style="margin-bottom:10px;color:var(--gold);font-family:'Oswald',sans-serif;font-size:.85rem;min-height:20px;text-align:center"></div>
     <div id="msg-res" class="msg"></div>
     <div style="display:flex;gap:8px">
@@ -3473,6 +3560,68 @@ function init(){
 }
 
 // ── Auto-sorteo toggle ────────────────────────────────────────────────────────
+// ── Números Bloqueados ────────────────────────────────────────────────────────
+var _lotBloq='peru';
+var _bloqueados=[];
+
+function selLotBloq(lot){
+  _lotBloq=lot;
+  document.getElementById('bloq-btn-peru').className='tag '+(lot==='peru'?'info active':'');
+  document.getElementById('bloq-btn-plus').className='tag';
+  document.getElementById('bloq-btn-plus').style.cssText='cursor:pointer;font-size:.6rem;padding:2px 8px;border-color:#7c3aed;color:'+(lot==='plus'?'#fff':'#c084fc')+';background:'+(lot==='plus'?'#7c3aed':'transparent');
+  cargarBloqueados();
+}
+
+function cargarBloqueados(){
+  fetch('/admin/numeros-bloqueados?loteria='+_lotBloq)
+    .then(function(r){return r.json();})
+    .then(function(d){
+      _bloqueados=d.bloqueados||[];
+      renderBloqGrid();
+    }).catch(function(){});
+}
+
+function renderBloqGrid(){
+  var g=document.getElementById('bloq-grid');
+  if(!g)return;
+  g.innerHTML='';
+  var orden=['00','0'];
+  for(var i=1;i<=40;i++) orden.push(String(i));
+  orden.forEach(function(k){
+    if(!ANIMALES[k])return;
+    var bloq=_bloqueados.indexOf(k)>=0;
+    var btn=document.createElement('button');
+    btn.style.cssText='padding:3px 2px;border-radius:3px;font-size:.58rem;cursor:pointer;text-align:center;line-height:1.2;'
+      +(bloq?'background:rgba(231,76,60,.25);border:1px solid var(--red);color:var(--red);'
+             :'background:var(--card);border:1px solid var(--border);color:var(--text);');
+    btn.innerHTML='<div style="font-weight:700">'+k+'</div><div style="font-size:.5rem;opacity:.8">'+ANIMALES[k].substring(0,4)+'</div>'
+      +(bloq?'<div style="font-size:.45rem;color:var(--red)">🚫</div>':'');
+    btn.onclick=(function(num){return function(){toggleBloqueado(num);};})(k);
+    g.appendChild(btn);
+  });
+  var count=_bloqueados.length;
+  var info=document.getElementById('bloq-info');
+  if(info) info.textContent=count>0?'Bloqueados ('+_lotBloq.toUpperCase()+'): '+_bloqueados.join(', '):'Sin números bloqueados en '+_lotBloq.toUpperCase();
+}
+
+function toggleBloqueado(numero){
+  fetch('/admin/numeros-bloqueados/toggle',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({numero:numero,loteria:_lotBloq})
+  }).then(function(r){return r.json();})
+  .then(function(d){
+    if(d.status==='ok'){
+      if(d.accion==='bloqueado'){
+        _bloqueados.push(d.numero);
+      }else{
+        _bloqueados=_bloqueados.filter(function(n){return n!==d.numero;});
+      }
+      renderBloqGrid();
+    }
+  }).catch(function(){});
+}
+
 function actualizarEstadoToggle(estado){
   var btn=document.getElementById('toggle-auto-btn');
   if(!btn)return;
