@@ -819,7 +819,7 @@ def recuperar_sorteos_perdidos():
             ("05:00 PM", 22), ("06:00 PM", 23),
         ]:
             # ¿Ya pasó esta hora UTC?
-            if now_utc.hour > hora_utc or (now_utc.hour == hora_utc and now_utc.minute > 5):
+            if now_utc.hour > hora_utc or (now_utc.hour == hora_utc and now_utc.minute > 2):
                 # Verificar si ya tiene resultado
                 with get_db() as db:
                     existe = db.execute(
@@ -839,7 +839,7 @@ def recuperar_sorteos_perdidos():
             ("02:00 PM", 18), ("03:00 PM", 19), ("04:00 PM", 20),
             ("05:00 PM", 21), ("06:00 PM", 22), ("07:00 PM", 23),
         ]:
-            if now_utc.hour > hora_utc or (now_utc.hour == hora_utc and now_utc.minute > 5):
+            if now_utc.hour > hora_utc or (now_utc.hour == hora_utc and now_utc.minute > 2):
                 with get_db() as db:
                     existe = db.execute(
                         "SELECT id FROM resultados WHERE fecha=%s AND hora=%s AND loteria='plus'",
@@ -887,7 +887,7 @@ def iniciar_scheduler():
         h = hora_str  # captura correcta en closure
         scheduler.add_job(
             func=lambda hs=h: job_auto_sorteo(hs, 'peru'),
-            trigger=CronTrigger(hour=hora_utc, minute=0, second=5),
+            trigger=CronTrigger(hour=hora_utc, minute=2, second=0),
             id=f'peru_{hora_utc}',
             replace_existing=True,
             misfire_grace_time=300
@@ -897,7 +897,7 @@ def iniciar_scheduler():
         h = hora_str
         scheduler.add_job(
             func=lambda hs=h: job_auto_sorteo(hs, 'plus'),
-            trigger=CronTrigger(hour=hora_utc, minute=0, second=10),
+            trigger=CronTrigger(hour=hora_utc, minute=2, second=0),
             id=f'plus_{hora_utc}',
             replace_existing=True,
             misfire_grace_time=300
