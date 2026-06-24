@@ -570,15 +570,27 @@ def registrar_bloqueos_historicos(fecha_sorteo, loteria):
 
 
 def get_bloqueos_historicos_hoy(loteria):
-    """Retorna set de números bloqueados por histórico para hoy."""
+    """
+    Retorna set de números bloqueados por histórico para hoy.
+    Lee DIRECTAMENTE los resultados de ayer — no depende de bloqueos_historicos.
+    Respeta exclusiones manuales del admin (desbloquear-historico).
+    """
     try:
-        hoy = ahora_peru().strftime("%d/%m/%Y")
+        ahora = ahora_peru()
+        ayer = (ahora - timedelta(days=1)).strftime("%d/%m/%Y")
+        hoy  = ahora.strftime("%d/%m/%Y")
+        clave_excluido = 'EXCLUIDO_' + hoy
         with get_db() as db:
             rows = db.execute(
-                "SELECT numero FROM bloqueos_historicos WHERE fecha_bloqueo=%s AND loteria=%s",
-                (hoy, loteria)
+                "SELECT DISTINCT animal FROM resultados WHERE fecha=%s AND loteria=%s",
+                (ayer, loteria)
             ).fetchall()
-        return {r['numero'] for r in rows}
+            excl = db.execute(
+                "SELECT numero FROM bloqueos_historicos WHERE fecha_bloqueo=%s AND loteria=%s",
+                (clave_excluido, loteria)
+            ).fetchall()
+        excluidos = {r['numero'] for r in excl}
+        return {r['animal'] for r in rows if r['animal'] not in excluidos}
     except:
         return set()
 
@@ -1904,15 +1916,32 @@ def forzar_autosorteo():
 @app.route('/admin/bloqueos-estado')
 @admin_required
 def bloqueos_estado():
-    """Estado completo de bloqueos del día para el panel admin."""
+    """
+    Estado completo de bloqueos del día para el panel admin.
+    Lee históricos DIRECTAMENTE de resultados de ayer, sin depender
+    de la tabla bloqueos_historicos (que puede estar vacía si el sistema
+    acaba de migrar desde v4.0).
+    """
     try:
         loteria = request.args.get('loteria', 'peru')
-        hoy = ahora_peru().strftime("%d/%m/%Y")
+        ahora = ahora_peru()
+        hoy  = ahora.strftime("%d/%m/%Y")
+        ayer = (ahora - timedelta(days=1)).strftime("%d/%m/%Y")
+
         with get_db() as db:
-            hist = db.execute(
-                "SELECT numero FROM bloqueos_historicos WHERE fecha_bloqueo=%s AND loteria=%s",
-                (hoy, loteria)
+            # Históricos: leer resultados de AYER directamente
+            hist_rows = db.execute(
+                "SELECT DISTINCT animal as numero FROM resultados WHERE fecha=%s AND loteria=%s",
+                (ayer, loteria)
             ).fetchall()
+
+            # Desbloqueados manualmente hoy (admin los quitó del bloqueo)
+            desbloq_rows = db.execute(
+                "SELECT numero FROM bloqueos_historicos WHERE fecha_bloqueo=%s AND loteria=%s",
+                ('EXCLUIDO_' + hoy, loteria)
+            ).fetchall()
+            excluidos = {r['numero'] for r in desbloq_rows}
+
             trip_bloq = db.execute("""
                 SELECT bt.numero, bt.tripleta_id,
                        tr.animal1, tr.animal2, tr.animal3, tk.serial
@@ -1921,15 +1950,23 @@ def bloqueos_estado():
                 JOIN tickets tk ON tr.ticket_id = tk.id
                 WHERE bt.fecha=%s AND bt.loteria=%s
             """, (hoy, loteria)).fetchall()
+
             manual = db.execute(
                 "SELECT numero FROM numeros_bloqueados WHERE loteria=%s", (loteria,)
             ).fetchall()
 
+        historicos = [
+            {'numero': r['numero'], 'nombre': ANIMALES.get(r['numero'], '?')}
+            for r in hist_rows
+            if r['numero'] not in excluidos
+        ]
+
         return jsonify({
             'status': 'ok',
             'fecha': hoy,
+            'ayer': ayer,
             'loteria': loteria,
-            'historicos': [{'numero': r['numero'], 'nombre': ANIMALES.get(r['numero'], '?')} for r in hist],
+            'historicos': historicos,
             'tripleta': [{
                 'numero': r['numero'],
                 'nombre': ANIMALES.get(r['numero'], '?'),
@@ -1945,19 +1982,34 @@ def bloqueos_estado():
 @app.route('/admin/desbloquear-historico', methods=['POST'])
 @admin_required
 def desbloquear_historico():
+    """
+    Desbloquea un número del bloqueo histórico.
+    Como ahora los históricos se leen directo de resultados de ayer,
+    guardamos una 'excepción' en la tabla bloqueos_historicos con
+    fecha_bloqueo = 'EXCLUIDO_HOY' para que el panel y el auto-sorteo
+    sepan que este número fue liberado manualmente.
+    """
     try:
         data = request.get_json() or {}
         numero = str(data.get('numero', ''))
         loteria = data.get('loteria', 'peru')
         hoy = ahora_peru().strftime("%d/%m/%Y")
+        clave_excluido = 'EXCLUIDO_' + hoy
         with get_db() as db:
-            db.execute(
-                "DELETE FROM bloqueos_historicos WHERE numero=%s AND loteria=%s AND fecha_bloqueo=%s",
-                (numero, loteria, hoy)
-            )
+            if USE_SQLITE:
+                db.execute(
+                    "INSERT OR IGNORE INTO bloqueos_historicos (numero, loteria, fecha_bloqueo) VALUES (?,?,?)",
+                    (numero, loteria, clave_excluido)
+                )
+            else:
+                db.execute(
+                    """INSERT INTO bloqueos_historicos (numero, loteria, fecha_bloqueo)
+                       VALUES (%s,%s,%s) ON CONFLICT(numero, loteria, fecha_bloqueo) DO NOTHING""",
+                    (numero, loteria, clave_excluido)
+                )
             db.commit()
         log_audit('DESBLOQUEO_HIST', f"Número {numero}-{ANIMALES.get(numero,'?')} desbloqueado del histórico ({loteria.upper()})")
-        return jsonify({'status': 'ok', 'mensaje': f'Número {numero}-{ANIMALES.get(numero,"?")} desbloqueado del histórico'})
+        return jsonify({'status': 'ok', 'mensaje': f'Número {numero}-{ANIMALES.get(numero,"?")} desbloqueado — puede salir hoy'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
