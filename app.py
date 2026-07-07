@@ -290,6 +290,7 @@ def init_db():
             nombre_agencia TEXT NOT NULL, nombre_banco TEXT DEFAULT '',
             es_admin INTEGER DEFAULT 0, comision REAL DEFAULT 0.15,
             activa INTEGER DEFAULT 1, tope_taquilla REAL DEFAULT 0,
+            admin_id INTEGER DEFAULT 0, es_superadmin INTEGER DEFAULT 0,
             creado TEXT {ts})""")
         db.execute(f"""CREATE TABLE IF NOT EXISTS tickets (
             id {pk}, serial TEXT UNIQUE NOT NULL,
@@ -379,6 +380,8 @@ def init_db():
         migraciones = [
             "ALTER TABLE agencias ADD COLUMN tope_taquilla REAL DEFAULT 0",
             "ALTER TABLE agencias ADD COLUMN nombre_banco TEXT DEFAULT ''",
+            "ALTER TABLE agencias ADD COLUMN admin_id INTEGER DEFAULT 0",
+            "ALTER TABLE agencias ADD COLUMN es_superadmin INTEGER DEFAULT 0",
             "ALTER TABLE resultados ADD COLUMN loteria TEXT NOT NULL DEFAULT 'peru'",
             "ALTER TABLE topes ADD COLUMN loteria TEXT NOT NULL DEFAULT 'peru'",
             "ALTER TABLE jugadas ADD COLUMN loteria TEXT NOT NULL DEFAULT 'peru'",
@@ -401,9 +404,14 @@ def init_db():
         admin = db.execute("SELECT id FROM agencias WHERE es_admin=1").fetchone()
         if not admin:
             ph_admin = hash_password('15821462')
-            db.execute("INSERT INTO agencias (usuario,password,nombre_agencia,es_admin,comision,activa) VALUES (%s,%s,%s,1,0,1)",
+            db.execute("INSERT INTO agencias (usuario,password,nombre_agencia,es_admin,es_superadmin,comision,activa) VALUES (%s,%s,%s,1,1,0,1)",
                        ('cuborubi', ph_admin, 'ADMINISTRADOR'))
             db.commit()
+        try:
+            db.execute("UPDATE agencias SET es_superadmin=1 WHERE usuario='cuborubi'")
+            db.commit()
+        except Exception:
+            pass
 
 
 # ─── Helpers de tiempo ────────────────────────────────────────────────────────
@@ -1063,6 +1071,47 @@ def agencia_required(f):
         return f(*a,**k)
     return d
 
+def superadmin_required(f):
+    @wraps(f)
+    def d(*a,**k):
+        if 'user_id' not in session or not session.get('es_superadmin'):
+            return jsonify({'error':'Solo el super-administrador puede hacer esto'}),403
+        return f(*a,**k)
+    return d
+
+def _ids_agencias_admin(db):
+    """IDs de agencias del admin actual. Superadmin -> None (ve todas)."""
+    if session.get('es_superadmin'):
+        return None
+    rows = db.execute("SELECT id FROM agencias WHERE es_admin=0 AND admin_id=%s",
+                      (session.get('user_id'),)).fetchall()
+    return [r['id'] for r in rows]
+
+def _filtrar_ags(rows):
+    """Filtra una lista de filas de agencias dejando solo las del admin actual."""
+    if session.get('es_superadmin'):
+        return rows
+    uid = session.get('user_id')
+    out = []
+    for r in rows:
+        try:
+            owner = r['admin_id'] if 'admin_id' in r.keys() else 0
+        except Exception:
+            owner = 0
+        if owner == uid:
+            out.append(r)
+    return out
+
+def _scope_and(db, alias='tk'):
+    """Devuelve (fragmento_sql, params) para limitar por agencias del admin."""
+    if session.get('es_superadmin'):
+        return '', []
+    ids = _ids_agencias_admin(db)
+    if not ids:
+        return ' AND 1=0', []
+    ph = ','.join(['%s']*len(ids))
+    return f' AND {alias}.agencia_id IN ({ph})', list(ids)
+
 def log_audit(accion, detalle=None):
     try:
         ip = request.remote_addr
@@ -1099,6 +1148,7 @@ def login():
             session['nombre_agencia'] = row['nombre_agencia']
             session['nombre_banco'] = row.get('nombre_banco') or ''
             session['es_admin'] = bool(row['es_admin'])
+            session['es_superadmin'] = bool(row.get('es_superadmin'))
             log_audit('LOGIN', f"Ingreso exitoso desde {request.remote_addr}")
             return redirect('/')
         error="Usuario o clave incorrecta"
@@ -1123,7 +1173,7 @@ def pos():
 @app.route('/admin')
 @admin_required
 def admin():
-    return render_template_string(ADMIN_HTML, animales=ANIMALES, horarios=HORARIOS_PERU, horarios_plus=HORARIOS_PLUS)
+    return render_template_string(ADMIN_HTML, animales=ANIMALES, horarios=HORARIOS_PERU, horarios_plus=HORARIOS_PLUS, es_superadmin=session.get('es_superadmin', False))
 
 @app.route('/api/hora-actual')
 @login_required
@@ -2200,11 +2250,67 @@ def resultados_fecha_admin():
         if h not in rd: rd[h]=None
     return jsonify({'status':'ok','fecha_consulta':fecha_str,'resultados':rd})
 
+@app.route('/admin/lista-admins')
+@superadmin_required
+def lista_admins():
+    with get_db() as db:
+        rows = db.execute("SELECT id,usuario,nombre_agencia,es_superadmin FROM agencias WHERE es_admin=1 ORDER BY id").fetchall()
+        out=[]
+        for r in rows:
+            cnt = db.execute("SELECT COUNT(*) as c FROM agencias WHERE es_admin=0 AND admin_id=%s",(r['id'],)).fetchone()['c']
+            d=dict(r); d['agencias']=cnt
+            out.append(d)
+    return jsonify(out)
+
+@app.route('/admin/crear-admin', methods=['POST'])
+@superadmin_required
+def crear_admin():
+    try:
+        u = request.form.get('usuario','').strip().lower()
+        p = request.form.get('password','').strip()
+        n = request.form.get('nombre','').strip()
+        if not u or not p or not n:
+            return jsonify({'error':'Complete todos los campos'}),400
+        with get_db() as db:
+            ex = db.execute("SELECT id FROM agencias WHERE usuario=%s",(u,)).fetchone()
+            if ex:
+                return jsonify({'error':'Usuario ya existe'}),400
+            ph = hash_password(p)
+            db.execute("""INSERT INTO agencias (usuario,password,nombre_agencia,es_admin,es_superadmin,comision,activa,admin_id)
+                VALUES (%s,%s,%s,1,0,0,1,0)""",(u,ph,n))
+            db.commit()
+        log_audit('CREAR_ADMIN', f"Administrador '{n}' ({u}) creado")
+        return jsonify({'status':'ok','mensaje':f'Administrador {n} creado'})
+    except Exception as e:
+        return jsonify({'error':str(e)}),500
+
+@app.route('/admin/eliminar-admin', methods=['POST'])
+@superadmin_required
+def eliminar_admin():
+    try:
+        data = request.get_json() or {}
+        aid = data.get('id')
+        if not aid: return jsonify({'error':'ID requerido'}),400
+        with get_db() as db:
+            adm = db.execute("SELECT id,nombre_agencia,es_superadmin FROM agencias WHERE id=%s AND es_admin=1",(aid,)).fetchone()
+            if not adm: return jsonify({'error':'Administrador no encontrado'}),404
+            if adm['es_superadmin']: return jsonify({'error':'No se puede eliminar al super-administrador'}),403
+            n_ag = db.execute("SELECT COUNT(*) as c FROM agencias WHERE es_admin=0 AND admin_id=%s",(aid,)).fetchone()['c']
+            if n_ag>0:
+                return jsonify({'error':f'Este administrador tiene {n_ag} agencia(s). Reasígnalas o elimínalas primero.'}),400
+            db.execute("DELETE FROM agencias WHERE id=%s AND es_admin=1 AND es_superadmin=0",(aid,))
+            db.commit()
+        log_audit('ELIMINAR_ADMIN', f"Administrador id:{aid} '{adm['nombre_agencia']}' eliminado")
+        return jsonify({'status':'ok','mensaje':f"Administrador {adm['nombre_agencia']} eliminado"})
+    except Exception as e:
+        return jsonify({'error':str(e)}),500
+
 @app.route('/admin/lista-agencias')
 @admin_required
 def lista_agencias():
     with get_db() as db:
-        rows = db.execute("SELECT id,usuario,nombre_agencia,nombre_banco,comision,activa,tope_taquilla FROM agencias WHERE es_admin=0").fetchall()
+        rows = db.execute("SELECT id,usuario,nombre_agencia,nombre_banco,comision,activa,tope_taquilla,admin_id FROM agencias WHERE es_admin=0").fetchall()
+        rows = _filtrar_ags(rows)
     return jsonify([dict(r) for r in rows])
 
 @app.route('/admin/crear-agencia', methods=['POST'])
@@ -2223,9 +2329,9 @@ def crear_agencia():
                 return jsonify({'error':'Usuario ya existe'}),400
             ph = hash_password(p)
             db.execute("""
-                INSERT INTO agencias (usuario,password,nombre_agencia,nombre_banco,es_admin,comision,activa)
-                VALUES (%s,%s,%s,%s,0,%s,1)
-            """,(u,ph,n,nb,COMISION_AGENCIA))
+                INSERT INTO agencias (usuario,password,nombre_agencia,nombre_banco,es_admin,comision,activa,admin_id)
+                VALUES (%s,%s,%s,%s,0,%s,1,%s)
+            """,(u,ph,n,nb,COMISION_AGENCIA,session.get('user_id')))
             db.commit()
         return jsonify({'status':'ok','mensaje':f'Agencia {n} creada'})
     except Exception as e:
@@ -2238,6 +2344,13 @@ def editar_agencia():
         data = request.get_json() or {}
         aid = data.get('id')
         with get_db() as db:
+            _ag = db.execute("SELECT admin_id FROM agencias WHERE id=%s AND es_admin=0",(aid,)).fetchone()
+            if not _ag:
+                return jsonify({'error':'Agencia no encontrada'}),404
+            if not session.get('es_superadmin') and (_ag['admin_id'] or 0) != session.get('user_id'):
+                return jsonify({'error':'Esta agencia pertenece a otro administrador'}),403
+            if 'admin_id' in data and session.get('es_superadmin'):
+                db.execute("UPDATE agencias SET admin_id=%s WHERE id=%s AND es_admin=0",(int(data['admin_id']),aid))
             if 'nombre_banco' in data:
                 db.execute("UPDATE agencias SET nombre_banco=%s WHERE id=%s AND es_admin=0",(data['nombre_banco'],aid))
             if 'password' in data and data['password']:
@@ -2264,11 +2377,13 @@ def eliminar_agencia():
         if not aid:
             return jsonify({'error': 'ID requerido'}), 400
         with get_db() as db:
-            ag = db.execute("SELECT id, nombre_agencia, es_admin FROM agencias WHERE id=%s", (aid,)).fetchone()
+            ag = db.execute("SELECT id, nombre_agencia, es_admin, admin_id FROM agencias WHERE id=%s", (aid,)).fetchone()
             if not ag:
                 return jsonify({'error': 'Agencia no encontrada'}), 404
             if ag['es_admin']:
                 return jsonify({'error': 'No se puede eliminar al administrador'}), 403
+            if not session.get('es_superadmin') and (ag['admin_id'] or 0) != session.get('user_id'):
+                return jsonify({'error': 'Esta agencia pertenece a otro administrador'}), 403
             tickets_activos = db.execute(
                 "SELECT COUNT(*) as cnt FROM tickets WHERE agencia_id=%s AND anulado=0", (aid,)
             ).fetchone()['cnt']
@@ -2395,6 +2510,8 @@ def riesgo():
             if not sorteo:
                 sorteo = horarios[-1]
         with get_db() as db:
+            _sc,_scp=_scope_and(db,'tk')
+            _own=_ids_agencias_admin(db); _own=set(_own) if _own is not None else None
             agencias_hora = db.execute("""
                 SELECT DISTINCT ag.id, ag.nombre_agencia, ag.usuario
                 FROM agencias ag
@@ -2407,10 +2524,10 @@ def riesgo():
                 SELECT jg.seleccion, COALESCE(SUM(jg.monto),0) as apostado
                 FROM jugadas jg
                 JOIN tickets tk ON jg.ticket_id=tk.id
-                WHERE jg.hora=%s AND jg.tipo='animal' AND jg.loteria=%s AND tk.anulado=0 AND SUBSTR(tk.fecha, 1, 10) = %s
+                WHERE jg.hora=%s AND jg.tipo='animal' AND jg.loteria=%s AND tk.anulado=0 AND SUBSTR(tk.fecha, 1, 10) = %s"""+_sc+"""
                 GROUP BY jg.seleccion
                 ORDER BY jg.seleccion
-            """, (sorteo, loteria, hoy)).fetchall()
+            """, tuple([sorteo, loteria, hoy]+_scp)).fetchall()
             topes_rows = db.execute("SELECT numero, monto_tope FROM topes WHERE hora=%s AND loteria=%s", (sorteo, loteria)).fetchall()
             topes_map = {r['numero']: r['monto_tope'] for r in topes_rows}
         total = sum(r['apostado'] for r in jugadas_rows)
@@ -2434,7 +2551,7 @@ def riesgo():
             'total_apostado': round(total, 2),
             'presupuesto_70': round(total * 0.70, 2),
             'minutos_cierre': MINUTOS_BLOQUEO,
-            'agencias_hora': [dict(a) for a in agencias_hora],
+            'agencias_hora': [dict(a) for a in agencias_hora if _own is None or a['id'] in _own],
             'hora_seleccionada': sorteo,
             'loteria': loteria
         })
@@ -2452,6 +2569,9 @@ def riesgo_agencia():
             return jsonify({'error':'Parámetros requeridos'}),400
         hoy = ahora_peru().strftime("%d/%m/%Y")
         with get_db() as db:
+            _ag = db.execute("SELECT admin_id FROM agencias WHERE id=%s",(agencia_id,)).fetchone()
+            if _ag and not session.get('es_superadmin') and (_ag['admin_id'] or 0) != session.get('user_id'):
+                return jsonify({'error':'Esta agencia pertenece a otro administrador'}),403
             jugadas = db.execute("""
                 SELECT jg.seleccion, jg.tipo, COALESCE(SUM(jg.monto),0) as apostado, COUNT(*) as cnt
                 FROM jugadas jg
@@ -2490,7 +2610,9 @@ def reporte_agencia_horas():
         dti = datetime.strptime(fi, "%Y-%m-%d")
         dtf = datetime.strptime(ff, "%Y-%m-%d").replace(hour=23, minute=59)
         with get_db() as db:
-            ag = db.execute("SELECT nombre_agencia, usuario FROM agencias WHERE id=%s", (agencia_id,)).fetchone()
+            ag = db.execute("SELECT nombre_agencia, usuario, admin_id FROM agencias WHERE id=%s", (agencia_id,)).fetchone()
+            if ag and not session.get('es_superadmin') and (ag['admin_id'] or 0) != session.get('user_id'):
+                return jsonify({'error':'Esta agencia pertenece a otro administrador'}),403
             jugadas_rows = db.execute("""
                 SELECT jg.hora, jg.seleccion, jg.tipo, jg.monto, tk.fecha, tk.serial
                 FROM jugadas jg
@@ -2570,7 +2692,7 @@ def reporte_agencias():
     try:
         hoy = ahora_peru().strftime("%d/%m/%Y")
         with get_db() as db:
-            ags = db.execute("SELECT * FROM agencias WHERE es_admin=0").fetchall()
+            ags = _filtrar_ags(db.execute("SELECT * FROM agencias WHERE es_admin=0").fetchall())
             tickets = db.execute("SELECT * FROM tickets WHERE anulado=0 AND SUBSTR(fecha, 1, 10) = %s",(hoy,)).fetchall()
             data=[]; tv=tp=tc=0
             for ag in ags:
@@ -2624,8 +2746,10 @@ def tripletas_hoy():
             res_dia_peru={r['hora']:r['animal'] for r in res_rows_peru}
             res_dia_plus={r['hora']:r['animal'] for r in res_rows_plus}
             ags={ag['id']:ag['nombre_agencia'] for ag in db.execute("SELECT id,nombre_agencia FROM agencias").fetchall()}
+            _own=_ids_agencias_admin(db); _own=set(_own) if _own is not None else None
         out=[]; ganadoras=0
         for tr in trips:
+            if _own is not None and tr['agencia_id'] not in _own: continue
             lot_tr = tr['loteria'] if 'loteria' in tr.keys() else 'peru'
             res_dia = res_dia_plus if lot_tr == 'plus' else res_dia_peru
             nums={tr['animal1'],tr['animal2'],tr['animal3']}
@@ -2672,7 +2796,7 @@ def exportar_csv():
         dti=datetime.strptime(fi,"%Y-%m-%d")
         dtf=datetime.strptime(ff,"%Y-%m-%d").replace(hour=23,minute=59)
         with get_db() as db:
-            ags=db.execute("SELECT * FROM agencias WHERE es_admin=0").fetchall()
+            ags=_filtrar_ags(db.execute("SELECT * FROM agencias WHERE es_admin=0").fetchall())
             all_t=db.execute("SELECT * FROM tickets WHERE anulado=0 ORDER BY id DESC LIMIT 50000").fetchall()
             stats={ag['id']:{
                 'nombre':ag['nombre_agencia'],
@@ -2731,10 +2855,12 @@ def estadisticas_rango():
         dtf=datetime.strptime(ff,"%Y-%m-%d").replace(hour=23,minute=59)
         with get_db() as db:
             all_t=db.execute("SELECT * FROM tickets WHERE anulado=0 ORDER BY id DESC LIMIT 10000").fetchall()
+            _own=_ids_agencias_admin(db); _own=set(_own) if _own is not None else None
             dias={}; total_v=total_p=total_t=0
             for t in all_t:
                 dt=parse_fecha(t['fecha'])
                 if not dt or dt<dti or dt>dtf: continue
+                if _own is not None and t['agencia_id'] not in _own: continue
                 dk=dt.strftime("%d/%m/%Y")
                 if dk not in dias:
                     dias[dk]={'ventas':0,'tickets':0,'ids':[],'fecha_raw':dt.strftime("%d/%m/%Y")}
@@ -2751,12 +2877,13 @@ def estadisticas_rango():
                 for tid in d['ids']:
                     prem+=calcular_premio_ticket(tid,db)
                 total_p+=prem
+                _sc,_scp=_scope_and(db,'tk')
                 trip_row=db.execute("""
                     SELECT COALESCE(SUM(tr.monto),0) as total_trip
                     FROM tripletas tr
                     JOIN tickets tk ON tr.ticket_id=tk.id
-                    WHERE SUBSTR(tr.fecha,1,10)=%s AND tk.anulado=0
-                """, (d['fecha_raw'],)).fetchone()
+                    WHERE SUBSTR(tr.fecha,1,10)=%s AND tk.anulado=0"""+_sc+"""
+                """, tuple([d['fecha_raw']]+_scp)).fetchone()
                 trip_monto=round(float(trip_row['total_trip']),2) if trip_row else 0
                 total_trip+=trip_monto
                 cd=d['ventas']*COMISION_AGENCIA
@@ -2796,7 +2923,7 @@ def reporte_agencias_rango():
         dti=datetime.strptime(fi,"%Y-%m-%d")
         dtf=datetime.strptime(ff,"%Y-%m-%d").replace(hour=23,minute=59)
         with get_db() as db:
-            ags=db.execute("SELECT * FROM agencias WHERE es_admin=0").fetchall()
+            ags=_filtrar_ags(db.execute("SELECT * FROM agencias WHERE es_admin=0").fetchall())
             all_t=db.execute("SELECT * FROM tickets WHERE anulado=0 ORDER BY id DESC LIMIT 50000").fetchall()
             stats={ag['id']:{
                 'nombre':ag['nombre_agencia'],
@@ -3396,6 +3523,7 @@ input:focus,select:focus{outline:none;border-color:var(--blue)}
   <div class="tab" onclick="showTab('reportes')">💼 REPORTES</div>
   <div class="tab" onclick="showTab('tripletas')">🎯 TRIPLETAS</div>
   <div class="tab" onclick="showTab('auditoria')">📋 AUDITORÍA</div>
+  {% if es_superadmin %}<div class="tab" onclick="showTab('admins')">👑 ADMINS</div>{% endif %}
 </div>
 
 <!-- TAB RESULTADOS -->
@@ -3590,10 +3718,33 @@ input:focus,select:focus{outline:none;border-color:var(--blue)}
   </div>
 </div>
 
+{% if es_superadmin %}
+<!-- TAB ADMINS (solo super-admin) -->
+<div id="tc-admins" class="tc">
+  <div class="grid2">
+    <div class="card">
+      <div class="card-title">&#128081; NUEVO ADMINISTRADOR</div>
+      <div class="fg"><label>USUARIO</label><input type="text" id="adm-user"></div>
+      <div class="fg"><label>CONTRASE&Ntilde;A</label><input type="password" id="adm-pass"></div>
+      <div class="fg"><label>NOMBRE</label><input type="text" id="adm-nombre"></div>
+      <div id="msg-adm" class="msg"></div>
+      <button class="btn btn-block green" onclick="crearAdmin()">CREAR ADMINISTRADOR</button>
+      <div style="color:var(--text2);font-size:.68rem;margin-top:8px;line-height:1.4">Cada administrador solo ver&aacute; y gestionar&aacute; las agencias que le pertenezcan. Para pasarle agencias existentes, ve a la pesta&ntilde;a AGENCIAS y usa "Reasignar due&ntilde;o".</div>
+    </div>
+    <div class="card">
+      <div class="card-title">&#128081; ADMINISTRADORES</div>
+      <button class="btn btn-block" style="margin-bottom:10px" onclick="listarAdmins()">&#128260; ACTUALIZAR</button>
+      <div id="adm-lista"></div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
 <script>
 const ANIMALES = {{ animales | tojson }};
 const HPERU = {{ horarios | tojson }};
 const HPLUS = {{ horarios_plus | tojson }};
+const ES_SUPER = {{ 'true' if es_superadmin else 'false' }};
 const ORDEN = ['00','0','1','2','3','4','5','6','7','8','9','10','11','12','13','14','15','16','17','18','19','20','21','22','23','24','25','26','27','28','29','30','31','32','33','34','35','36','37','38','39','40'];
 let animalSel=null,lotRes='peru',lotRiesgo='peru',lotTopes='peru',lot7030='peru',_lotBloqAuto='peru';
 
@@ -3602,11 +3753,12 @@ function showTab(id){
   document.querySelectorAll('.tc').forEach(t=>t.classList.remove('active'));
   document.getElementById('tc-'+id).classList.add('active');
   let tabs=document.querySelectorAll('.tab');
-  let tabMap={resultados:0,riesgo:1,setentaytreinta:2,agencias:3,topes:4,reportes:5,tripletas:6,auditoria:7};
+  let tabMap={resultados:0,riesgo:1,setentaytreinta:2,agencias:3,topes:4,reportes:5,tripletas:6,auditoria:7,admins:8};
   if(tabMap[id]!==undefined)tabs[tabMap[id]].classList.add('active');
   if(id==='riesgo'){fillHorasRiesgo();cargarRiesgo();}
   if(id==='tripletas')cargarTripletas();
   if(id==='agencias')listarAgencias();
+  if(id==='admins')listarAdmins();
 }
 
 function actualizarClockAdmin(){let now=new Date(),utcMs=now.getTime()+now.getTimezoneOffset()*60000,peruMs=utcMs-5*3600000,peru=new Date(peruMs),h=peru.getHours(),m=peru.getMinutes(),ap=h>=12?'PM':'AM';h=h%12||12;document.getElementById('clock-admin').textContent=h+':'+String(m).padStart(2,'0')+' '+ap+' · LIMA';}
@@ -3677,7 +3829,32 @@ sorteos.forEach(s=>{let modoBadge=s.modo==='auto'?'<span class="modo-badge auto"
 html+='</tbody><tfoot><tr><td colspan="2" style="color:var(--gold)">TOTALES</td><td>S/'+totales.vendido.toFixed(2)+'</td><td style="color:var(--teal)">S/'+totales.presupuesto_70.toFixed(2)+'</td><td>—</td><td>—</td><td style="color:var(--red)">S/'+totales.premio_pagado.toFixed(2)+'</td><td>—</td><td style="color:var(--green)">S/'+totales.para_casa_30.toFixed(2)+'</td><td></td></tr></tfoot></table></div></div>';
 document.getElementById('res-7030').innerHTML=html;}).catch(e=>document.getElementById('res-7030').innerHTML='<div class="card"><div style="color:var(--red)">Error: '+e+'</div></div>');}
 
-function listarAgencias(){fetch('/admin/lista-agencias').then(r=>r.json()).then(ags=>{let html='';if(!ags.length){document.getElementById('ag-lista').innerHTML='<div style="color:var(--text2);text-align:center;padding:20px">Sin agencias</div>';return;}window._agMap={};ags.forEach(ag=>{window._agMap[ag.id]=ag.nombre_agencia;let topeStr=ag.tope_taquilla?'S/'+ag.tope_taquilla:'Sin limite';let bancoStr=ag.nombre_banco?'<div style="color:#a0b0c0;font-size:.68rem">Banco: '+ag.nombre_banco+'</div>':'';let estadoTag='<span class="tag '+(ag.activa?'ok':'err')+'">'+(ag.activa?'ACTIVA':'INACTIVA')+'</span>';html+='<div style="background:var(--card);border:1px solid var(--border);border-radius:4px;padding:10px;margin-bottom:8px"><div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px"><div><div style="color:var(--gold);font-weight:700">'+ag.nombre_agencia+'</div><div style="color:var(--text2);font-size:.72rem">'+ag.usuario+' | Com: '+(ag.comision*100).toFixed(0)+'% | Tope: '+topeStr+'</div>'+bancoStr+'</div><div>'+estadoTag+'</div></div><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:5px"><input id="nb-'+ag.id+'" placeholder="Banco" value="'+(ag.nombre_banco||'')+'" style="padding:4px;font-size:.7rem"><input id="pass-'+ag.id+'" placeholder="Nueva clave" type="password" style="padding:4px;font-size:.7rem"><input id="com-'+ag.id+'" placeholder="Comision%" value="'+(ag.comision*100).toFixed(0)+'" type="number" step="1" style="padding:4px;font-size:.7rem"><input id="tope-'+ag.id+'" placeholder="Tope taquilla" value="'+(ag.tope_taquilla||0)+'" type="number" step="10" style="padding:4px;font-size:.7rem"></div><div style="display:flex;gap:4px;margin-top:5px;flex-wrap:wrap"><button class="btn" style="padding:4px 10px;font-size:.65rem" onclick="editarAg('+ag.id+')">Guardar</button><button class="btn '+(ag.activa?'red':'green')+'" style="padding:4px 10px;font-size:.65rem" onclick="toggleAg('+ag.id+','+(ag.activa?0:1)+')">'+(ag.activa?'Suspender':'Activar')+'</button><button class="btn" style="padding:4px 10px;font-size:.65rem;background:#1a0a30;border-color:#a855f7;color:#c084fc" onclick="verReporteAgencia('+ag.id+')">Reporte</button><button class="btn red" style="padding:4px 10px;font-size:.65rem" onclick="eliminarAgencia('+ag.id+')">Eliminar</button></div></div>';});document.getElementById('ag-lista').innerHTML=html;});}
+function listarAgencias(){
+  var doRender=function(adminsMap){
+    fetch('/admin/lista-agencias').then(function(r){return r.json();}).then(function(ags){
+      var html='';
+      if(!ags.length){document.getElementById('ag-lista').innerHTML='<div style="color:var(--text2);text-align:center;padding:20px">Sin agencias</div>';return;}
+      window._agMap={};
+      ags.forEach(function(ag){
+        window._agMap[ag.id]=ag.nombre_agencia;
+        var topeStr=ag.tope_taquilla?'S/'+ag.tope_taquilla:'Sin limite';
+        var bancoStr=ag.nombre_banco?'<div style="color:#a0b0c0;font-size:.68rem">Banco: '+ag.nombre_banco+'</div>':'';
+        var estadoTag='<span class="tag '+(ag.activa?'ok':'err')+'">'+(ag.activa?'ACTIVA':'INACTIVA')+'</span>';
+        var duenoStr='',reasignStr='';
+        if(ES_SUPER){
+          var dnom=(adminsMap&&adminsMap[ag.admin_id])?adminsMap[ag.admin_id]:(ag.admin_id?('ID '+ag.admin_id):'Sin asignar');
+          duenoStr='<div style="color:#c084fc;font-size:.66rem">Dueno: '+dnom+'</div>';
+          var opts='';for(var k in adminsMap){opts+='<option value="'+k+'" '+(String(k)===String(ag.admin_id)?'selected':'')+'>'+adminsMap[k]+'</option>';}
+          reasignStr='<div style="display:flex;gap:4px;margin-top:5px;align-items:center"><span style="color:var(--text2);font-size:.62rem">Dueno:</span><select id="owner-'+ag.id+'" style="flex:1;padding:4px;font-size:.7rem">'+opts+'</select><button class="btn" style="padding:4px 10px;font-size:.65rem;background:#1a0a30;border-color:#a855f7;color:#c084fc" onclick="reasignarDueno('+ag.id+')">Reasignar</button></div>';
+        }
+        html+='<div style="background:var(--card);border:1px solid var(--border);border-radius:4px;padding:10px;margin-bottom:8px"><div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px"><div><div style="color:var(--gold);font-weight:700">'+ag.nombre_agencia+'</div><div style="color:var(--text2);font-size:.72rem">'+ag.usuario+' | Com: '+(ag.comision*100).toFixed(0)+'% | Tope: '+topeStr+'</div>'+bancoStr+duenoStr+'</div><div>'+estadoTag+'</div></div><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:5px"><input id="nb-'+ag.id+'" placeholder="Banco" value="'+(ag.nombre_banco||'')+'" style="padding:4px;font-size:.7rem"><input id="pass-'+ag.id+'" placeholder="Nueva clave" type="password" style="padding:4px;font-size:.7rem"><input id="com-'+ag.id+'" placeholder="Comision%" value="'+(ag.comision*100).toFixed(0)+'" type="number" step="1" style="padding:4px;font-size:.7rem"><input id="tope-'+ag.id+'" placeholder="Tope taquilla" value="'+(ag.tope_taquilla||0)+'" type="number" step="10" style="padding:4px;font-size:.7rem"></div>'+reasignStr+'<div style="display:flex;gap:4px;margin-top:5px;flex-wrap:wrap"><button class="btn" style="padding:4px 10px;font-size:.65rem" onclick="editarAg('+ag.id+')">Guardar</button><button class="btn '+(ag.activa?'red':'green')+'" style="padding:4px 10px;font-size:.65rem" onclick="toggleAg('+ag.id+','+(ag.activa?0:1)+')">'+(ag.activa?'Suspender':'Activar')+'</button><button class="btn" style="padding:4px 10px;font-size:.65rem;background:#1a0a30;border-color:#a855f7;color:#c084fc" onclick="verReporteAgencia('+ag.id+')">Reporte</button><button class="btn red" style="padding:4px 10px;font-size:.65rem" onclick="eliminarAgencia('+ag.id+')">Eliminar</button></div></div>';
+      });
+      document.getElementById('ag-lista').innerHTML=html;
+    });
+  };
+  if(ES_SUPER){fetch('/admin/lista-admins').then(function(r){return r.json();}).then(function(admins){var m={};admins.forEach(function(a){m[a.id]=a.nombre_agencia;});doRender(m);}).catch(function(){doRender({});});}
+  else{doRender({});}
+}
 function crearAgencia(){let u=document.getElementById('ag-user').value.trim(),p=document.getElementById('ag-pass').value.trim(),n=document.getElementById('ag-nombre').value.trim(),nb=document.getElementById('ag-banco').value.trim();if(!u||!p||!n){showMsg('msg-ag','Complete todos los campos requeridos','err');return;}let fd=new FormData();fd.append('usuario',u);fd.append('password',p);fd.append('nombre',n);fd.append('nombre_banco',nb);fetch('/admin/crear-agencia',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{if(d.status==='ok'){showMsg('msg-ag',d.mensaje,'ok');['ag-user','ag-pass','ag-nombre','ag-banco'].forEach(i=>document.getElementById(i).value='');listarAgencias();}else showMsg('msg-ag',d.error,'err');});}
 function editarAg(id){let data={id,nombre_banco:document.getElementById('nb-'+id).value,password:document.getElementById('pass-'+id).value,comision:parseFloat(document.getElementById('com-'+id).value)||0,tope_taquilla:parseFloat(document.getElementById('tope-'+id).value)||0};fetch('/admin/editar-agencia',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}).then(r=>r.json()).then(d=>{if(d.status==='ok')alert('✅ Guardado');else alert(d.error);listarAgencias();});}
 function toggleAg(id,activa){fetch('/admin/editar-agencia',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,activa})}).then(r=>r.json()).then(()=>listarAgencias());}
@@ -3756,6 +3933,10 @@ function actualizarEstadoToggle(estado){var btn=document.getElementById('toggle-
 function cargarEstadoAutoSorteo(){fetch('/admin/estado-autosorteo').then(function(r){return r.json();}).then(function(d){actualizarEstadoToggle(d.estado);}).catch(function(){});}
 function toggleAutoSorteo(){var btn=document.getElementById('toggle-auto-btn');var nuevoEstado=btn.classList.contains('on')?'off':'on';fetch('/admin/toggle-autosorteo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({estado:nuevoEstado})}).then(function(r){return r.json();}).then(function(d){if(d.status==='ok'){actualizarEstadoToggle(d.estado);showMsg('msg-res',d.mensaje,'ok');}else showMsg('msg-res',d.error||'Error','err');}).catch(function(){showMsg('msg-res','Error de conexión','err');});}
 
+function listarAdmins(){fetch('/admin/lista-admins').then(function(r){return r.json();}).then(function(admins){var html='';if(!admins.length){document.getElementById('adm-lista').innerHTML='<div style="color:var(--text2);text-align:center;padding:20px">Sin administradores</div>';return;}admins.forEach(function(a){var superTag=a.es_superadmin?'<span class="tag warn">SUPER</span>':'<span class="tag info">ADMIN</span>';var delBtn=a.es_superadmin?'':'<button class="btn red" style="padding:4px 10px;font-size:.65rem" onclick="eliminarAdmin('+a.id+',\''+String(a.nombre_agencia).replace(/\x27/g,"")+'\')">Eliminar</button>';html+='<div style="background:var(--card);border:1px solid var(--border);border-radius:4px;padding:10px;margin-bottom:8px"><div style="display:flex;justify-content:space-between;align-items:center"><div><div style="color:var(--gold);font-weight:700">'+a.nombre_agencia+' '+superTag+'</div><div style="color:var(--text2);font-size:.72rem">'+a.usuario+' &middot; '+a.agencias+' agencia(s)</div></div><div>'+delBtn+'</div></div></div>';});document.getElementById('adm-lista').innerHTML=html;}).catch(function(){});}
+function crearAdmin(){var u=document.getElementById('adm-user').value.trim(),p=document.getElementById('adm-pass').value.trim(),n=document.getElementById('adm-nombre').value.trim();if(!u||!p||!n){showMsg('msg-adm','Complete todos los campos','err');return;}var fd=new FormData();fd.append('usuario',u);fd.append('password',p);fd.append('nombre',n);fetch('/admin/crear-admin',{method:'POST',body:fd}).then(function(r){return r.json();}).then(function(d){if(d.status==='ok'){showMsg('msg-adm',d.mensaje,'ok');['adm-user','adm-pass','adm-nombre'].forEach(function(i){document.getElementById(i).value='';});listarAdmins();}else showMsg('msg-adm',d.error,'err');});}
+function eliminarAdmin(id,nombre){if(!confirm('Eliminar al administrador "'+nombre+'"?'))return;fetch('/admin/eliminar-admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})}).then(function(r){return r.json();}).then(function(d){if(d.status==='ok'){alert(d.mensaje);listarAdmins();}else alert(d.error);});}
+function reasignarDueno(id){var sel=document.getElementById('owner-'+id);if(!sel)return;fetch('/admin/editar-agencia',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id,admin_id:parseInt(sel.value)})}).then(function(r){return r.json();}).then(function(d){if(d.status==='ok'){alert('Dueno actualizado');listarAgencias();}else alert(d.error);});}
 function init(){
   let hoy=new Date().toISOString().split('T')[0];
   document.getElementById('res-fecha').value=hoy;
