@@ -1806,7 +1806,7 @@ def secuencia_sugerida():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/admin/guardar-resultado', methods=['POST'])
-@admin_required
+@superadmin_required
 def guardar_resultado():
     try:
         hora = request.form.get('hora','').strip()
@@ -1879,7 +1879,7 @@ def guardar_resultado():
         return jsonify({'error':str(e)}),500
 
 @app.route('/admin/borrar-resultado', methods=['POST'])
-@admin_required
+@superadmin_required
 def borrar_resultado():
     try:
         data = request.get_json() or {}
@@ -2084,7 +2084,7 @@ def desbloquear_tripleta():
 
 
 @app.route('/admin/reporte-7030', methods=['POST'])
-@admin_required
+@superadmin_required
 def reporte_7030():
     try:
         data = request.get_json() or {}
@@ -2436,7 +2436,7 @@ def get_topes():
         return jsonify({'error':str(e)}),500
 
 @app.route('/admin/topes/guardar', methods=['POST'])
-@admin_required
+@superadmin_required
 def guardar_tope():
     try:
         data = request.get_json() or {}
@@ -2468,7 +2468,7 @@ def guardar_tope():
         return jsonify({'error':str(e)}),500
 
 @app.route('/admin/topes/limpiar', methods=['POST'])
-@admin_required
+@superadmin_required
 def limpiar_topes():
     try:
         data = request.get_json() or {}
@@ -2486,7 +2486,7 @@ def limpiar_topes():
         return jsonify({'error':str(e)}),500
 
 @app.route('/admin/riesgo')
-@admin_required
+@superadmin_required
 def riesgo():
     try:
         hoy = ahora_peru().strftime("%d/%m/%Y")
@@ -2559,7 +2559,7 @@ def riesgo():
         return jsonify({'error':str(e)}),500
 
 @app.route('/admin/riesgo-agencia', methods=['POST'])
-@admin_required
+@superadmin_required
 def riesgo_agencia():
     try:
         data = request.get_json() or {}
@@ -3516,8 +3516,8 @@ input:focus,select:focus{outline:none;border-color:var(--blue)}
 </div>
 <div class="tabs">
   <div class="tab active" onclick="showTab('resultados')">📊 RESULTADOS</div>
-  <div class="tab" onclick="showTab('riesgo')">⚡ RIESGO</div>
-  <div class="tab" onclick="showTab('setentaytreinta')">📈 70/30</div>
+  <div class="tab"{% if not es_superadmin %} style="display:none"{% endif %} onclick="showTab('riesgo')">⚡ RIESGO</div>
+  <div class="tab"{% if not es_superadmin %} style="display:none"{% endif %} onclick="showTab('setentaytreinta')">📈 70/30</div>
   <div class="tab" onclick="showTab('agencias')">🏢 AGENCIAS</div>
   <div class="tab" onclick="showTab('topes')">🔒 TOPES</div>
   <div class="tab" onclick="showTab('reportes')">💼 REPORTES</div>
@@ -3528,7 +3528,7 @@ input:focus,select:focus{outline:none;border-color:var(--blue)}
 
 <!-- TAB RESULTADOS -->
 <div id="tc-resultados" class="tc active">
-  <div class="card">
+  <div class="card"{% if not es_superadmin %} style="display:none"{% endif %}>
     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px">
       <div class="card-title" style="border:none;padding:0;margin:0">📊 CARGAR RESULTADO</div>
       <div style="display:flex;align-items:center;gap:10px">
@@ -3663,7 +3663,7 @@ input:focus,select:focus{outline:none;border-color:var(--blue)}
       <div class="fg"><label>HORA</label><select id="tope-hora"></select></div>
       <div class="fg" style="align-self:flex-end">
         <button class="btn" onclick="cargarTopes()">VER TOPES</button>
-        <button class="btn red" style="margin-left:6px" onclick="limpiarTopes()">LIMPIAR TODO</button>
+        {% if es_superadmin %}<button class="btn red" style="margin-left:6px" onclick="limpiarTopes()">LIMPIAR TODO</button>{% endif %}
       </div>
     </div>
     <div id="topes-body"></div>
@@ -3863,10 +3863,9 @@ function verReporteAgencia(id){let nombre=window._agMap&&window._agMap[id]?windo
 
 function selLotTopes(l){lotTopes=l;document.getElementById('lot-topes-peru').classList.toggle('active',l==='peru');document.getElementById('lot-topes-plus').classList.toggle('active',l==='plus');fillHorasTopes();cargarTopes();}
 function fillHorasTopes(){let s=document.getElementById('tope-hora'),lista=lotTopes==='plus'?HPLUS:HPERU;s.innerHTML=lista.map(x=>'<option value="'+x+'">'+x+'</option>').join('');}
-function cargarTopes(){let hora=document.getElementById('tope-hora').value,lot=lotTopes;fetch('/admin/topes?hora='+encodeURIComponent(hora)+'&loteria='+lot).then(r=>r.json()).then(d=>{if(d.error){document.getElementById('topes-body').innerHTML='<div style="color:var(--red)">'+d.error+'</div>';return;}let html='<table class="tbl"><thead><tr><th>N°</th><th>Animal</th><th>Apostado Hoy</th><th>Tope</th><th>Disponible</th><th>Acción</th></tr></thead><tbody>';ORDEN.forEach(k=>{if(!ANIMALES[k])return;let t=d.topes.find(x=>x.numero===k);let apt=t?t.apostado:0,tope=t?t.tope:0,disp=t?t.disponible:null;let dispStr=disp!==null?'<span style="color:'+(disp<10?'var(--red)':disp<50?'var(--gold)':'var(--green)')+';font-family:\'Oswald\',sans-serif">S/'+disp.toFixed(2)+'</span>':'<span class="tag info">LIBRE</span>';html+='<tr><td style="font-family:\'Oswald\',sans-serif;color:var(--gold)">'+k+'</td><td>'+ANIMALES[k]+'</td><td style="color:var(--teal);font-family:\'Oswald\',sans-serif">'+(apt>0?'S/'+apt.toFixed(2):'—')+'</td><td><input type="number" id="tope-monto-'+k+'" value="'+(tope||'')+'" placeholder="Sin tope" style="width:90px;padding:4px;font-size:.75rem" min="0" step="5"></td><td>'+dispStr+'</td><td><button class="btn" style="padding:3px 8px;font-size:.65rem" onclick="guardarTope(\''+k+'\',\''+hora+'\',\''+lot+'\')">💾</button>'+(tope>0?'<button class="btn red" style="padding:3px 8px;font-size:.65rem;margin-left:4px" onclick="liberarTope(\''+k+'\',\''+hora+'\',\''+lot+'\')">✕</button>':'&nbsp;')+'</td></tr>';});html+='</tbody></table>';document.getElementById('topes-body').innerHTML=html;});}
-function guardarTope(num,hora,lot){let monto=parseFloat(document.getElementById('tope-monto-'+num).value)||0;fetch('/admin/topes/guardar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hora,numero:num,monto,loteria:lot})}).then(r=>r.json()).then(d=>{if(d.status==='ok')cargarTopes();else alert(d.error);});}
-function liberarTope(num,hora,lot){fetch('/admin/topes/guardar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hora,numero:num,monto:0,loteria:lot})}).then(r=>r.json()).then(d=>{if(d.status==='ok')cargarTopes();});}
-function limpiarTopes(){let hora=document.getElementById('tope-hora').value,lot=lotTopes;if(!confirm('¿Eliminar TODOS los topes de '+hora+' ('+lot+')?'))return;fetch('/admin/topes/limpiar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hora,loteria:lot})}).then(r=>r.json()).then(d=>{if(d.status==='ok')cargarTopes();else alert(d.error);});}
+function cargarTopes(){let hora=document.getElementById('tope-hora').value,lot=lotTopes;fetch('/admin/topes?hora='+encodeURIComponent(hora)+'&loteria='+lot).then(r=>r.json()).then(d=>{if(d.error){document.getElementById('topes-body').innerHTML='<div style="color:var(--red)">'+d.error+'</div>';return;}let html='<table class="tbl"><thead><tr><th>N°</th><th>Animal</th><th>Apostado Hoy</th><th>Tope</th><th>Disponible</th>'+(ES_SUPER?'<th>Acción</th>':'')+'</tr></thead><tbody>';ORDEN.forEach(k=>{if(!ANIMALES[k])return;let t=d.topes.find(x=>x.numero===k);let apt=t?t.apostado:0,tope=t?t.tope:0,disp=t?t.disponible:null;let dispStr=disp!==null?'<span style="color:'+(disp<10?'var(--red)':disp<50?'var(--gold)':'var(--green)')+';font-family:\'Oswald\',sans-serif">S/'+disp.toFixed(2)+'</span>':'<span class="tag info">LIBRE</span>';html+='<tr><td style="font-family:\'Oswald\',sans-serif;color:var(--gold)">'+k+'</td><td>'+ANIMALES[k]+'</td><td style="color:var(--teal);font-family:\'Oswald\',sans-serif">'+(apt>0?'S/'+apt.toFixed(2):'—')+'</td><td>'+(ES_SUPER?('<input type="number" id="tope-monto-'+k+'" value="'+(tope||'')+'" placeholder="Sin tope" style="width:90px;padding:4px;font-size:.75rem" min="0" step="5">'):('<span style="font-family:Oswald,sans-serif;color:var(--gold)">'+(tope>0?'S/'+tope.toFixed(2):'—')+'</span>'))+'</td><td>'+dispStr+'</td>'+(ES_SUPER?('<td><button class="btn" style="padding:3px 8px;font-size:.65rem" onclick="guardarTope(\''+k+'\',\''+hora+'\',\''+lot+'\')">💾</button>'+(tope>0?'<button class="btn red" style="padding:3px 8px;font-size:.65rem;margin-left:4px" onclick="liberarTope(\''+k+'\',\''+hora+'\',\''+lot+'\')">✕</button>':'&nbsp;')+'</td>'):'')+'</tr>';});html+='</tbody></table>';document.getElementById('topes-body').innerHTML=html;});}function guardarTope(num,hora,lot){if(!ES_SUPER){alert('Solo el administrador principal puede modificar topes');return;}let monto=parseFloat(document.getElementById('tope-monto-'+num).value)||0;fetch('/admin/topes/guardar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hora,numero:num,monto,loteria:lot})}).then(r=>r.json()).then(d=>{if(d.status==='ok')cargarTopes();else alert(d.error);});}
+function liberarTope(num,hora,lot){if(!ES_SUPER)return;fetch('/admin/topes/guardar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hora,numero:num,monto:0,loteria:lot})}).then(r=>r.json()).then(d=>{if(d.status==='ok')cargarTopes();});}
+function limpiarTopes(){if(!ES_SUPER){alert('Solo el administrador principal puede modificar topes');return;}let hora=document.getElementById('tope-hora').value,lot=lotTopes;if(!confirm('¿Eliminar TODOS los topes de '+hora+' ('+lot+')?'))return;fetch('/admin/topes/limpiar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hora,loteria:lot})}).then(r=>r.json()).then(d=>{if(d.status==='ok')cargarTopes();else alert(d.error);});}
 
 function cargarReporteHoy(){fetch('/admin/reporte-agencias').then(r=>r.json()).then(d=>{let html='<table class="tbl"><thead><tr><th>Agencia</th><th>Tickets</th><th>Ventas</th><th>Premios Pagados</th><th>Pendientes</th><th>Total Premios</th><th>Comision</th><th>Balance</th></tr></thead><tbody>';d.agencias.forEach(a=>{let bc=a.balance>=0?'var(--green)':'var(--red)';let pend=a.premios_pendientes||0;html+='<tr><td><span style="color:var(--gold)">'+a.nombre+'</span><br><span style="color:var(--text2);font-size:.65rem">'+a.usuario+'</span></td><td>'+a.tickets+'</td><td>S/'+a.ventas.toFixed(2)+'</td><td style="color:var(--red)">S/'+a.premios_pagados.toFixed(2)+'</td><td style="color:var(--gold)">'+(pend>0?'S/'+pend.toFixed(2):'—')+'</td><td style="color:var(--red);font-weight:700">S/'+a.premios_total.toFixed(2)+'</td><td>S/'+a.comision.toFixed(2)+'</td><td style="color:'+bc+';font-weight:700">S/'+a.balance.toFixed(2)+'</td></tr>';});html+='<tfoot><tr><td colspan="2" style="color:var(--gold)">GLOBAL</td><td>S/'+d.global.ventas.toFixed(2)+'</td><td style="color:var(--red)">S/'+d.global.pagos.toFixed(2)+'</td><td></td><td></td><td>S/'+d.global.comisiones.toFixed(2)+'</td><td style="color:'+(d.global.balance>=0?'var(--green)':'var(--red)')+';font-weight:700">S/'+d.global.balance.toFixed(2)+'</td></tr></tfoot></table>';document.getElementById('rep-hoy').innerHTML=html;document.getElementById('btn-csv').disabled=false;document.getElementById('btn-csv').style.opacity=1;});}
 function cargarEstadisticas(){let ini=document.getElementById('rep-ini').value,fin=document.getElementById('rep-fin').value;if(!ini||!fin){alert('Seleccione fechas');return;}fetch('/admin/estadisticas-rango',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json()).then(d=>{let t=d.totales;let vAnim=Math.round((t.ventas-(t.tripletas||0))*100)/100;let html='<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin:12px 0"><div class="stat-box"><div class="stat-label">VENTAS ANIMALES</div><div class="stat-val">S/'+vAnim.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">TRIPLETAS</div><div class="stat-val" style="color:#c084fc">S/'+(t.tripletas||0).toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">TOTAL INGRESOS</div><div class="stat-val" style="color:var(--gold)">S/'+t.ventas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PREMIOS</div><div class="stat-val r">S/'+t.premios.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">COMISIONES</div><div class="stat-val">S/'+t.comisiones.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">BALANCE</div><div class="stat-val" style="color:'+(t.balance>=0?'var(--green)':'var(--red)')+'">S/'+t.balance.toFixed(2)+'</div></div></div>';html+='<table class="tbl"><thead><tr><th>Fecha</th><th>Tickets</th><th>V.Animales</th><th style="color:#c084fc">Tripletas</th><th style="color:var(--gold)">Total</th><th>Premios</th><th>Comisiones</th><th>Balance</th></tr></thead><tbody>';d.resumen_por_dia.forEach(function(r){var bc=r.balance>=0?'var(--green)':'var(--red)';var va=Math.round((r.ventas-(r.tripletas||0))*100)/100;html+='<tr><td>'+r.fecha+'</td><td>'+r.tickets+'</td><td>S/'+va.toFixed(2)+'</td><td style="color:#c084fc">S/'+(r.tripletas||0).toFixed(2)+'</td><td style="color:var(--gold);font-weight:700">S/'+r.ventas.toFixed(2)+'</td><td style="color:var(--red)">S/'+r.premios.toFixed(2)+'</td><td>S/'+r.comisiones.toFixed(2)+'</td><td style="color:'+bc+';font-weight:700">S/'+r.balance.toFixed(2)+'</td></tr>';});html+='</tbody></table>';document.getElementById('rep-periodo').innerHTML=html;});}
