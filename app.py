@@ -2030,7 +2030,7 @@ def bloqueos_estado():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/admin/desbloquear-historico', methods=['POST'])
-@admin_required
+@superadmin_required
 def desbloquear_historico():
     """
     Desbloquea un número del bloqueo histórico.
@@ -2064,7 +2064,7 @@ def desbloquear_historico():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/admin/desbloquear-tripleta', methods=['POST'])
-@admin_required
+@superadmin_required
 def desbloquear_tripleta():
     try:
         data = request.get_json() or {}
@@ -2986,7 +2986,7 @@ def get_numeros_bloqueados():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/admin/numeros-bloqueados/toggle', methods=['POST'])
-@admin_required
+@superadmin_required
 def toggle_numero_bloqueado():
     try:
         data = request.get_json() or {}
@@ -3567,7 +3567,7 @@ input:focus,select:focus{outline:none;border-color:var(--blue)}
   </div>
 
   <!-- NUEVO v4.1: Panel de bloqueos automáticos -->
-  <div class="card">
+  <div class="card"{% if not es_superadmin %} style="display:none"{% endif %}>
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
       <div class="card-title" style="border:none;padding:0;margin:0">🔐 BLOQUEOS AUTOMÁTICOS HOY</div>
       <button class="btn" style="padding:4px 10px;font-size:.65rem" onclick="cargarBloqueos()">🔄 Actualizar</button>
@@ -3890,6 +3890,7 @@ function toggleBloqueado(numero){fetch('/admin/numeros-bloqueados/toggle',{metho
 function selLotBloqAuto(lot){_lotBloqAuto=lot;document.getElementById('lot-bloq-auto-peru').classList.toggle('active',lot==='peru');document.getElementById('lot-bloq-auto-plus').classList.toggle('active',lot==='plus');cargarBloqueos();}
 
 function cargarBloqueos(){
+  if(!ES_SUPER)return;
   fetch('/admin/bloqueos-estado?loteria='+_lotBloqAuto)
     .then(function(r){return r.json();})
     .then(function(d){
