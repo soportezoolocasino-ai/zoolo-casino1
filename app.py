@@ -2486,7 +2486,7 @@ def limpiar_topes():
         return jsonify({'error':str(e)}),500
 
 @app.route('/admin/riesgo')
-@superadmin_required
+@admin_required
 def riesgo():
     try:
         hoy = ahora_peru().strftime("%d/%m/%Y")
@@ -2559,7 +2559,7 @@ def riesgo():
         return jsonify({'error':str(e)}),500
 
 @app.route('/admin/riesgo-agencia', methods=['POST'])
-@superadmin_required
+@admin_required
 def riesgo_agencia():
     try:
         data = request.get_json() or {}
@@ -3117,42 +3117,6 @@ body{background:#050a12;min-height:100vh;display:flex;align-items:center;justify
 <div class="box">
 <div class="logo">ZOO<em>LO</em></div>
 <div class="sub">SISTEMA DE APUESTAS</div>
-{% if error %}<div class="err">⚠ {{error}}</div>{% endif %}
-<form method="POST">
-<div class="fg"><label>USUARIO</label><input type="text" name="usuario" required autofocus autocomplete="off"></div>
-<div class="fg"><label>CONTRASEÑA</label><input type="password" name="password" required></div>
-<button type="submit" class="btn">INGRESAR</button>
-</form>
-</div></body></html>'''
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# HTML TEMPLATES
-# ═══════════════════════════════════════════════════════════════════════════════
-
-LOGIN_HTML = '''<!DOCTYPE html>
-<html><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ZOOLO CASINO</title>
-<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;700&family=Rajdhani:wght@500;600&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:#050a12;min-height:100vh;display:flex;align-items:center;justify-content:center;font-family:'Rajdhani',sans-serif}
-.box{background:#0a1020;padding:44px 36px;border-radius:8px;border:1px solid #1e3060;width:100%;max-width:400px;text-align:center;box-shadow:0 0 60px rgba(0,80,200,.1)}
-.logo{font-family:'Oswald',sans-serif;font-size:2.6rem;font-weight:700;color:#fff;letter-spacing:4px;margin-bottom:4px}
-.logo em{color:#f5a623;font-style:normal}
-.sub{color:#3a5080;font-size:.8rem;letter-spacing:3px;margin-bottom:36px}
-.fg{margin-bottom:18px;text-align:left}
-.fg label{display:block;color:#3a5080;font-size:.78rem;letter-spacing:2px;margin-bottom:6px}
-.fg input{width:100%;padding:13px 16px;background:#060e1e;border:1px solid #1e3060;border-radius:4px;color:#7ab0ff;font-size:.95rem;font-family:'Rajdhani',sans-serif;letter-spacing:1px}
-.fg input:focus{outline:none;border-color:#2060d0;box-shadow:0 0 16px rgba(32,96,208,.15)}
-.btn{width:100%;padding:15px;background:linear-gradient(135deg,#1a4cd0,#0d32a0);color:#fff;border:none;border-radius:4px;font-size:.95rem;font-weight:700;font-family:'Oswald',sans-serif;letter-spacing:3px;cursor:pointer;margin-top:8px;transition:all .3s}
-.btn:hover{background:linear-gradient(135deg,#2060e8,#1440c0);box-shadow:0 6px 20px rgba(20,64,200,.3)}
-.err{background:rgba(200,40,40,.1);color:#e05050;padding:11px;border-radius:4px;margin-bottom:16px;border:1px solid rgba(200,40,40,.2);font-size:.85rem}
-</style></head><body>
-<div class="box">
-<div class="logo">ZOO<em>LO</em></div>
-<div class="sub">SISTEMA DE APUESTAS</div>
 {% if error %}<div class="err">&#9888; {{error}}</div>{% endif %}
 <form method="POST">
 <div class="fg"><label>USUARIO</label><input type="text" name="usuario" required autofocus autocomplete="off"></div>
@@ -3511,12 +3475,13 @@ input:focus,select:focus{outline:none;border-color:var(--blue)}
   <div class="brand">ZOO<em>LO</em> <span style="font-size:.75rem;color:var(--text2);font-weight:400;letter-spacing:1px">ADMIN v4.1</span></div>
   <div style="display:flex;gap:6px">
     <div id="clock-admin" style="color:var(--gold);font-family:'Oswald',sans-serif;font-size:.8rem;background:var(--card);padding:4px 10px;border-radius:3px;border:1px solid var(--border)">--:-- LIMA</div>
+    <button class="tbtn" style="background:#4a0808;border-color:var(--red);color:var(--red)" onclick="anularTicketAdmin()">ANULAR TICKET</button>
     <button class="tbtn exit" onclick="location.href='/logout'">SALIR</button>
   </div>
 </div>
 <div class="tabs">
   <div class="tab active" onclick="showTab('resultados')">📊 RESULTADOS</div>
-  <div class="tab"{% if not es_superadmin %} style="display:none"{% endif %} onclick="showTab('riesgo')">⚡ RIESGO</div>
+  <div class="tab" onclick="showTab('riesgo')">⚡ RIESGO</div>
   <div class="tab"{% if not es_superadmin %} style="display:none"{% endif %} onclick="showTab('setentaytreinta')">📈 70/30</div>
   <div class="tab" onclick="showTab('agencias')">🏢 AGENCIAS</div>
   <div class="tab" onclick="showTab('topes')">🔒 TOPES</div>
@@ -3763,6 +3728,19 @@ function showTab(id){
 
 function actualizarClockAdmin(){let now=new Date(),utcMs=now.getTime()+now.getTimezoneOffset()*60000,peruMs=utcMs-5*3600000,peru=new Date(peruMs),h=peru.getHours(),m=peru.getMinutes(),ap=h>=12?'PM':'AM';h=h%12||12;document.getElementById('clock-admin').textContent=h+':'+String(m).padStart(2,'0')+' '+ap+' · LIMA';}
 setInterval(actualizarClockAdmin,1000);actualizarClockAdmin();
+
+function anularTicketAdmin(){
+  let serial = prompt('Ingrese el SERIAL del ticket a anular:');
+  if(!serial) return;
+  serial = serial.trim();
+  if(!serial) return;
+  if(!confirm('¿Confirma ANULAR el ticket '+serial+'? Esta acción no se puede deshacer.')) return;
+  fetch('/api/anular-ticket',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({serial:serial})})
+    .then(r=>r.json()).then(d=>{
+      if(d.status==='ok'){ alert('✅ '+d.mensaje); }
+      else { alert('❌ '+(d.error||'Error al anular')); }
+    }).catch(()=>alert('Error de conexión'));
+}
 
 let _secuencias={'peru':[],'plus':[]};
 function renderAMG(){let g=document.getElementById('amg');g.innerHTML='';ORDEN.forEach(k=>{if(!ANIMALES[k])return;let d=document.createElement('div');d.className='amg-card'+(k===animalSel?' sel':'');d.innerHTML='<div class="anum">'+k+'</div><div class="anom">'+ANIMALES[k].substring(0,5)+'</div>';d.onclick=()=>{animalSel=k;renderAMG();document.getElementById('animal-sel-preview').textContent='✅ '+k+' — '+ANIMALES[k];};g.appendChild(d);});}
