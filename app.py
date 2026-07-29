@@ -2503,41 +2503,6 @@ def lista_agencias():
         rows = _filtrar_ags(rows)
     return jsonify([dict(r) for r in rows])
 
-# ── PARCHE TEMPORAL: reparar agencias huérfanas (admin_id=0) ──────────────────
-# Usar UNA vez desde la consola del navegador logueado como cuborubi:
-#   fetch('/admin/reparar-admin-id-huerfanas', {method:'POST'}).then(r=>r.json()).then(console.log)
-# Después de confirmar que las agencias reaparecieron, BORRAR esta ruta.
-@app.route('/admin/reparar-admin-id-huerfanas', methods=['POST'])
-@superadmin_required
-def reparar_admin_id_huerfanas():
-    """
-    Ruta de mantenimiento (usar UNA VEZ y borrar después).
-    Reasigna al superadmin actual todas las agencias que quedaron
-    con admin_id=0 tras la migración multi-admin (agencias 'huérfanas').
-    Esto es lo que causaba que "desaparecieran" agencias viejas: la
-    migración les puso admin_id=0 por defecto, y ningún admin tiene
-    ese ID, así que el filtro por administrador las escondía de todas
-    las vistas (incluso 'ver como').
-    """
-    try:
-        with get_db() as db:
-            huerfanas = db.execute(
-                "SELECT id, nombre_agencia, usuario FROM agencias WHERE es_admin=0 AND (admin_id=0 OR admin_id IS NULL)"
-            ).fetchall()
-            if not huerfanas:
-                return jsonify({'status':'ok','mensaje':'No hay agencias huérfanas. Nada que reparar.'})
-            db.execute(
-                "UPDATE agencias SET admin_id=%s WHERE es_admin=0 AND (admin_id=0 OR admin_id IS NULL)",
-                (session['user_id'],)
-            )
-            db.commit()
-        nombres = [f"{h['nombre_agencia']} ({h['usuario']})" for h in huerfanas]
-        log_audit('REPARAR_ADMIN_ID', f"{len(huerfanas)} agencias reasignadas: {', '.join(nombres)}")
-        return jsonify({'status':'ok','mensaje':f'{len(huerfanas)} agencia(s) recuperada(s)','agencias':nombres})
-    except Exception as e:
-        return jsonify({'error':str(e)}),500
-# ────────────────────────────────────────────────────────────────────────────
-
 @app.route('/admin/crear-agencia', methods=['POST'])
 @admin_required
 def crear_agencia():
