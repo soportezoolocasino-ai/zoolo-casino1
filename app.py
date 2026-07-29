@@ -281,6 +281,39 @@ def _sql(pg_sql, sqlite_sql=None):
 TS_DEFAULT_PG = "DEFAULT (to_char(now(), 'YYYY-MM-DD HH24:MI:SS'))"
 TS_DEFAULT_SQ = "DEFAULT (datetime('now'))"
 
+SIMBOLO_MONEDA = {'peru': 'S/', 'plus': 'Bs'}
+def simbolo(loteria):
+    return SIMBOLO_MONEDA.get(loteria, 'S/')
+
+def _backfill_totales_moneda():
+    """
+    Rellena total_peru/total_plus para tickets antiguos que se crearon
+    antes de que existieran estas columnas (sumando sus jugadas y
+    tripletas agrupadas por lotería). Es seguro correrlo varias veces:
+    solo toca tickets que todavía no tienen el desglose calculado.
+    """
+    with get_db() as db:
+        pendientes = db.execute("""
+            SELECT id FROM tickets
+            WHERE (total_peru IS NULL OR total_peru=0)
+              AND (total_plus IS NULL OR total_plus=0)
+              AND total>0
+            LIMIT 5000
+        """).fetchall()
+        if not pendientes:
+            return
+        for r in pendientes:
+            tid = r['id']
+            jp = db.execute("SELECT COALESCE(SUM(monto),0) as m FROM jugadas WHERE ticket_id=%s AND loteria='peru'", (tid,)).fetchone()['m']
+            jl = db.execute("SELECT COALESCE(SUM(monto),0) as m FROM jugadas WHERE ticket_id=%s AND loteria='plus'", (tid,)).fetchone()['m']
+            tp = db.execute("SELECT COALESCE(SUM(monto),0) as m FROM tripletas WHERE ticket_id=%s AND loteria='peru'", (tid,)).fetchone()['m']
+            tl = db.execute("SELECT COALESCE(SUM(monto),0) as m FROM tripletas WHERE ticket_id=%s AND loteria='plus'", (tid,)).fetchone()['m']
+            tot_peru = round(float(jp) + float(tp), 2)
+            tot_plus = round(float(jl) + float(tl), 2)
+            db.execute("UPDATE tickets SET total_peru=%s, total_plus=%s WHERE id=%s", (tot_peru, tot_plus, tid))
+        db.commit()
+        logger.info(f"[BACKFILL] {len(pendientes)} tickets actualizados con total_peru/total_plus")
+
 def init_db():
     with get_db() as db:
         ts = TS_DEFAULT_SQ if USE_SQLITE else TS_DEFAULT_PG
@@ -386,6 +419,8 @@ def init_db():
             "ALTER TABLE topes ADD COLUMN loteria TEXT NOT NULL DEFAULT 'peru'",
             "ALTER TABLE jugadas ADD COLUMN loteria TEXT NOT NULL DEFAULT 'peru'",
             "ALTER TABLE tripletas ADD COLUMN loteria TEXT NOT NULL DEFAULT 'peru'",
+            "ALTER TABLE tickets ADD COLUMN total_peru REAL DEFAULT 0",
+            "ALTER TABLE tickets ADD COLUMN total_plus REAL DEFAULT 0",
         ]
         for sql in migraciones:
             try:
@@ -394,6 +429,11 @@ def init_db():
                     db_mig.commit()
             except Exception:
                 pass
+
+        try:
+            _backfill_totales_moneda()
+        except Exception as e:
+            logger.error(f"[BACKFILL] Error al iniciar: {e}")
 
         db.execute("""INSERT OR IGNORE INTO config_sistema (clave, valor)
             VALUES ('auto_sorteo', 'off')""" if USE_SQLITE else """INSERT INTO config_sistema (clave, valor)
@@ -465,15 +505,16 @@ def resultados_validos_para_tripleta(resultados_dia, hora_compra_ticket):
     min_compra = hora_compra_ticket.hour * 60 + hora_compra_ticket.minute
     return {h: a for h, a in resultados_dia.items() if hora_a_min(h) >= min_compra}
 
-def calcular_premio_ticket(ticket_id, db=None):
+def calcular_premio_ticket_split(ticket_id, db=None):
+    """Igual que calcular_premio_ticket, pero devuelve {'peru':X,'plus':Y} sin mezclar monedas."""
     close = False
     if db is None:
         db = get_db(); close = True
     try:
         t = db.execute("SELECT fecha FROM tickets WHERE id=%s", (ticket_id,)).fetchone()
-        if not t: return 0
+        if not t: return {'peru': 0.0, 'plus': 0.0}
         fecha_ticket = parse_fecha(t['fecha'])
-        if not fecha_ticket: return 0
+        if not fecha_ticket: return {'peru': 0.0, 'plus': 0.0}
         fecha_str = fecha_ticket.strftime("%d/%m/%Y")
 
         res_rows_peru = db.execute(
@@ -485,7 +526,7 @@ def calcular_premio_ticket(ticket_id, db=None):
         resultados_peru = {r['hora']: r['animal'] for r in res_rows_peru}
         resultados_plus = {r['hora']: r['animal'] for r in res_rows_plus}
 
-        total = 0
+        total = {'peru': 0.0, 'plus': 0.0}
         jugadas = db.execute("SELECT * FROM jugadas WHERE ticket_id=%s", (ticket_id,)).fetchall()
         for j in jugadas:
             lot_j = j['loteria'] if 'loteria' in j.keys() else 'peru'
@@ -493,14 +534,14 @@ def calcular_premio_ticket(ticket_id, db=None):
             wa = res_dia.get(j['hora'])
             if not wa: continue
             if j['tipo']=='animal' and str(wa)==str(j['seleccion']):
-                total += calcular_premio_animal(j['monto'], wa)
+                total[lot_j] += calcular_premio_animal(j['monto'], wa)
             elif j['tipo']=='especial' and str(wa) not in ["0","00"]:
                 sel, num = j['seleccion'], int(wa)
                 if (sel=='ROJO' and str(wa) in ROJOS) or \
                    (sel=='NEGRO' and str(wa) not in ROJOS) or \
                    (sel=='PAR' and num%2==0) or \
                    (sel=='IMPAR' and num%2!=0):
-                    total += j['monto'] * PAGO_ESPECIAL
+                    total[lot_j] += j['monto'] * PAGO_ESPECIAL
 
         res_validos_peru = resultados_validos_para_tripleta(resultados_peru, fecha_ticket)
         res_validos_plus = resultados_validos_para_tripleta(resultados_plus, fecha_ticket)
@@ -511,10 +552,15 @@ def calcular_premio_ticket(ticket_id, db=None):
             nums = {tr['animal1'], tr['animal2'], tr['animal3']}
             salidos = {a for a in res_validos.values() if a in nums}
             if len(salidos)==3:
-                total += tr['monto'] * PAGO_TRIPLETA
-        return total
+                total[lot_tr] += tr['monto'] * PAGO_TRIPLETA
+        return {'peru': round(total['peru'], 2), 'plus': round(total['plus'], 2)}
     finally:
         if close: db.close()
+
+def calcular_premio_ticket(ticket_id, db=None):
+    """Compatibilidad: suma combinada (úsese solo donde de verdad no importe separar moneda)."""
+    d = calcular_premio_ticket_split(ticket_id, db)
+    return d['peru'] + d['plus']
 
 # ─── Config sistema ──────────────────────────────────────────────────────────
 def get_config(clave, default='off'):
@@ -1079,33 +1125,70 @@ def superadmin_required(f):
         return f(*a,**k)
     return d
 
-def _ids_agencias_admin(db):
-    """IDs de agencias del admin actual. Superadmin -> None (ve todas)."""
-    if session.get('es_superadmin'):
+def _ver_como_param():
+    """Lee el parámetro 'ver_como' de query string o del body JSON, si viene."""
+    v = request.args.get('ver_como')
+    if v:
+        return v
+    try:
+        data = request.get_json(silent=True) or {}
+        return data.get('ver_como')
+    except Exception:
         return None
+
+def _efectivo_admin_id():
+    """
+    ID del administrador cuyas agencias/datos deben mostrarse.
+    - Admin normal: siempre su propio ID (nunca puede ver a otro).
+    - Superadmin: su propio ID por defecto (SUS agencias, no las de nadie más).
+      Si manda 'ver_como' con el ID de otro administrador, ve las agencias
+      de ESE administrador, en modo exclusivamente de lectura.
+    """
+    uid = session.get('user_id')
+    if session.get('es_superadmin'):
+        v = _ver_como_param()
+        if v:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return uid
+        return uid
+    return uid
+
+def _es_modo_solo_lectura():
+    """True si el superadmin está 'viendo como' otro administrador (no puede mutar nada)."""
+    if not session.get('es_superadmin'):
+        return False
+    v = _ver_como_param()
+    if not v:
+        return False
+    try:
+        return int(v) != session.get('user_id')
+    except (TypeError, ValueError):
+        return False
+
+def _ids_agencias_admin(db):
+    """IDs de agencias del administrador efectivo (propio, o el que se está 'viendo como')."""
+    aid = _efectivo_admin_id()
     rows = db.execute("SELECT id FROM agencias WHERE es_admin=0 AND admin_id=%s",
-                      (session.get('user_id'),)).fetchall()
+                      (aid,)).fetchall()
     return [r['id'] for r in rows]
 
 def _filtrar_ags(rows):
-    """Filtra una lista de filas de agencias dejando solo las del admin actual."""
-    if session.get('es_superadmin'):
-        return rows
-    uid = session.get('user_id')
+    """Filtra una lista de filas de agencias dejando solo las del administrador efectivo."""
+    aid = _efectivo_admin_id()
     out = []
     for r in rows:
         try:
             owner = r['admin_id'] if 'admin_id' in r.keys() else 0
         except Exception:
             owner = 0
-        if owner == uid:
+        if owner == aid:
             out.append(r)
     return out
 
 def _scope_and(db, alias='tk'):
-    """Devuelve (fragmento_sql, params) para limitar por agencias del admin."""
-    if session.get('es_superadmin'):
-        return '', []
+    """Devuelve (fragmento_sql, params) para limitar por agencias del administrador efectivo."""
     ids = _ids_agencias_admin(db)
     if not ids:
         return ' AND 1=0', []
@@ -1240,6 +1323,8 @@ def procesar_venta():
         hoy = ahora_peru().strftime("%d/%m/%Y")
         agencia_id = session['user_id']
         total = sum(j['monto'] for j in jugadas)
+        total_peru = round(sum(j['monto'] for j in jugadas_peru), 2)
+        total_plus = round(sum(j['monto'] for j in jugadas_plus), 2)
 
         with get_db() as db:
             ag = db.execute("SELECT tope_taquilla, comision FROM agencias WHERE id=%s", (agencia_id,)).fetchone()
@@ -1276,13 +1361,13 @@ def procesar_venta():
             fecha  = ahora_peru().strftime("%d/%m/%Y %I:%M %p")
 
             if USE_SQLITE:
-                db.execute("INSERT INTO tickets (serial,agencia_id,fecha,total) VALUES (?,?,?,?)",
-                    (serial, agencia_id, fecha, total))
+                db.execute("INSERT INTO tickets (serial,agencia_id,fecha,total,total_peru,total_plus) VALUES (?,?,?,?,?,?)",
+                    (serial, agencia_id, fecha, total, total_peru, total_plus))
                 ticket_id = db._cur.lastrowid
             else:
                 db._cur.execute(
-                    "INSERT INTO tickets (serial,agencia_id,fecha,total) VALUES (%s,%s,%s,%s) RETURNING id",
-                    (serial, agencia_id, fecha, total))
+                    "INSERT INTO tickets (serial,agencia_id,fecha,total,total_peru,total_plus) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
+                    (serial, agencia_id, fecha, total, total_peru, total_plus))
                 ticket_id = db._cur.fetchone()[0]
 
             for j in jugadas:
@@ -1390,8 +1475,12 @@ def procesar_venta():
                 lineas.append("  TRIPLETA: " + " - ".join(partes) + f" x {fmt(t['monto'])} SL")
             lineas.append("-------------------------------")
 
-        lineas += ["------------------------",
-                   f"*TOTAL: S/{fmt(total)}*",
+        totales_lineas = ["------------------------"]
+        if total_peru > 0:
+            totales_lineas.append(f"*TOTAL PERU: S/{fmt(total_peru)}*")
+        if total_plus > 0:
+            totales_lineas.append(f"*TOTAL PLUS: Bs{fmt(total_plus)}*")
+        lineas += totales_lineas + [
                    "",
                    "Buena Suerte! 🍀",
                    "El ticket vence a los 3 dias"]
@@ -1406,6 +1495,8 @@ def procesar_venta():
             'serial':serial,
             'ticket_id':ticket_id,
             'total':total,
+            'total_peru':total_peru,
+            'total_plus':total_plus,
             'url_whatsapp':url_wa
         })
     except Exception as e:
@@ -1493,6 +1584,8 @@ def mis_tickets():
                 jugadas_raw = db.execute("SELECT * FROM jugadas WHERE ticket_id=%s",(t['id'],)).fetchall()
                 tripletas_raw = db.execute("SELECT * FROM tripletas WHERE ticket_id=%s",(t['id'],)).fetchall()
                 premio_total = 0
+                premio_peru = 0.0
+                premio_plus = 0.0
                 jugadas_det = []
                 for j in jugadas_raw:
                     lot_j = j['loteria'] if 'loteria' in j.keys() else 'peru'
@@ -1508,7 +1601,10 @@ def mis_tickets():
                                (sel=='PAR' and num%2==0) or \
                                (sel=='IMPAR' and num%2!=0):
                                 pj=j['monto']*PAGO_ESPECIAL; gano=True
-                    if gano: premio_total+=pj
+                    if gano:
+                        premio_total+=pj
+                        if lot_j=='plus': premio_plus+=pj
+                        else: premio_peru+=pj
                     jugadas_det.append({
                         'tipo':j['tipo'],'hora':j['hora'],'seleccion':j['seleccion'],
                         'nombre':ANIMALES.get(j['seleccion'],j['seleccion']) if j['tipo']=='animal' else j['seleccion'],
@@ -1526,7 +1622,10 @@ def mis_tickets():
                     nums={tr['animal1'],tr['animal2'],tr['animal3']}
                     salidos=list(dict.fromkeys([a for a in res_validos_trip.values() if a in nums]))
                     gano_t=len(salidos)==3; pt=tr['monto']*PAGO_TRIPLETA if gano_t else 0
-                    if gano_t: premio_total+=pt
+                    if gano_t:
+                        premio_total+=pt
+                        if lot_tr=='plus': premio_plus+=pt
+                        else: premio_peru+=pt
                     trips_det.append({
                         'animal1':tr['animal1'],'nombre1':ANIMALES.get(tr['animal1'],tr['animal1']),
                         'animal2':tr['animal2'],'nombre2':ANIMALES.get(tr['animal2'],tr['animal2']),
@@ -1535,17 +1634,22 @@ def mis_tickets():
                         'pagado':bool(tr['pagado']),'loteria':lot_tr
                     })
                 if est=='por_pagar' and (t['pagado'] or premio_total==0): continue
+                tot_peru = t['total_peru'] if 'total_peru' in t.keys() and t['total_peru'] else 0
+                tot_plus = t['total_plus'] if 'total_plus' in t.keys() and t['total_plus'] else 0
                 tickets_out.append({
                     'id':t['id'],'serial':t['serial'],'fecha':t['fecha'],
-                    'total':t['total'],'pagado':bool(t['pagado']),
+                    'total':t['total'],'total_peru':round(tot_peru,2),'total_plus':round(tot_plus,2),
+                    'pagado':bool(t['pagado']),
                     'premio_calculado':round(premio_total,2),
+                    'premio_peru':round(premio_peru,2),'premio_plus':round(premio_plus,2),
                     'jugadas':jugadas_det,'tripletas':trips_det
                 })
-        tv = sum(t['total'] for t in tickets_out)
+        tv_peru = sum(t['total_peru'] for t in tickets_out)
+        tv_plus = sum(t['total_plus'] for t in tickets_out)
         return jsonify({
             'status':'ok',
             'tickets':tickets_out,
-            'totales':{'cantidad':len(tickets_out),'ventas':round(tv,2)}
+            'totales':{'cantidad':len(tickets_out),'ventas_peru':round(tv_peru,2),'ventas_plus':round(tv_plus,2)}
         })
     except Exception as e:
         return jsonify({'error':str(e)}),500
@@ -1571,7 +1675,7 @@ def consultar_ticket_detalle():
             res_dia_plus = {r['hora']:r['animal'] for r in res_rows_plus}
             jugadas_raw = db.execute("SELECT * FROM jugadas WHERE ticket_id=%s",(t['id'],)).fetchall()
             tripletas_raw = db.execute("SELECT * FROM tripletas WHERE ticket_id=%s",(t['id'],)).fetchall()
-        premio_total=0; jdet=[]
+        premio_total=0; premio_peru=0.0; premio_plus=0.0; jdet=[]
         for j in jugadas_raw:
             lot_j = j['loteria'] if 'loteria' in j.keys() else 'peru'
             res_dia = res_dia_plus if lot_j == 'plus' else res_dia_peru
@@ -1586,7 +1690,10 @@ def consultar_ticket_detalle():
                        (sel=='PAR' and num%2==0) or \
                        (sel=='IMPAR' and num%2!=0):
                         pj=j['monto']*PAGO_ESPECIAL; gano=True
-            if gano: premio_total+=pj
+            if gano:
+                premio_total+=pj
+                if lot_j=='plus': premio_plus+=pj
+                else: premio_peru+=pj
             jdet.append({
                 'tipo':j['tipo'],'hora':j['hora'],'seleccion':j['seleccion'],
                 'nombre_seleccion':ANIMALES.get(j['seleccion'],j['seleccion']) if j['tipo']=='animal' else j['seleccion'],
@@ -1605,7 +1712,10 @@ def consultar_ticket_detalle():
             nums={tr['animal1'],tr['animal2'],tr['animal3']}
             salidos=list(dict.fromkeys([a for a in res_validos_trip.values() if a in nums]))
             gano_t=len(salidos)==3; pt=tr['monto']*PAGO_TRIPLETA if gano_t else 0
-            if gano_t: premio_total+=pt
+            if gano_t:
+                premio_total+=pt
+                if lot_tr=='plus': premio_plus+=pt
+                else: premio_peru+=pt
             tdet.append({
                 'tipo':'tripleta',
                 'animal1':tr['animal1'],'nombre1':ANIMALES.get(tr['animal1'],''),
@@ -1618,8 +1728,11 @@ def consultar_ticket_detalle():
             'status':'ok',
             'ticket':{
                 'id':t['id'],'serial':t['serial'],'fecha':t['fecha'],
-                'total_apostado':t['total'],'pagado':bool(t['pagado']),
-                'anulado':bool(t['anulado']),'premio_total':round(premio_total,2)
+                'total_apostado':t['total'],
+                'total_peru':t.get('total_peru',0),'total_plus':t.get('total_plus',0),
+                'pagado':bool(t['pagado']),
+                'anulado':bool(t['anulado']),'premio_total':round(premio_total,2),
+                'premio_peru':round(premio_peru,2),'premio_plus':round(premio_plus,2)
             },
             'jugadas':jdet,'tripletas':tdet
         })
@@ -1638,10 +1751,30 @@ def verificar_ticket():
                 return jsonify({'error':'No autorizado'})
             if t['anulado']: return jsonify({'error':'TICKET ANULADO'})
             if t['pagado']:  return jsonify({'error':'YA FUE PAGADO'})
-            premio = calcular_premio_ticket(t['id'], db)
-        return jsonify({'status':'ok','ticket_id':t['id'],'total_ganado':round(premio,2)})
+            premio = calcular_premio_ticket_split(t['id'], db)
+        return jsonify({
+            'status':'ok','ticket_id':t['id'],
+            'total_ganado':round(premio['peru']+premio['plus'],2),
+            'total_ganado_peru':premio['peru'],
+            'total_ganado_plus':premio['plus']
+        })
     except Exception as e:
         return jsonify({'error':str(e)}),500
+
+def _agencia_pertenece_a_sesion(db, agencia_id):
+    """
+    True si la sesión actual tiene permiso para tocar dinero (pagar/anular)
+    de tickets de esta agencia:
+    - Superadmin real (fuera de modo 'ver como'): siempre True, ve/toca todo.
+    - Administrador normal: True solo si la agencia es de su propia administración.
+    - Agencia (login no-admin): True solo si es ella misma.
+    """
+    if session.get('es_admin'):
+        if session.get('es_superadmin'):
+            return True
+        ag = db.execute("SELECT admin_id FROM agencias WHERE id=%s", (agencia_id,)).fetchone()
+        return bool(ag) and (ag['admin_id'] or 0) == session.get('user_id')
+    return agencia_id == session.get('user_id')
 
 @app.route('/api/pagar-ticket', methods=['POST'])
 @login_required
@@ -1651,8 +1784,8 @@ def pagar_ticket():
         with get_db() as db:
             t = db.execute("SELECT * FROM tickets WHERE id=%s",(tid,)).fetchone()
             if not t: return jsonify({'error':'Ticket no existe'})
-            if not session.get('es_admin') and t['agencia_id']!=session['user_id']:
-                return jsonify({'error':'No autorizado'})
+            if not _agencia_pertenece_a_sesion(db, t['agencia_id']):
+                return jsonify({'error':'No autorizado: este ticket pertenece a otra administración'})
             db.execute("UPDATE tickets SET pagado=1 WHERE id=%s",(tid,))
             db.execute("UPDATE tripletas SET pagado=1 WHERE ticket_id=%s",(tid,))
             db.commit()
@@ -1669,8 +1802,8 @@ def anular_ticket():
         with get_db() as db:
             t = db.execute("SELECT * FROM tickets WHERE serial=%s",(serial,)).fetchone()
             if not t: return jsonify({'error':'Ticket no existe'})
-            if not session.get('es_admin') and t['agencia_id']!=session['user_id']:
-                return jsonify({'error':'No autorizado'})
+            if not _agencia_pertenece_a_sesion(db, t['agencia_id']):
+                return jsonify({'error':'No autorizado: este ticket pertenece a otra administración'})
             if t['pagado']:
                 return jsonify({'error':'Ya pagado, no se puede anular'})
             if t['anulado']:
@@ -1700,19 +1833,22 @@ def caja_agencia():
                                 (session['user_id'], hoy)).fetchall()
             ag = db.execute("SELECT comision FROM agencias WHERE id=%s",(session['user_id'],)).fetchone()
             com_pct = ag['comision'] if ag else COMISION_AGENCIA
-            ventas=0; premios_pagados=0; pendientes=0
+            ventas_peru=premios_peru=0.0; ventas_plus=premios_plus=0.0; pendientes=0
             for t in tickets:
-                ventas += t['total']
-                p = calcular_premio_ticket(t['id'],db)
+                tp = t['total_peru'] if 'total_peru' in t.keys() and t['total_peru'] else 0
+                tl = t['total_plus'] if 'total_plus' in t.keys() and t['total_plus'] else 0
+                ventas_peru += tp; ventas_plus += tl
+                prem = calcular_premio_ticket_split(t['id'], db)
                 if t['pagado']:
-                    premios_pagados+=p
-                elif p>0:
-                    pendientes+=1
+                    premios_peru += prem['peru']; premios_plus += prem['plus']
+                elif (prem['peru']+prem['plus']) > 0:
+                    pendientes += 1
+        def _resumen(ventas, premios):
+            com = round(ventas*com_pct, 2)
+            return {'ventas':round(ventas,2),'premios':round(premios,2),'comision':com,'balance':round(ventas-premios-com,2)}
         return jsonify({
-            'ventas':round(ventas,2),
-            'premios':round(premios_pagados,2),
-            'comision':round(ventas*com_pct,2),
-            'balance':round(ventas-premios_pagados-ventas*com_pct,2),
+            'peru': _resumen(ventas_peru, premios_peru),
+            'plus': _resumen(ventas_plus, premios_plus),
             'tickets_pendientes':pendientes,
             'total_tickets':len(tickets)
         })
@@ -1733,44 +1869,93 @@ def caja_historico():
             com_pct = ag['comision'] if ag else COMISION_AGENCIA
             tickets = db.execute("SELECT * FROM tickets WHERE agencia_id=%s AND anulado=0 ORDER BY id DESC LIMIT 2000",
                                 (session['user_id'],)).fetchall()
-            dias={}; tv=0; tp=0
+            dias={}; tv_peru=tp_peru=tv_plus=tp_plus=0.0
             for t in tickets:
                 dt=parse_fecha(t['fecha'])
                 if not dt or dt<dti or dt>dtf: continue
                 dk=dt.strftime("%d/%m/%Y")
                 if dk not in dias:
-                    dias[dk]={'ventas':0,'tickets':0,'premios':0}
-                dias[dk]['ventas']+=t['total']
+                    dias[dk]={'ventas_peru':0,'ventas_plus':0,'tickets':0,'premios_peru':0,'premios_plus':0}
+                tot_peru = t['total_peru'] if 'total_peru' in t.keys() and t['total_peru'] else 0
+                tot_plus = t['total_plus'] if 'total_plus' in t.keys() and t['total_plus'] else 0
+                dias[dk]['ventas_peru']+=tot_peru
+                dias[dk]['ventas_plus']+=tot_plus
                 dias[dk]['tickets']+=1
-                tv+=t['total']
-                p=calcular_premio_ticket(t['id'],db)
+                tv_peru+=tot_peru; tv_plus+=tot_plus
                 if t['pagado']:
-                    dias[dk]['premios']+=p
-                    tp+=p
+                    prem = calcular_premio_ticket_split(t['id'],db)
+                    dias[dk]['premios_peru']+=prem['peru']
+                    dias[dk]['premios_plus']+=prem['plus']
+                    tp_peru+=prem['peru']; tp_plus+=prem['plus']
         resumen=[]
         for dk in sorted(dias.keys()):
             d=dias[dk]
-            cd=d['ventas']*com_pct
+            cd_peru=d['ventas_peru']*com_pct
+            cd_plus=d['ventas_plus']*com_pct
             resumen.append({
                 'fecha':dk,
                 'tickets':d['tickets'],
-                'ventas':round(d['ventas'],2),
-                'premios':round(d['premios'],2),
-                'comision':round(cd,2),
-                'balance':round(d['ventas']-d['premios']-cd,2)
+                'peru':{'ventas':round(d['ventas_peru'],2),'premios':round(d['premios_peru'],2),'comision':round(cd_peru,2),'balance':round(d['ventas_peru']-d['premios_peru']-cd_peru,2)},
+                'plus':{'ventas':round(d['ventas_plus'],2),'premios':round(d['premios_plus'],2),'comision':round(cd_plus,2),'balance':round(d['ventas_plus']-d['premios_plus']-cd_plus,2)}
             })
-        tc=tv*com_pct
+        tc_peru=tv_peru*com_pct
+        tc_plus=tv_plus*com_pct
         return jsonify({
             'resumen_por_dia':resumen,
             'totales':{
-                'ventas':round(tv,2),
-                'premios':round(tp,2),
-                'comision':round(tc,2),
-                'balance':round(tv-tp-tc,2)
+                'peru':{'ventas':round(tv_peru,2),'premios':round(tp_peru,2),'comision':round(tc_peru,2),'balance':round(tv_peru-tp_peru-tc_peru,2)},
+                'plus':{'ventas':round(tv_plus,2),'premios':round(tp_plus,2),'comision':round(tc_plus,2),'balance':round(tv_plus-tp_plus-tc_plus,2)}
             }
         })
     except Exception as e:
         return jsonify({'error':str(e)}),500
+
+@app.route('/api/tickets-detalle', methods=['POST'])
+@agencia_required
+def tickets_detalle():
+    """
+    Detalle ticket por ticket (serial, hora de cada jugada, qué se jugó,
+    por cuánto y en qué lotería) para el rango de fechas pedido.
+    Usado por el modal 'Archivo' del POS para poder auditar exactamente
+    qué jugó la agencia y a qué hora.
+    """
+    try:
+        data = request.get_json() or {}
+        fi, ff = data.get('fecha_inicio'), data.get('fecha_fin')
+        if not fi or not ff:
+            return jsonify({'error': 'Fechas requeridas'}), 400
+        dti = datetime.strptime(fi, "%Y-%m-%d")
+        dtf = datetime.strptime(ff, "%Y-%m-%d").replace(hour=23, minute=59)
+        with get_db() as db:
+            tickets = db.execute(
+                "SELECT * FROM tickets WHERE agencia_id=%s ORDER BY id DESC LIMIT 1000",
+                (session['user_id'],)
+            ).fetchall()
+            out = []
+            for t in tickets:
+                dt = parse_fecha(t['fecha'])
+                if not dt or dt < dti or dt > dtf: continue
+                jugadas_raw = db.execute("SELECT * FROM jugadas WHERE ticket_id=%s ORDER BY hora", (t['id'],)).fetchall()
+                trips_raw = db.execute("SELECT * FROM tripletas WHERE ticket_id=%s", (t['id'],)).fetchall()
+                jdet = [{
+                    'tipo': j['tipo'], 'hora': j['hora'], 'seleccion': j['seleccion'],
+                    'nombre': ANIMALES.get(j['seleccion'], j['seleccion']) if j['tipo']=='animal' else j['seleccion'],
+                    'monto': j['monto'], 'loteria': j['loteria'] if 'loteria' in j.keys() else 'peru'
+                } for j in jugadas_raw]
+                tdet = [{
+                    'animales': f"{tr['animal1']}-{tr['animal2']}-{tr['animal3']}",
+                    'monto': tr['monto'], 'loteria': tr['loteria'] if 'loteria' in tr.keys() else 'peru'
+                } for tr in trips_raw]
+                out.append({
+                    'id': t['id'], 'serial': t['serial'], 'fecha': t['fecha'],
+                    'total_peru': t['total_peru'] if 'total_peru' in t.keys() else 0,
+                    'total_plus': t['total_plus'] if 'total_plus' in t.keys() else 0,
+                    'pagado': bool(t['pagado']), 'anulado': bool(t['anulado']),
+                    'jugadas': jdet, 'tripletas': tdet
+                })
+        return jsonify({'status': 'ok', 'tickets': out, 'total': len(out)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2347,10 +2532,10 @@ def editar_agencia():
             _ag = db.execute("SELECT admin_id FROM agencias WHERE id=%s AND es_admin=0",(aid,)).fetchone()
             if not _ag:
                 return jsonify({'error':'Agencia no encontrada'}),404
-            if not session.get('es_superadmin') and (_ag['admin_id'] or 0) != session.get('user_id'):
+            if (_ag['admin_id'] or 0) != session.get('user_id'):
                 return jsonify({'error':'Esta agencia pertenece a otro administrador'}),403
-            if 'admin_id' in data and session.get('es_superadmin'):
-                db.execute("UPDATE agencias SET admin_id=%s WHERE id=%s AND es_admin=0",(int(data['admin_id']),aid))
+            # NOTA: ya no se permite reasignar 'admin_id' — una agencia queda
+            # ligada de forma permanente al administrador que la creó.
             if 'nombre_banco' in data:
                 db.execute("UPDATE agencias SET nombre_banco=%s WHERE id=%s AND es_admin=0",(data['nombre_banco'],aid))
             if 'password' in data and data['password']:
@@ -2382,7 +2567,7 @@ def eliminar_agencia():
                 return jsonify({'error': 'Agencia no encontrada'}), 404
             if ag['es_admin']:
                 return jsonify({'error': 'No se puede eliminar al administrador'}), 403
-            if not session.get('es_superadmin') and (ag['admin_id'] or 0) != session.get('user_id'):
+            if (ag['admin_id'] or 0) != session.get('user_id'):
                 return jsonify({'error': 'Esta agencia pertenece a otro administrador'}), 403
             tickets_activos = db.execute(
                 "SELECT COUNT(*) as cnt FROM tickets WHERE agencia_id=%s AND anulado=0", (aid,)
@@ -2668,8 +2853,10 @@ def get_audit_logs():
                 LEFT JOIN agencias ag ON al.agencia_id=ag.id
                 ORDER BY al.id DESC LIMIT %s
             """, (limit,)).fetchall()
+            _permitidos = set(_ids_agencias_admin(db)) | {_efectivo_admin_id()}
         result = []
         for r in rows:
+            if r['agencia_id'] not in _permitidos: continue
             dt_str = r['creado']
             if fi and dt_str[:10] < fi: continue
             if ff and dt_str[:10] > ff: continue
@@ -2694,36 +2881,33 @@ def reporte_agencias():
         with get_db() as db:
             ags = _filtrar_ags(db.execute("SELECT * FROM agencias WHERE es_admin=0").fetchall())
             tickets = db.execute("SELECT * FROM tickets WHERE anulado=0 AND SUBSTR(fecha, 1, 10) = %s",(hoy,)).fetchall()
-            data=[]; tv=tp=tc=0
+            data=[]; tv_p=tp_p=tc_p=0.0; tv_l=tp_l=tc_l=0.0
             for ag in ags:
                 mts=[t for t in tickets if t['agencia_id']==ag['id']]
-                ventas=sum(t['total'] for t in mts); pp=0; pp_pend=0
+                ventas_p = sum((t['total_peru'] if 'total_peru' in t.keys() and t['total_peru'] else 0) for t in mts)
+                ventas_l = sum((t['total_plus'] if 'total_plus' in t.keys() and t['total_plus'] else 0) for t in mts)
+                pp_p=pp_l=pend_p=pend_l=0.0
                 for t in mts:
-                    p=calcular_premio_ticket(t['id'],db)
+                    prem=calcular_premio_ticket_split(t['id'],db)
                     if t['pagado']:
-                        pp+=p
-                    elif p>0:
-                        pp_pend+=p
-                com=ventas*ag['comision']
+                        pp_p+=prem['peru']; pp_l+=prem['plus']
+                    else:
+                        pend_p+=prem['peru']; pend_l+=prem['plus']
+                com_p=ventas_p*ag['comision']; com_l=ventas_l*ag['comision']
                 data.append({
                     'nombre':ag['nombre_agencia'],
                     'usuario':ag['usuario'],
-                    'ventas':round(ventas,2),
-                    'premios_pagados':round(pp,2),
-                    'premios_pendientes':round(pp_pend,2),
-                    'premios_total':round(pp+pp_pend,2),
-                    'comision':round(com,2),
-                    'balance':round(ventas-(pp+pp_pend)-com,2),
-                    'tickets':len(mts)
+                    'tickets':len(mts),
+                    'peru':{'ventas':round(ventas_p,2),'premios_pagados':round(pp_p,2),'premios_pendientes':round(pend_p,2),'premios_total':round(pp_p+pend_p,2),'comision':round(com_p,2),'balance':round(ventas_p-(pp_p+pend_p)-com_p,2)},
+                    'plus':{'ventas':round(ventas_l,2),'premios_pagados':round(pp_l,2),'premios_pendientes':round(pend_l,2),'premios_total':round(pp_l+pend_l,2),'comision':round(com_l,2),'balance':round(ventas_l-(pp_l+pend_l)-com_l,2)}
                 })
-                tv+=ventas; tp+=(pp+pp_pend); tc+=com
+                tv_p+=ventas_p; tp_p+=(pp_p+pend_p); tc_p+=com_p
+                tv_l+=ventas_l; tp_l+=(pp_l+pend_l); tc_l+=com_l
         return jsonify({
             'agencias':data,
             'global':{
-                'ventas':round(tv,2),
-                'pagos':round(tp,2),
-                'comisiones':round(tc,2),
-                'balance':round(tv-tp-tc,2)
+                'peru':{'ventas':round(tv_p,2),'pagos':round(tp_p,2),'comisiones':round(tc_p,2),'balance':round(tv_p-tp_p-tc_p,2)},
+                'plus':{'ventas':round(tv_l,2),'pagos':round(tp_l,2),'comisiones':round(tc_l,2),'balance':round(tv_l-tp_l-tc_l,2)}
             }
         })
     except Exception as e:
@@ -2786,6 +2970,61 @@ def tripletas_hoy():
     except Exception as e:
         return jsonify({'error':str(e)}),500
 
+@app.route('/admin/tickets-detalle', methods=['POST'])
+@admin_required
+def admin_tickets_detalle():
+    """
+    Detalle ticket por ticket (serial, agencia, hora de cada jugada, qué
+    se jugó, por cuánto y en qué lotería) para TODAS las agencias del
+    administrador efectivo (o del administrador que se está 'viendo como',
+    en modo lectura). Esto le da al administrador un respaldo/auditoría
+    completa de lo que cada agencia jugó, sin depender solo del balance.
+    """
+    try:
+        data = request.get_json() or {}
+        fi, ff = data.get('fecha_inicio'), data.get('fecha_fin')
+        if not fi or not ff:
+            return jsonify({'error': 'Fechas requeridas'}), 400
+        dti = datetime.strptime(fi, "%Y-%m-%d")
+        dtf = datetime.strptime(ff, "%Y-%m-%d").replace(hour=23, minute=59)
+        with get_db() as db:
+            ids = _ids_agencias_admin(db)
+            if not ids:
+                return jsonify({'status': 'ok', 'tickets': [], 'total': 0})
+            ph = ','.join(['%s'] * len(ids))
+            tickets = db.execute(
+                f"SELECT tk.*, ag.nombre_agencia FROM tickets tk "
+                f"JOIN agencias ag ON tk.agencia_id = ag.id "
+                f"WHERE tk.agencia_id IN ({ph}) ORDER BY tk.id DESC LIMIT 2000",
+                tuple(ids)
+            ).fetchall()
+            out = []
+            for t in tickets:
+                dt = parse_fecha(t['fecha'])
+                if not dt or dt < dti or dt > dtf: continue
+                jugadas_raw = db.execute("SELECT * FROM jugadas WHERE ticket_id=%s ORDER BY hora", (t['id'],)).fetchall()
+                trips_raw = db.execute("SELECT * FROM tripletas WHERE ticket_id=%s", (t['id'],)).fetchall()
+                jdet = [{
+                    'tipo': j['tipo'], 'hora': j['hora'], 'seleccion': j['seleccion'],
+                    'nombre': ANIMALES.get(j['seleccion'], j['seleccion']) if j['tipo']=='animal' else j['seleccion'],
+                    'monto': j['monto'], 'loteria': j['loteria'] if 'loteria' in j.keys() else 'peru'
+                } for j in jugadas_raw]
+                tdet = [{
+                    'animales': f"{tr['animal1']}-{tr['animal2']}-{tr['animal3']}",
+                    'monto': tr['monto'], 'loteria': tr['loteria'] if 'loteria' in tr.keys() else 'peru'
+                } for tr in trips_raw]
+                out.append({
+                    'id': t['id'], 'serial': t['serial'], 'fecha': t['fecha'],
+                    'agencia': t['nombre_agencia'],
+                    'total_peru': t['total_peru'] if 'total_peru' in t.keys() else 0,
+                    'total_plus': t['total_plus'] if 'total_plus' in t.keys() else 0,
+                    'pagado': bool(t['pagado']), 'anulado': bool(t['anulado']),
+                    'jugadas': jdet, 'tripletas': tdet
+                })
+        return jsonify({'status': 'ok', 'tickets': out, 'total': len(out)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/admin/exportar-csv', methods=['POST'])
 @admin_required
 def exportar_csv():
@@ -2802,8 +3041,8 @@ def exportar_csv():
                 'nombre':ag['nombre_agencia'],
                 'usuario':ag['usuario'],
                 'tickets':0,
-                'ventas':0,
-                'premios':0,
+                'ventas_peru':0,'premios_peru':0,
+                'ventas_plus':0,'premios_plus':0,
                 'comision_pct':ag['comision']
             } for ag in ags}
             for t in all_t:
@@ -2812,27 +3051,31 @@ def exportar_csv():
                 aid=t['agencia_id']
                 if aid not in stats: continue
                 stats[aid]['tickets']+=1
-                stats[aid]['ventas']+=t['total']
+                stats[aid]['ventas_peru']+=(t['total_peru'] if 'total_peru' in t.keys() and t['total_peru'] else 0)
+                stats[aid]['ventas_plus']+=(t['total_plus'] if 'total_plus' in t.keys() and t['total_plus'] else 0)
                 if t['pagado']:
-                    stats[aid]['premios']+=calcular_premio_ticket(t['id'],db)
+                    prem=calcular_premio_ticket_split(t['id'],db)
+                    stats[aid]['premios_peru']+=prem['peru']
+                    stats[aid]['premios_plus']+=prem['plus']
         out=io.StringIO()
         w=csv.writer(out)
         w.writerow(['REPORTE ZOOLO CASINO'])
         w.writerow([f'Periodo: {fi} al {ff}'])
         w.writerow([])
-        w.writerow(['Agencia','Usuario','Tickets','Ventas','Premios','Comision','Balance'])
-        tv=0
-        for s in sorted(stats.values(),key=lambda x:x['ventas'],reverse=True):
+        w.writerow(['Agencia','Usuario','Tickets','Ventas S/ (PERU)','Premios S/ (PERU)','Comision S/','Balance S/','Ventas Bs (PLUS)','Premios Bs (PLUS)','Comision Bs','Balance Bs'])
+        tv_p=tv_l=0
+        for s in sorted(stats.values(),key=lambda x:x['ventas_peru']+x['ventas_plus'],reverse=True):
             if s['tickets']==0: continue
-            com=s['ventas']*s['comision_pct']
+            com_p=s['ventas_peru']*s['comision_pct']
+            com_l=s['ventas_plus']*s['comision_pct']
             w.writerow([
                 s['nombre'], s['usuario'], s['tickets'],
-                round(s['ventas'],2), round(s['premios'],2),
-                round(com,2), round(s['ventas']-s['premios']-com,2)
+                round(s['ventas_peru'],2), round(s['premios_peru'],2), round(com_p,2), round(s['ventas_peru']-s['premios_peru']-com_p,2),
+                round(s['ventas_plus'],2), round(s['premios_plus'],2), round(com_l,2), round(s['ventas_plus']-s['premios_plus']-com_l,2)
             ])
-            tv+=s['ventas']
+            tv_p+=s['ventas_peru']; tv_l+=s['ventas_plus']
         w.writerow([])
-        w.writerow(['TOTAL','',sum(s['tickets'] for s in stats.values()),round(tv,2),'','',''])
+        w.writerow(['TOTAL','',sum(s['tickets'] for s in stats.values()),round(tv_p,2),'','','',round(tv_l,2),'','',''])
         out.seek(0)
         return Response(
             out.getvalue(),
@@ -2855,57 +3098,61 @@ def estadisticas_rango():
         dtf=datetime.strptime(ff,"%Y-%m-%d").replace(hour=23,minute=59)
         with get_db() as db:
             all_t=db.execute("SELECT * FROM tickets WHERE anulado=0 ORDER BY id DESC LIMIT 10000").fetchall()
-            _own=_ids_agencias_admin(db); _own=set(_own) if _own is not None else None
-            dias={}; total_v=total_p=total_t=0
+            _own=set(_ids_agencias_admin(db))
+            dias={}; total_v_p=total_v_l=total_t=0.0
             for t in all_t:
                 dt=parse_fecha(t['fecha'])
                 if not dt or dt<dti or dt>dtf: continue
-                if _own is not None and t['agencia_id'] not in _own: continue
+                if t['agencia_id'] not in _own: continue
                 dk=dt.strftime("%d/%m/%Y")
                 if dk not in dias:
-                    dias[dk]={'ventas':0,'tickets':0,'ids':[],'fecha_raw':dt.strftime("%d/%m/%Y")}
-                dias[dk]['ventas']+=t['total']
+                    dias[dk]={'ventas_peru':0,'ventas_plus':0,'tickets':0,'ids':[],'fecha_raw':dt.strftime("%d/%m/%Y")}
+                dias[dk]['ventas_peru']+=(t['total_peru'] if 'total_peru' in t.keys() and t['total_peru'] else 0)
+                dias[dk]['ventas_plus']+=(t['total_plus'] if 'total_plus' in t.keys() and t['total_plus'] else 0)
                 dias[dk]['tickets']+=1
                 dias[dk]['ids'].append(t['id'])
-                total_v+=t['total']
+                total_v_p+=(t['total_peru'] if 'total_peru' in t.keys() and t['total_peru'] else 0)
+                total_v_l+=(t['total_plus'] if 'total_plus' in t.keys() and t['total_plus'] else 0)
                 total_t+=1
             resumen=[]
-            total_p=0; total_trip=0
+            total_p_p=total_p_l=total_trip_p=total_trip_l=0.0
             for dk in sorted(dias.keys()):
                 d=dias[dk]
-                prem=0
+                prem_p=prem_l=0.0
                 for tid in d['ids']:
-                    prem+=calcular_premio_ticket(tid,db)
-                total_p+=prem
+                    pr=calcular_premio_ticket_split(tid,db)
+                    prem_p+=pr['peru']; prem_l+=pr['plus']
+                total_p_p+=prem_p; total_p_l+=prem_l
                 _sc,_scp=_scope_and(db,'tk')
-                trip_row=db.execute("""
-                    SELECT COALESCE(SUM(tr.monto),0) as total_trip
-                    FROM tripletas tr
-                    JOIN tickets tk ON tr.ticket_id=tk.id
-                    WHERE SUBSTR(tr.fecha,1,10)=%s AND tk.anulado=0"""+_sc+"""
+                trip_p_row=db.execute("""
+                    SELECT COALESCE(SUM(tr.monto),0) as tm
+                    FROM tripletas tr JOIN tickets tk ON tr.ticket_id=tk.id
+                    WHERE SUBSTR(tr.fecha,1,10)=%s AND tr.loteria='peru' AND tk.anulado=0"""+_sc+"""
                 """, tuple([d['fecha_raw']]+_scp)).fetchone()
-                trip_monto=round(float(trip_row['total_trip']),2) if trip_row else 0
-                total_trip+=trip_monto
-                cd=d['ventas']*COMISION_AGENCIA
+                trip_l_row=db.execute("""
+                    SELECT COALESCE(SUM(tr.monto),0) as tm
+                    FROM tripletas tr JOIN tickets tk ON tr.ticket_id=tk.id
+                    WHERE SUBSTR(tr.fecha,1,10)=%s AND tr.loteria='plus' AND tk.anulado=0"""+_sc+"""
+                """, tuple([d['fecha_raw']]+_scp)).fetchone()
+                trip_p=round(float(trip_p_row['tm']),2) if trip_p_row else 0
+                trip_l=round(float(trip_l_row['tm']),2) if trip_l_row else 0
+                total_trip_p+=trip_p; total_trip_l+=trip_l
+                cd_p=d['ventas_peru']*COMISION_AGENCIA
+                cd_l=d['ventas_plus']*COMISION_AGENCIA
                 resumen.append({
                     'fecha':dk,
-                    'ventas':round(d['ventas'],2),
-                    'tripletas':trip_monto,
-                    'premios':round(prem,2),
-                    'comisiones':round(cd,2),
-                    'balance':round(d['ventas']-prem-cd,2),
-                    'tickets':d['tickets']
+                    'tickets':d['tickets'],
+                    'peru':{'ventas':round(d['ventas_peru'],2),'tripletas':trip_p,'premios':round(prem_p,2),'comisiones':round(cd_p,2),'balance':round(d['ventas_peru']-prem_p-cd_p,2)},
+                    'plus':{'ventas':round(d['ventas_plus'],2),'tripletas':trip_l,'premios':round(prem_l,2),'comisiones':round(cd_l,2),'balance':round(d['ventas_plus']-prem_l-cd_l,2)}
                 })
-        tc=total_v*COMISION_AGENCIA
+        tc_p=total_v_p*COMISION_AGENCIA
+        tc_l=total_v_l*COMISION_AGENCIA
         return jsonify({
             'resumen_por_dia':resumen,
             'totales':{
-                'ventas':round(total_v,2),
-                'tripletas':round(total_trip,2),
-                'premios':round(total_p,2),
-                'comisiones':round(tc,2),
-                'balance':round(total_v-total_p-tc,2),
-                'tickets':total_t
+                'tickets':total_t,
+                'peru':{'ventas':round(total_v_p,2),'tripletas':round(total_trip_p,2),'premios':round(total_p_p,2),'comisiones':round(tc_p,2),'balance':round(total_v_p-total_p_p-tc_p,2)},
+                'plus':{'ventas':round(total_v_l,2),'tripletas':round(total_trip_l,2),'premios':round(total_p_l,2),'comisiones':round(tc_l,2),'balance':round(total_v_l-total_p_l-tc_l,2)}
             }
         })
     except Exception as e:
@@ -2929,8 +3176,8 @@ def reporte_agencias_rango():
                 'nombre':ag['nombre_agencia'],
                 'usuario':ag['usuario'],
                 'tickets':0,
-                'ventas':0,
-                'premios_teoricos':0,
+                'ventas_peru':0.0,'premios_peru':0.0,
+                'ventas_plus':0.0,'premios_plus':0.0,
                 'comision_pct':ag['comision']
             } for ag in ags}
             for t in all_t:
@@ -2939,29 +3186,31 @@ def reporte_agencias_rango():
                 aid=t['agencia_id']
                 if aid not in stats: continue
                 stats[aid]['tickets']+=1
-                stats[aid]['ventas']+=t['total']
-                p=calcular_premio_ticket(t['id'],db)
-                stats[aid]['premios_teoricos']+=p
+                stats[aid]['ventas_peru']+=(t['total_peru'] if 'total_peru' in t.keys() and t['total_peru'] else 0)
+                stats[aid]['ventas_plus']+=(t['total_plus'] if 'total_plus' in t.keys() and t['total_plus'] else 0)
+                p=calcular_premio_ticket_split(t['id'],db)
+                stats[aid]['premios_peru']+=p['peru']
+                stats[aid]['premios_plus']+=p['plus']
         out=[]
         for s in stats.values():
             if s['tickets']==0: continue
-            com=s['ventas']*s['comision_pct']
-            s['comision']=round(com,2)
-            s['balance']=round(s['ventas']-s['premios_teoricos']-com,2)
-            s['ventas']=round(s['ventas'],2)
-            s['premios_teoricos']=round(s['premios_teoricos'],2)
-            out.append(s)
-        out.sort(key=lambda x:x['ventas'],reverse=True)
-        tv=sum(x['ventas'] for x in out)
-        if tv>0:
-            for x in out:
-                x['porcentaje_ventas']=round(x['ventas']/tv*100,1)
+            com_p=s['ventas_peru']*s['comision_pct']
+            com_l=s['ventas_plus']*s['comision_pct']
+            out.append({
+                'nombre':s['nombre'], 'usuario':s['usuario'], 'tickets':s['tickets'],
+                'peru':{'ventas':round(s['ventas_peru'],2),'premios_teoricos':round(s['premios_peru'],2),'comision':round(com_p,2),'balance':round(s['ventas_peru']-s['premios_peru']-com_p,2)},
+                'plus':{'ventas':round(s['ventas_plus'],2),'premios_teoricos':round(s['premios_plus'],2),'comision':round(com_l,2),'balance':round(s['ventas_plus']-s['premios_plus']-com_l,2)}
+            })
+        out.sort(key=lambda x:x['peru']['ventas']+x['plus']['ventas'],reverse=True)
+        tv_p=sum(x['peru']['ventas'] for x in out)
+        tv_l=sum(x['plus']['ventas'] for x in out)
+        for x in out:
+            x['porcentaje_ventas_peru']=round(x['peru']['ventas']/tv_p*100,1) if tv_p>0 else 0
+            x['porcentaje_ventas_plus']=round(x['plus']['ventas']/tv_l*100,1) if tv_l>0 else 0
         total={
             'tickets':sum(x['tickets'] for x in out),
-            'ventas':round(tv,2),
-            'premios':round(sum(x['premios_teoricos'] for x in out),2),
-            'comision':round(sum(x['comision'] for x in out),2),
-            'balance':round(sum(x['balance'] for x in out),2)
+            'peru':{'ventas':round(tv_p,2),'premios':round(sum(x['peru']['premios_teoricos'] for x in out),2),'comision':round(sum(x['peru']['comision'] for x in out),2),'balance':round(sum(x['peru']['balance'] for x in out),2)},
+            'plus':{'ventas':round(tv_l,2),'premios':round(sum(x['plus']['premios_teoricos'] for x in out),2),'comision':round(sum(x['plus']['comision'] for x in out),2),'balance':round(sum(x['plus']['balance'] for x in out),2)}
         }
         return jsonify({
             'agencias':out,
@@ -3308,7 +3557,7 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
       <div class="presets">
         <button class="mpre" onclick="setM(.5)">0.5</button><button class="mpre" onclick="setM(1)">1</button><button class="mpre" onclick="setM(2)">2</button><button class="mpre" onclick="setM(5)">5</button><button class="mpre" onclick="setM(10)">10</button><button class="mpre" onclick="setM(20)">20</button><button class="mpre" onclick="setM(50)">50</button>
       </div>
-      <div class="monto-input-wrap"><span class="monto-label">S/</span><input type="number" class="monto-input" id="monto" value="1" min="0.5" step="0.5"></div>
+      <div class="monto-input-wrap"><span class="monto-label" id="monto-simb">S/</span><input type="number" class="monto-input" id="monto" value="1" min="0.5" step="0.5"></div>
     </div>
     <div class="actions-sec">
       <button class="btn-add" onclick="agregar()">+ AGREGAR AL TICKET</button>
@@ -3328,12 +3577,12 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 </div>
 <div class="trip-slots"><div class="tslot act" id="tms0" onclick="activarSlotModal(0)"><div class="sph">ANIMAL 1</div></div><div class="tslot" id="tms1" onclick="activarSlotModal(1)"><div class="sph">ANIMAL 2</div></div><div class="tslot" id="tms2" onclick="activarSlotModal(2)"><div class="sph">ANIMAL 3</div></div></div>
 <div class="trip-modal-grid" id="trip-modal-grid"></div>
-<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)"><div style="color:var(--purple);font-size:.75rem;margin-bottom:6px;font-family:'Oswald',sans-serif;letter-spacing:1px">MONTO TRIPLETA</div><div class="monto-input-wrap"><span class="monto-label">S/</span><input type="number" class="monto-input" id="monto-tripleta" value="1" min="0.5" step="0.5"></div></div>
+<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)"><div style="color:var(--purple);font-size:.75rem;margin-bottom:6px;font-family:'Oswald',sans-serif;letter-spacing:1px">MONTO TRIPLETA</div><div class="monto-input-wrap"><span class="monto-label" id="monto-trip-simb">S/</span><input type="number" class="monto-input" id="monto-tripleta" value="1" min="0.5" step="0.5"></div></div>
 <div style="display:flex;gap:8px;margin-top:12px"><button class="btn-q" id="trip-btn-agregar" style="flex:1" onclick="agregarTripletaModal()">AGREGAR AL TICKET</button><button class="btn-close" style="flex:1;background:#1e3050;border-color:#4080c0;color:#90c0ff" onclick="closeMod('mod-tripleta')">CANCELAR</button></div>
 </div></div></div>
 <div class="modal" id="mod-resultados"><div class="mc"><div class="mh"><h3>RESULTADOS</h3><button class="btn-close" onclick="closeMod('mod-resultados')">X</button></div><div class="mbody"><div class="frow"><input type="date" id="res-fecha"></div><button class="btn-q" onclick="cargarResultados()">VER RESULTADOS</button><div id="res-titulo" style="color:var(--teal);font-family:'Oswald',sans-serif;letter-spacing:2px;text-align:center;margin-bottom:8px;font-size:.8rem"></div><div id="res-lista" style="max-height:340px;overflow-y:auto"></div></div></div></div>
 <div class="modal" id="mod-consultas"><div class="mc"><div class="mh"><h3>CONSULTAS</h3><button class="btn-close" onclick="closeMod('mod-consultas')">X</button></div><div class="mbody"><div class="frow"><input type="date" id="mt-ini"><input type="date" id="mt-fin"><select id="mt-estado"><option value="todos">Todos</option><option value="pagados">Pagados</option><option value="pendientes">Pendientes</option><option value="por_pagar">Con Premio</option></select></div><button class="btn-q" onclick="consultarTickets()">BUSCAR</button><div id="mt-resumen" style="display:none;background:rgba(0,180,216,.06);border:1px solid #0a4050;border-radius:3px;padding:8px;margin-bottom:8px;color:var(--teal);font-size:.78rem;font-family:'Oswald',sans-serif;letter-spacing:1px"></div><div id="mt-lista" style="max-height:400px;overflow-y:auto"><p style="color:var(--text2);text-align:center;padding:20px;letter-spacing:2px;font-size:.75rem">USE LOS FILTROS Y BUSQUE</p></div></div></div></div>
-<div class="modal" id="mod-archivo"><div class="mc"><div class="mh"><h3>ARCHIVO — CAJA HISTORICO</h3><button class="btn-close" onclick="closeMod('mod-archivo')">X</button></div><div class="mbody"><div class="frow"><input type="date" id="ar-ini"><input type="date" id="ar-fin"></div><button class="btn-q" onclick="cajaHist()">VER HISTORICO</button><div id="ar-res"></div></div></div></div>
+<div class="modal" id="mod-archivo"><div class="mc"><div class="mh"><h3>ARCHIVO — CAJA HISTORICO</h3><button class="btn-close" onclick="closeMod('mod-archivo')">X</button></div><div class="mbody"><div class="frow"><input type="date" id="ar-ini"><input type="date" id="ar-fin"></div><div style="display:flex;gap:6px;margin-bottom:8px"><button class="btn-q" style="margin:0" onclick="cajaHist()">VER RESUMEN</button><button class="btn-q" style="margin:0;background:#7c3aed;border-color:#a855f7" onclick="cajaHistTickets()">VER TICKETS</button></div><div id="ar-res"></div></div></div></div>
 <div class="modal" id="mod-pagar"><div class="mc"><div class="mh"><h3>VERIFICAR / PAGAR</h3><button class="btn-close" onclick="closeMod('mod-pagar')">X</button></div><div class="mbody"><div class="frow"><input type="text" id="pag-serial" placeholder="Serial del ticket"></div><button class="btn-q" onclick="verificarTicket()">VERIFICAR</button><div id="pag-res"></div></div></div></div>
 <div class="modal" id="mod-anular"><div class="mc"><div class="mh"><h3>ANULAR TICKET</h3><button class="btn-close" onclick="closeMod('mod-anular')">X</button></div><div class="mbody"><div class="frow"><input type="text" id="an-serial" placeholder="Serial del ticket"></div><button class="btn-q" style="background:linear-gradient(135deg,#3a1010,#280808);border-color:#6b1515;color:#e05050" onclick="anularTicket()">ANULAR</button><div id="an-res"></div></div></div></div>
 <div class="modal" id="mod-caja"><div class="mc"><div class="mh"><h3>CAJA HOY</h3><button class="btn-close" onclick="closeMod('mod-caja')">X</button></div><div class="mbody" id="caja-body"></div></div></div>
@@ -3343,6 +3592,7 @@ const COLORES  = {{ colores | tojson }};
 const HPERU = {{ horarios_peru | tojson }};
 const HPLUS = {{ horarios_plus | tojson }};
 const ROJOS = ["1","3","5","7","9","12","14","16","18","19","21","23","25","27","30","32","34","36","37","39"];
+function simb(lot){ return lot==='plus' ? 'Bs' : 'S/'; }
 const ORDEN = ['00','0','1','2','3','4','5','6','7','8','9','10','11','12','13','14','15','16','17','18','19','20','21','22','23','24','25','26','27','28','29','30','31','32','33','34','35','36','37','38','39','40'];
 let carrito=[],horasSel=[],horasSelPlus=[],animalesSel=[],espSel=null,horasBloq=[],horasBloqPlus=[],loteriaActiva='peru',tripSlotModal=0,tripAnimModal=[null,null,null];
 function init(){renderAnimales();renderHoras();renderTripModalGrid();actualizarBloq();setInterval(actualizarBloq,30000);setInterval(actualizarClock,1000);setInterval(verificarConexion,10000);actualizarClock();verificarConexion();let hoy=new Date().toISOString().split('T')[0];['res-fecha','mt-ini','mt-fin','ar-ini','ar-fin'].forEach(id=>{let el=document.getElementById(id);if(el)el.value=hoy});}
@@ -3362,9 +3612,9 @@ function renderHoras(){let g=document.getElementById('horas-grid');g.innerHTML='
 function toggleH(h){let isPlus=loteriaActiva==='plus',arr=isPlus?horasSelPlus:horasSel,i=arr.indexOf(h);if(i>=0)arr.splice(i,1);else arr.push(h);renderHoras();}
 function selTodos(){if(loteriaActiva==='plus')horasSelPlus=HPLUS.filter(h=>!horasBloqPlus.includes(h));else horasSel=HPERU.filter(h=>!horasBloq.includes(h));renderHoras();}
 function limpiarH(){if(loteriaActiva==='plus')horasSelPlus=[];else horasSel=[];renderHoras();}
-function cambiarLoteria(lot){loteriaActiva=lot;let lbl=lot==='plus'?'PLUS - 12 Sorteos':'PERU - 11 Sorteos';document.getElementById('horas-label').textContent=lbl;renderHoras();}
+function cambiarLoteria(lot){loteriaActiva=lot;let lbl=lot==='plus'?'PLUS - 12 Sorteos':'PERU - 11 Sorteos';document.getElementById('horas-label').textContent=lbl;document.getElementById('monto-simb').textContent=simb(lot);renderHoras();}
 function openTripletaModal(){tripAnimModal=[null,null,null];tripSlotModal=0;actualizarSlotsModal();renderTripModalGrid();selTripLoteria(loteriaActiva||'peru');openMod('mod-tripleta');}
-function selTripLoteria(lot){window.tripLoteriaModal=lot;let tabPeru=document.getElementById('trip-tab-peru'),tabPlus=document.getElementById('trip-tab-plus'),btn=document.getElementById('trip-btn-agregar');if(lot==='plus'){tabPlus.style.background='#6b21a8';tabPlus.style.color='#f3e8ff';tabPlus.style.fontWeight='700';tabPeru.style.background='#0c1020';tabPeru.style.color='#4a6090';tabPeru.style.fontWeight='normal';btn.style.background='linear-gradient(135deg,#6b21a8,#4c1d95)';btn.style.borderColor='#a855f7';btn.style.color='#f3e8ff';btn.textContent='AGREGAR ZOOLO PLUS';}else{tabPeru.style.background='#0c4a9e';tabPeru.style.color='#e0f0ff';tabPeru.style.fontWeight='700';tabPlus.style.background='#0c1020';tabPlus.style.color='#4a6090';tabPlus.style.fontWeight='normal';btn.style.background='linear-gradient(135deg,#166534,#14532d)';btn.style.borderColor='#22c55e';btn.style.color='#dcfce7';btn.textContent='AGREGAR ZOOLO PERU';}}
+function selTripLoteria(lot){window.tripLoteriaModal=lot;document.getElementById('monto-trip-simb').textContent=simb(lot);let tabPeru=document.getElementById('trip-tab-peru'),tabPlus=document.getElementById('trip-tab-plus'),btn=document.getElementById('trip-btn-agregar');if(lot==='plus'){tabPlus.style.background='#6b21a8';tabPlus.style.color='#f3e8ff';tabPlus.style.fontWeight='700';tabPeru.style.background='#0c1020';tabPeru.style.color='#4a6090';tabPeru.style.fontWeight='normal';btn.style.background='linear-gradient(135deg,#6b21a8,#4c1d95)';btn.style.borderColor='#a855f7';btn.style.color='#f3e8ff';btn.textContent='AGREGAR ZOOLO PLUS';}else{tabPeru.style.background='#0c4a9e';tabPeru.style.color='#e0f0ff';tabPeru.style.fontWeight='700';tabPlus.style.background='#0c1020';tabPlus.style.color='#4a6090';tabPlus.style.fontWeight='normal';btn.style.background='linear-gradient(135deg,#166534,#14532d)';btn.style.borderColor='#22c55e';btn.style.color='#dcfce7';btn.textContent='AGREGAR ZOOLO PERU';}}
 function renderTripModalGrid(){let g=document.getElementById('trip-modal-grid');if(!g)return;g.innerHTML='';ORDEN.forEach(k=>{if(!ANIMALES[k])return;let d=document.createElement('div');d.className='acard '+getCardClass(k);d.innerHTML='<div class="anum">'+k+'</div><div class="anom">'+ANIMALES[k]+'</div>';d.onclick=()=>selTripAnimModal(k);g.appendChild(d);});}
 function activarSlotModal(i){tripSlotModal=i;actualizarSlotsModal();}
 function selTripAnimModal(k){let otro=tripAnimModal.findIndex((x,idx)=>x===k&&idx!==tripSlotModal);if(otro>=0){toast('Animal ya seleccionado','err');return;}tripAnimModal[tripSlotModal]=k;actualizarSlotsModal();if(tripSlotModal<2){let nextEmpty=tripAnimModal.findIndex(x=>x===null,tripSlotModal+1);if(nextEmpty===-1)nextEmpty=tripSlotModal+1;if(nextEmpty<3)tripSlotModal=nextEmpty;}actualizarSlotsModal();}
@@ -3377,18 +3627,20 @@ function agregarItemRepetir(idx,tipo,seleccion,loteria){let monto=parseFloat(doc
 function agregarTodoRepetir(){let btns=document.querySelectorAll('#rep-contenido .rep-item button');btns.forEach(btn=>btn.click());}
 function setM(v){document.getElementById('monto').value=v;}
 function agregar(){let monto=parseFloat(document.getElementById('monto').value)||0;if(monto<=0){toast('Monto invalido','err');return;}let lot=loteriaActiva,sel=lot==='plus'?horasSelPlus:horasSel;if(espSel){if(sel.length===0){toast('Seleccione horario','err');return;}sel.forEach(h=>{let labels={'ROJO':'ROJO x2','NEGRO':'NEGRO x2','PAR':'PAR x2','IMPAR':'IMPAR x2'};carrito.push({tipo:'especial',hora:h,seleccion:espSel,monto,desc:labels[espSel],loteria:lot});});renderCarrito();toast('Especial agregado','ok');return;}if(animalesSel.length===0){toast('Seleccione animal(es)','err');return;}if(sel.length===0){toast('Seleccione horario(s)','err');return;}sel.forEach(h=>{animalesSel.forEach(k=>{carrito.push({tipo:'animal',hora:h,seleccion:k,monto,desc:k+'-'+ANIMALES[k],loteria:lot});});});animalesSel=[];document.querySelectorAll('.animals-grid .acard').forEach(c=>c.classList.remove('sel'));document.getElementById('manual-input').value='';renderCarrito();toast('Jugadas agregadas ('+lot.toUpperCase()+')','ok');}
-function renderCarrito(){let list=document.getElementById('ticket-list'),tot=document.getElementById('ticket-total');window._carritoLen=carrito.length;document.getElementById('btn-wa').disabled=(carrito.length===0||_sinConexion);if(!carrito.length){list.innerHTML='<div class="ticket-empty">TICKET VACIO</div>';tot.style.display='none';return;}let html='',total=0;carrito.forEach((it,i)=>{total+=it.monto;let lot=it.loteria||'peru',isTrip=it.tipo==='tripleta';let lotLabel=lot==='plus'?'<span style="background:#4c1d95;border:1px solid #a855f7;color:#e9d5ff;font-size:.58rem;font-family:\'Oswald\',sans-serif;padding:1px 5px;border-radius:3px;flex-shrink:0">PLUS</span>':'<span style="background:#0c2461;border:1px solid #3b9eff;color:#bae6fd;font-size:.58rem;font-family:\'Oswald\',sans-serif;padding:1px 5px;border-radius:3px;flex-shrink:0">PERU</span>';let horaLabel=it.hora==='TODO DIA'?'x60':it.hora.replace(':00','').replace(' ','');html+='<div class="ti"><span class="ti-hora">'+horaLabel+'</span>'+lotLabel+'<span class="ti-desc">'+it.desc+'</span><span class="ti-monto">'+it.monto+'</span><button class="ti-del" onclick="quitarItem('+i+')">X</button></div>';});list.innerHTML=html;tot.style.display='block';tot.textContent='TOTAL: S/ '+total.toFixed(2);}
+function renderCarrito(){let list=document.getElementById('ticket-list'),tot=document.getElementById('ticket-total');window._carritoLen=carrito.length;document.getElementById('btn-wa').disabled=(carrito.length===0||_sinConexion);if(!carrito.length){list.innerHTML='<div class="ticket-empty">TICKET VACIO</div>';tot.style.display='none';return;}let html='',totalPeru=0,totalPlus=0;carrito.forEach((it,i)=>{let lot=it.loteria||'peru';if(lot==='plus')totalPlus+=it.monto;else totalPeru+=it.monto;let lotLabel=lot==='plus'?'<span style="background:#4c1d95;border:1px solid #a855f7;color:#e9d5ff;font-size:.58rem;font-family:\'Oswald\',sans-serif;padding:1px 5px;border-radius:3px;flex-shrink:0">PLUS</span>':'<span style="background:#0c2461;border:1px solid #3b9eff;color:#bae6fd;font-size:.58rem;font-family:\'Oswald\',sans-serif;padding:1px 5px;border-radius:3px;flex-shrink:0">PERU</span>';let horaLabel=it.hora==='TODO DIA'?'x60':it.hora.replace(':00','').replace(' ','');html+='<div class="ti"><span class="ti-hora">'+horaLabel+'</span>'+lotLabel+'<span class="ti-desc">'+it.desc+'</span><span class="ti-monto">'+simb(lot)+it.monto+'</span><button class="ti-del" onclick="quitarItem('+i+')">X</button></div>';});list.innerHTML=html;tot.style.display='block';let lineas=[];if(totalPeru>0)lineas.push('PERU: S/ '+totalPeru.toFixed(2));if(totalPlus>0)lineas.push('PLUS: Bs '+totalPlus.toFixed(2));tot.innerHTML=lineas.map(l=>'TOTAL '+l).join('<br>');}
 function quitarItem(i){carrito.splice(i,1);renderCarrito();}
 function borrarTodo(){carrito=[];animalesSel=[];espSel=null;horasSel=[];horasSelPlus=[];document.querySelectorAll('.acard').forEach(c=>c.classList.remove('sel'));document.querySelectorAll('.esp-btn').forEach(e=>e.classList.remove('sel'));renderCarrito();toast('Ticket borrado','err');}
 async function vender(){if(!carrito.length){toast('Ticket vacio','err');return;}let btn=document.getElementById('btn-wa');btn.disabled=true;btn.textContent='PROCESANDO...';try{let r=await fetch('/api/procesar-venta',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({jugadas:carrito.map(c=>({hora:c.hora,seleccion:c.seleccion,monto:c.monto,tipo:c.tipo,loteria:c.loteria||'peru'}))})});let d=await r.json();if(d.error){toast(d.error,'err');}else{window.open(d.url_whatsapp,'_blank');toast('Ticket #'+d.ticket_id+' generado!','ok');carrito=[];animalesSel=[];if(espSel){document.getElementById('esp-'+espSel).classList.remove('sel');espSel=null;}horasSel=[];horasSelPlus=[];document.getElementById('manual-input').value='';renderCarrito();renderAnimales();renderHoras();}}catch(e){toast('Error de conexion','err');}finally{btn.disabled=false;btn.textContent='ENVIAR POR WHATSAPP';}}
 function openResultados(){if(!document.getElementById('res-fecha').value)document.getElementById('res-fecha').value=new Date().toISOString().split('T')[0];openMod('mod-resultados');cargarResultados();}
 function cargarResultados(){let f=document.getElementById('res-fecha').value;if(!f)return;let c=document.getElementById('res-lista');c.innerHTML='<p style="color:var(--text2);text-align:center;padding:10px;font-size:.75rem">CARGANDO...</p>';Promise.all([fetch('/api/resultados-fecha',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:f,loteria:'peru'})}).then(r=>r.json()),fetch('/api/resultados-fecha',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:f,loteria:'plus'})}).then(r=>r.json())]).then(([dp,dpl])=>{let html='<div style="color:#0ea5e9;font-family:\'Oswald\',sans-serif;font-size:.72rem;letter-spacing:2px;padding:4px 0 6px;border-bottom:1px solid #e2e8f0;margin-bottom:4px">ZOOLO PERU (11 SORTEOS)</div>';HPERU.forEach(h=>{let res=dp.resultados[h];html+='<div class="ri '+(res?'ok':'')+'"><span class="ri-hora">'+h.replace(':00 AM',' AM').replace(':00 PM',' PM')+'</span>'+(res?'<span class="ri-animal">'+res.animal+' - '+res.nombre+'</span>':'<span style="color:#4a6090;font-size:.78rem">PENDIENTE</span>')+'</div>';});html+='<div style="color:#a855f7;font-family:\'Oswald\',sans-serif;font-size:.72rem;letter-spacing:2px;padding:8px 0 6px;border-bottom:1px solid #e2e8f0;margin-top:10px;margin-bottom:4px">ZOOLO PLUS (12 SORTEOS)</div>';HPLUS.forEach(h=>{let res=dpl.resultados[h];html+='<div class="ri '+(res?'ok':'')+'"><span class="ri-hora">'+h.replace(':00 AM',' AM').replace(':00 PM',' PM')+'</span>'+(res?'<span class="ri-animal">'+res.animal+' - '+res.nombre+'</span>':'<span style="color:#4a6090;font-size:.78rem">PENDIENTE</span>')+'</div>';});c.innerHTML=html;}).catch(()=>{c.innerHTML='<p style="color:var(--red);text-align:center;padding:12px">Error de conexion</p>';});}
-function consultarTickets(){let ini=document.getElementById('mt-ini').value,fin=document.getElementById('mt-fin').value,est=document.getElementById('mt-estado').value;if(!ini||!fin){toast('Seleccione fechas','err');return;}let lista=document.getElementById('mt-lista');lista.innerHTML='<p style="color:#6090c0;text-align:center;padding:15px;font-size:.75rem">CARGANDO...</p>';fetch('/api/mis-tickets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin,estado:est})}).then(r=>r.json()).then(d=>{if(d.error){lista.innerHTML='<p style="color:#f87171;text-align:center">'+d.error+'</p>';return;}let res=document.getElementById('mt-resumen');res.style.display='block';res.textContent=d.totales.cantidad+' TICKET(S) - TOTAL: S/ '+d.totales.ventas.toFixed(2);if(!d.tickets.length){lista.innerHTML='<p style="color:#4a6090;text-align:center;padding:20px;font-size:.75rem">SIN RESULTADOS</p>';return;}let html='';d.tickets.forEach(t=>{let bc=t.pagado?'p':(t.premio_calculado>0?'g':'n'),bt=t.pagado?'PAGADO':(t.premio_calculado>0?'GANADOR':'PENDIENTE'),tc=t.pagado?'gano':(t.premio_calculado>0?'pte':'');html+='<div class="tcard '+tc+'"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:6px;margin-bottom:6px"><div><div class="ts">#'+t.serial+'</div><div style="color:#4a6090;font-size:.7rem">'+t.fecha+'</div></div><div style="text-align:right"><span class="badge '+bc+'">'+bt+'</span><div style="color:#fbbf24;font-family:\'Oswald\',sans-serif;font-size:.9rem;margin-top:3px;font-weight:700">S/'+t.total+'</div>'+(t.premio_calculado>0?'<div style="color:#4ade80;font-size:.82rem;font-weight:700;font-family:\'Oswald\',sans-serif">PREMIO: S/'+t.premio_calculado.toFixed(2)+'</div>':'')+'</div></div></div>';});lista.innerHTML=html;}).catch(()=>{lista.innerHTML='<p style="color:#f87171;text-align:center">Error de conexion</p>';});}
-function cajaHist(){let ini=document.getElementById('ar-ini').value,fin=document.getElementById('ar-fin').value;if(!ini||!fin){toast('Seleccione fechas','err');return;}let c=document.getElementById('ar-res');c.innerHTML='<p style="color:var(--text2);text-align:center;padding:10px;font-size:.75rem">CARGANDO...</p>';fetch('/api/caja-historico',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json()).then(d=>{if(d.error){c.innerHTML='<p style="color:var(--red)">'+d.error+'</p>';return;}let html='<div class="sbox">';d.resumen_por_dia.forEach(dia=>{let col=dia.balance>=0?'var(--green)':'var(--red)';html+='<div class="srow"><span class="sl">'+dia.fecha+'</span><span style="font-size:.72rem;color:var(--text2)">V:'+dia.ventas+'</span><span class="sv" style="color:'+col+'">S/'+dia.balance.toFixed(2)+'</span></div>';});html+='</div><div class="sbox"><div class="srow"><span class="sl">Ventas</span><span class="sv">S/'+d.totales.ventas.toFixed(2)+'</span></div><div class="srow"><span class="sl">Premios</span><span class="sv" style="color:var(--red)">S/'+d.totales.premios.toFixed(2)+'</span></div><div class="srow"><span class="sl">Comision</span><span class="sv">S/'+d.totales.comision.toFixed(2)+'</span></div><div class="srow"><span class="sl">Balance</span><span class="sv" style="color:'+(d.totales.balance>=0?'var(--green)':'var(--red)')+'">S/'+d.totales.balance.toFixed(2)+'</span></div></div>';c.innerHTML=html;});}
-function openCaja(){openMod('mod-caja');fetch('/api/caja').then(r=>r.json()).then(d=>{if(d.error)return;let bc=d.balance>=0?'g':'r';document.getElementById('caja-body').innerHTML='<div class="caja-grid"><div class="cg"><div class="cgl">VENTAS</div><div class="cgv">S/'+d.ventas.toFixed(2)+'</div></div><div class="cg"><div class="cgl">PREMIOS PAGADOS</div><div class="cgv r">S/'+d.premios.toFixed(2)+'</div></div><div class="cg"><div class="cgl">COMISION</div><div class="cgv">S/'+d.comision.toFixed(2)+'</div></div><div class="cg"><div class="cgl">BALANCE</div><div class="cgv '+bc+'">S/'+d.balance.toFixed(2)+'</div></div></div><div class="sbox"><div class="srow"><span class="sl">Tickets vendidos</span><span class="sv">'+d.total_tickets+'</span></div><div class="srow"><span class="sl">Con premio pendiente</span><span class="sv" style="color:#c08020">'+d.tickets_pendientes+'</span></div></div>';});}
+function consultarTickets(){let ini=document.getElementById('mt-ini').value,fin=document.getElementById('mt-fin').value,est=document.getElementById('mt-estado').value;if(!ini||!fin){toast('Seleccione fechas','err');return;}let lista=document.getElementById('mt-lista');lista.innerHTML='<p style="color:#6090c0;text-align:center;padding:15px;font-size:.75rem">CARGANDO...</p>';fetch('/api/mis-tickets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin,estado:est})}).then(r=>r.json()).then(d=>{if(d.error){lista.innerHTML='<p style="color:#f87171;text-align:center">'+d.error+'</p>';return;}let res=document.getElementById('mt-resumen');res.style.display='block';res.textContent=d.totales.cantidad+' TICKET(S) - PERU: S/ '+d.totales.ventas_peru.toFixed(2)+' | PLUS: Bs '+d.totales.ventas_plus.toFixed(2);if(!d.tickets.length){lista.innerHTML='<p style="color:#4a6090;text-align:center;padding:20px;font-size:.75rem">SIN RESULTADOS</p>';return;}let html='';d.tickets.forEach(t=>{let bc=t.pagado?'p':(t.premio_calculado>0?'g':'n'),bt=t.pagado?'PAGADO':(t.premio_calculado>0?'GANADOR':'PENDIENTE'),tc=t.pagado?'gano':(t.premio_calculado>0?'pte':'');let totStr=[];if(t.total_peru>0)totStr.push('S/'+t.total_peru.toFixed(2));if(t.total_plus>0)totStr.push('Bs'+t.total_plus.toFixed(2));let premStr='';if(t.premio_peru>0)premStr+='PREMIO PERU: S/'+t.premio_peru.toFixed(2)+' ';if(t.premio_plus>0)premStr+='PREMIO PLUS: Bs'+t.premio_plus.toFixed(2);html+='<div class="tcard '+tc+'"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:6px;margin-bottom:6px"><div><div class="ts">#'+t.serial+'</div><div style="color:#4a6090;font-size:.7rem">'+t.fecha+'</div></div><div style="text-align:right"><span class="badge '+bc+'">'+bt+'</span><div style="color:#fbbf24;font-family:\'Oswald\',sans-serif;font-size:.9rem;margin-top:3px;font-weight:700">'+totStr.join(' / ')+'</div>'+(premStr?'<div style="color:#4ade80;font-size:.78rem;font-weight:700;font-family:\'Oswald\',sans-serif">'+premStr+'</div>':'')+'</div></div></div>';});lista.innerHTML=html;}).catch(()=>{lista.innerHTML='<p style="color:#f87171;text-align:center">Error de conexion</p>';});}
+function cajaHist(){let ini=document.getElementById('ar-ini').value,fin=document.getElementById('ar-fin').value;if(!ini||!fin){toast('Seleccione fechas','err');return;}let c=document.getElementById('ar-res');c.innerHTML='<p style="color:var(--text2);text-align:center;padding:10px;font-size:.75rem">CARGANDO...</p>';fetch('/api/caja-historico',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json()).then(d=>{if(d.error){c.innerHTML='<p style="color:var(--red)">'+d.error+'</p>';return;}let html='<div class="sbox">';d.resumen_por_dia.forEach(dia=>{let colP=dia.peru.balance>=0?'var(--green)':'var(--red)';let colL=dia.plus.balance>=0?'var(--green)':'var(--red)';html+='<div class="srow"><span class="sl">'+dia.fecha+' ('+dia.tickets+' tk)</span><span></span></div>';if(dia.peru.ventas>0)html+='<div class="srow" style="padding-left:10px"><span style="font-size:.68rem;color:#0284c7">PERU V:'+dia.peru.ventas+'</span><span class="sv" style="color:'+colP+'">S/'+dia.peru.balance.toFixed(2)+'</span></div>';if(dia.plus.ventas>0)html+='<div class="srow" style="padding-left:10px"><span style="font-size:.68rem;color:#7c3aed">PLUS V:'+dia.plus.ventas+'</span><span class="sv" style="color:'+colL+'">Bs'+dia.plus.balance.toFixed(2)+'</span></div>';});html+='</div><div class="sbox"><div style="color:#0284c7;font-size:.68rem;letter-spacing:1px;margin-bottom:4px">TOTAL PERU</div><div class="srow"><span class="sl">Ventas</span><span class="sv">S/'+d.totales.peru.ventas.toFixed(2)+'</span></div><div class="srow"><span class="sl">Premios</span><span class="sv" style="color:var(--red)">S/'+d.totales.peru.premios.toFixed(2)+'</span></div><div class="srow"><span class="sl">Comision</span><span class="sv">S/'+d.totales.peru.comision.toFixed(2)+'</span></div><div class="srow"><span class="sl">Balance</span><span class="sv" style="color:'+(d.totales.peru.balance>=0?'var(--green)':'var(--red)')+'">S/'+d.totales.peru.balance.toFixed(2)+'</span></div></div><div class="sbox"><div style="color:#7c3aed;font-size:.68rem;letter-spacing:1px;margin-bottom:4px">TOTAL PLUS</div><div class="srow"><span class="sl">Ventas</span><span class="sv">Bs'+d.totales.plus.ventas.toFixed(2)+'</span></div><div class="srow"><span class="sl">Premios</span><span class="sv" style="color:var(--red)">Bs'+d.totales.plus.premios.toFixed(2)+'</span></div><div class="srow"><span class="sl">Comision</span><span class="sv">Bs'+d.totales.plus.comision.toFixed(2)+'</span></div><div class="srow"><span class="sl">Balance</span><span class="sv" style="color:'+(d.totales.plus.balance>=0?'var(--green)':'var(--red)')+'">Bs'+d.totales.plus.balance.toFixed(2)+'</span></div></div>';c.innerHTML=html;});}
+function cajaHistTickets(){let ini=document.getElementById('ar-ini').value,fin=document.getElementById('ar-fin').value;if(!ini||!fin){toast('Seleccione fechas','err');return;}let c=document.getElementById('ar-res');c.innerHTML='<p style="color:var(--text2);text-align:center;padding:10px;font-size:.75rem">CARGANDO...</p>';fetch('/api/tickets-detalle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json()).then(d=>{if(d.error){c.innerHTML='<p style="color:var(--red)">'+d.error+'</p>';return;}if(!d.tickets.length){c.innerHTML='<p style="color:var(--text2);text-align:center;padding:20px">Sin tickets en ese rango</p>';return;}let html='';d.tickets.forEach(function(t){let estado=t.anulado?'<span class="badge n" style="background:#7c2d12">ANULADO</span>':(t.pagado?'<span class="badge p">PAGADO</span>':'<span class="badge g">PENDIENTE</span>');let totales=[];if(t.total_peru>0)totales.push('S/'+t.total_peru.toFixed(2));if(t.total_plus>0)totales.push('Bs'+t.total_plus.toFixed(2));html+='<div class="tcard"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><div class="ts">#'+t.serial+' <span style="color:#4a6090;font-size:.68rem;font-weight:400">'+t.fecha+'</span></div><div>'+estado+' <span style="color:var(--gold);font-weight:700">'+totales.join(' / ')+'</span></div></div>';t.jugadas.forEach(function(j){let simbJ=j.loteria==='plus'?'Bs':'S/';html+='<div class="jrow"><span>'+j.hora+' — '+(j.tipo==='animal'?(j.seleccion+' '+j.nombre):j.seleccion)+'</span><span>'+simbJ+j.monto+'</span></div>';});t.tripletas.forEach(function(tr){let simbT=tr.loteria==='plus'?'Bs':'S/';html+='<div class="trip-row"><span>TRIPLETA '+tr.animales+'</span><span>'+simbT+tr.monto+'</span></div>';});html+='</div>';});c.innerHTML=html;});}
+function bloqueCaja(titulo,simbolo,d){let bc=d.balance>=0?'g':'r';return '<div style="color:var(--text2);font-size:.68rem;letter-spacing:2px;font-family:\'Oswald\',sans-serif;margin:10px 0 4px">'+titulo+'</div><div class="caja-grid"><div class="cg"><div class="cgl">VENTAS</div><div class="cgv">'+simbolo+d.ventas.toFixed(2)+'</div></div><div class="cg"><div class="cgl">PREMIOS PAGADOS</div><div class="cgv r">'+simbolo+d.premios.toFixed(2)+'</div></div><div class="cg"><div class="cgl">COMISION</div><div class="cgv">'+simbolo+d.comision.toFixed(2)+'</div></div><div class="cg"><div class="cgl">BALANCE</div><div class="cgv '+bc+'">'+simbolo+d.balance.toFixed(2)+'</div></div></div>';}
+function openCaja(){openMod('mod-caja');fetch('/api/caja').then(r=>r.json()).then(d=>{if(d.error)return;let html=bloqueCaja('ZOOLO PERU (S/)','S/',d.peru)+bloqueCaja('ZOOLO PLUS (Bs)','Bs',d.plus)+'<div class="sbox"><div class="srow"><span class="sl">Tickets vendidos</span><span class="sv">'+d.total_tickets+'</span></div><div class="srow"><span class="sl">Con premio pendiente</span><span class="sv" style="color:#c08020">'+d.tickets_pendientes+'</span></div></div>';document.getElementById('caja-body').innerHTML=html;});}
 function openPagar(){openMod('mod-pagar');document.getElementById('pag-serial').value='';document.getElementById('pag-res').innerHTML='';}
-function verificarTicket(){let s=document.getElementById('pag-serial').value.trim();if(!s)return;let c=document.getElementById('pag-res');fetch('/api/verificar-ticket',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({serial:s})}).then(r=>r.json()).then(d=>{if(d.error){c.innerHTML='<div style="background:var(--red-bg);color:var(--red);padding:10px;border-radius:3px;text-align:center;margin-top:8px;border:1px solid var(--red-border)">X '+d.error+'</div>';return;}let col=d.total_ganado>0?'var(--green)':'var(--text2)';c.innerHTML='<div style="border:1px solid '+col+';border-radius:4px;padding:14px;margin-top:10px"><div style="color:var(--teal);font-family:\'Oswald\',sans-serif;letter-spacing:2px;margin-bottom:10px">TICKET #'+s+'</div><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><span style="color:var(--text2);font-size:.8rem">PREMIO</span><span style="color:'+col+';font-family:\'Oswald\',sans-serif;font-size:1.2rem;font-weight:700">S/'+d.total_ganado.toFixed(2)+'</span></div>'+(d.total_ganado>0?'<button onclick="pagarTicket('+d.ticket_id+','+d.total_ganado+')" style="width:100%;padding:11px;background:linear-gradient(135deg,#0a3020,#062018);color:var(--green);border:1px solid #0d5a2a;border-radius:3px;font-weight:700;cursor:pointer;font-family:\'Oswald\',sans-serif;letter-spacing:2px;font-size:.85rem">CONFIRMAR PAGO S/'+d.total_ganado.toFixed(2)+'</button>':'<div style="color:var(--text2);text-align:center;font-size:.8rem;padding:6px">SIN PREMIO</div>')+'</div>';});}
-function pagarTicket(tid,m){if(!confirm('Confirmar pago S/'+m+'?'))return;fetch('/api/pagar-ticket',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ticket_id:tid})}).then(r=>r.json()).then(d=>{if(d.status==='ok'){toast('Ticket pagado','ok');closeMod('mod-pagar');}else toast(d.error||'Error','err');});}
+function verificarTicket(){let s=document.getElementById('pag-serial').value.trim();if(!s)return;let c=document.getElementById('pag-res');fetch('/api/verificar-ticket',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({serial:s})}).then(r=>r.json()).then(d=>{if(d.error){c.innerHTML='<div style="background:var(--red-bg);color:var(--red);padding:10px;border-radius:3px;text-align:center;margin-top:8px;border:1px solid var(--red-border)">X '+d.error+'</div>';return;}let col=d.total_ganado>0?'var(--green)':'var(--text2)';let premLineas=[];if(d.total_ganado_peru>0)premLineas.push('<div style="display:flex;justify-content:space-between"><span style="color:var(--text2);font-size:.75rem">PREMIO PERU</span><span style="color:var(--green);font-family:\'Oswald\',sans-serif;font-weight:700">S/'+d.total_ganado_peru.toFixed(2)+'</span></div>');if(d.total_ganado_plus>0)premLineas.push('<div style="display:flex;justify-content:space-between"><span style="color:var(--text2);font-size:.75rem">PREMIO PLUS</span><span style="color:var(--green);font-family:\'Oswald\',sans-serif;font-weight:700">Bs'+d.total_ganado_plus.toFixed(2)+'</span></div>');c.innerHTML='<div style="border:1px solid '+col+';border-radius:4px;padding:14px;margin-top:10px"><div style="color:var(--teal);font-family:\'Oswald\',sans-serif;letter-spacing:2px;margin-bottom:10px">TICKET #'+s+'</div>'+(premLineas.length?premLineas.join(''):'<div style="color:var(--text2);text-align:center;font-size:.8rem;padding:6px">SIN PREMIO</div>')+(d.total_ganado>0?'<button onclick="pagarTicket('+d.ticket_id+')" style="width:100%;padding:11px;margin-top:12px;background:linear-gradient(135deg,#0a3020,#062018);color:var(--green);border:1px solid #0d5a2a;border-radius:3px;font-weight:700;cursor:pointer;font-family:\'Oswald\',sans-serif;letter-spacing:2px;font-size:.85rem">CONFIRMAR PAGO</button>':'')+'</div>';});}
+function pagarTicket(tid){if(!confirm('¿Confirmar pago de este ticket?'))return;fetch('/api/pagar-ticket',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ticket_id:tid})}).then(r=>r.json()).then(d=>{if(d.status==='ok'){toast('Ticket pagado','ok');closeMod('mod-pagar');}else toast(d.error||'Error','err');});}
 function openAnular(){openMod('mod-anular');document.getElementById('an-serial').value='';document.getElementById('an-res').innerHTML='';}
 function anularTicket(){let s=document.getElementById('an-serial').value.trim();if(!s)return;fetch('/api/anular-ticket',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({serial:s})}).then(r=>r.json()).then(d=>{let c=document.getElementById('an-res');if(d.status==='ok')c.innerHTML='<div style="background:#062012;color:var(--green);padding:10px;border-radius:3px;text-align:center;margin-top:8px;border:1px solid #0d5a2a">'+d.mensaje+'</div>';else c.innerHTML='<div style="background:var(--red-bg);color:var(--red);padding:10px;border-radius:3px;text-align:center;margin-top:8px;border:1px solid var(--red-border)">'+d.error+'</div>';});}
 function openMod(id){document.getElementById(id).classList.add('open');}
@@ -3470,15 +3722,21 @@ input:focus,select:focus{outline:none;border-color:var(--blue)}
 .modo-badge.auto{background:#0a2a14;color:#4ade80;border:1px solid #166534}
 .modo-badge.manual{background:#1a1a00;color:#fbbf24;border:1px solid #854d0e}
 .modo-badge.pte{background:#0a0a1a;color:#4a6090;border:1px solid #1a2a4a}
+.ver-como-sel{background:#1a0a30;border:1px solid #a855f7;color:#e9d5ff;border-radius:3px;padding:5px 8px;font-family:'Oswald',sans-serif;font-size:.7rem;font-weight:700}
+#banner-solo-lectura{display:none;align-items:center;justify-content:center;gap:8px;background:#2a1a00;border-bottom:2px solid var(--gold);padding:7px 14px}
+#banner-solo-lectura span{color:var(--gold);font-family:'Oswald',sans-serif;font-size:.78rem;letter-spacing:1px;font-weight:700}
+body.solo-lectura .tc button,body.solo-lectura .tc input,body.solo-lectura .tc select{pointer-events:none!important;opacity:.45!important;cursor:not-allowed!important}
 </style></head><body>
 <div class="topbar">
   <div class="brand">ZOO<em>LO</em> <span style="font-size:.75rem;color:var(--text2);font-weight:400;letter-spacing:1px">ADMIN v4.1</span></div>
-  <div style="display:flex;gap:6px">
+  <div style="display:flex;gap:6px;align-items:center">
+    {% if es_superadmin %}<select id="ver-como-sel" class="ver-como-sel" onchange="cambiarVerComo()"><option value="">-- Ver mis propias agencias --</option></select>{% endif %}
     <div id="clock-admin" style="color:var(--gold);font-family:'Oswald',sans-serif;font-size:.8rem;background:var(--card);padding:4px 10px;border-radius:3px;border:1px solid var(--border)">--:-- LIMA</div>
     <button class="tbtn" style="background:#4a0808;border-color:var(--red);color:var(--red)" onclick="anularTicketAdmin()">ANULAR TICKET</button>
     <button class="tbtn exit" onclick="location.href='/logout'">SALIR</button>
   </div>
 </div>
+<div id="banner-solo-lectura"><span></span></div>
 <div class="tabs">
   <div class="tab active" onclick="showTab('resultados')">📊 RESULTADOS</div>
   <div class="tab" onclick="showTab('riesgo')">⚡ RIESGO</div>
@@ -3658,6 +3916,17 @@ input:focus,select:focus{outline:none;border-color:var(--blue)}
     </div>
     <div id="rep-periodo"></div>
   </div>
+  <div class="card">
+    <div class="card-title">🎫 TICKETS — DETALLE POR TICKET (auditoría)</div>
+    <div style="color:var(--text2);font-size:.72rem;margin-bottom:8px">Ve cada ticket de tus agencias con su serial, hora de cada jugada y qué se jugó — para resolver dudas o reclamos sin depender solo del balance general.</div>
+    <div class="frow">
+      <div class="fg"><label>INICIO</label><input type="date" id="tkd-ini"></div>
+      <div class="fg"><label>FIN</label><input type="date" id="tkd-fin"></div>
+      <div class="fg"><label>AGENCIA</label><select id="tkd-agencia-filtro"><option value="">Todas</option></select></div>
+    </div>
+    <button class="btn btn-block" onclick="cargarTicketsDetalle()">🔍 VER TICKETS</button>
+    <div id="tkd-resultado" style="margin-top:10px;max-height:500px;overflow-y:auto"></div>
+  </div>
 </div>
 
 <!-- TAB TRIPLETAS -->
@@ -3712,6 +3981,39 @@ const HPLUS = {{ horarios_plus | tojson }};
 const ES_SUPER = {{ 'true' if es_superadmin else 'false' }};
 const ORDEN = ['00','0','1','2','3','4','5','6','7','8','9','10','11','12','13','14','15','16','17','18','19','20','21','22','23','24','25','26','27','28','29','30','31','32','33','34','35','36','37','38','39','40'];
 let animalSel=null,lotRes='peru',lotRiesgo='peru',lotTopes='peru',lot7030='peru',_lotBloqAuto='peru';
+function simb(lot){ return lot==='plus' ? 'Bs' : 'S/'; }
+let verComoId=null,verComoNombre='';
+function esSoloLectura(){ return !!verComoId; }
+function urlVC(url){ if(!verComoId) return url; return url+(url.indexOf('?')>=0?'&':'?')+'ver_como='+verComoId; }
+function bodyVC(obj){ obj=obj||{}; if(verComoId) obj.ver_como=verComoId; return JSON.stringify(obj); }
+function bloquearSiSoloLectura(){ if(esSoloLectura()){ alert('Modo SOLO LECTURA: estás viendo a '+verComoNombre+'. No puedes modificar nada desde aquí.'); return true; } return false; }
+function actualizarBannerSoloLectura(){
+  var b=document.getElementById('banner-solo-lectura');
+  if(!b) return;
+  if(esSoloLectura()){ b.style.display='flex'; b.querySelector('span').textContent='👁 MODO SOLO LECTURA — Viendo a: '+verComoNombre+' (no puedes modificar nada)'; document.body.classList.add('solo-lectura'); }
+  else { b.style.display='none'; document.body.classList.remove('solo-lectura'); }
+}
+function cambiarVerComo(){
+  var sel=document.getElementById('ver-como-sel');
+  if(!sel) return;
+  verComoId = sel.value || null;
+  verComoNombre = sel.value ? sel.options[sel.selectedIndex].text : '';
+  actualizarBannerSoloLectura();
+  cargarResultadosAdmin();
+  listarAgencias();
+  if(document.getElementById('tc-riesgo').classList.contains('active')) cargarRiesgo();
+  if(document.getElementById('tc-tripletas').classList.contains('active')) cargarTripletas();
+}
+function cargarSelectorVerComo(){
+  if(!ES_SUPER) return;
+  fetch('/admin/lista-admins').then(function(r){return r.json();}).then(function(admins){
+    var sel=document.getElementById('ver-como-sel');
+    if(!sel) return;
+    var opts='<option value="">-- Ver mis propias agencias --</option>';
+    admins.forEach(function(a){ if(!a.es_superadmin) opts+='<option value="'+a.id+'">'+a.nombre_agencia+'</option>'; });
+    sel.innerHTML=opts;
+  }).catch(function(){});
+}
 
 function showTab(id){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
@@ -3730,6 +4032,7 @@ function actualizarClockAdmin(){let now=new Date(),utcMs=now.getTime()+now.getTi
 setInterval(actualizarClockAdmin,1000);actualizarClockAdmin();
 
 function anularTicketAdmin(){
+  if(bloquearSiSoloLectura()) return;
   let serial = prompt('Ingrese el SERIAL del ticket a anular:');
   if(!serial) return;
   serial = serial.trim();
@@ -3785,31 +4088,30 @@ function selLotRes(l){lotRes=l;document.getElementById('lot-res-peru').classList
 function selLotRiesgo(l){lotRiesgo=l;document.getElementById('lot-riesgo-peru').classList.toggle('active',l==='peru');document.getElementById('lot-riesgo-plus').classList.toggle('active',l==='plus');fillHorasRiesgo();cargarRiesgo();}
 function fillHorasRiesgo(){let s=document.getElementById('risk-hora');if(!s)return;let lista=lotRiesgo==='plus'?HPLUS:HPERU;s.innerHTML=lista.map(x=>'<option value="'+x+'">'+x+'</option>').join('');if(!s.value&&lista.length)s.value=lista[0];}
 
-function cargarRiesgo(){let hora=document.getElementById('risk-hora').value,lot=lotRiesgo;if(!hora)return;fetch('/admin/riesgo?hora='+encodeURIComponent(hora)+'&loteria='+lot).then(r=>r.json()).then(d=>{
+function cargarRiesgo(){let hora=document.getElementById('risk-hora').value,lot=lotRiesgo,sm2=simb(lot);if(!hora)return;fetch(urlVC('/admin/riesgo?hora='+encodeURIComponent(hora)+'&loteria='+lot)).then(r=>r.json()).then(d=>{
   let sm=document.getElementById('riesgo-summary');
-  sm.innerHTML='<div class="stat-box"><div class="stat-label">TOTAL APOSTADO</div><div class="stat-val">S/'+d.total_apostado.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PRESUPUESTO 70%</div><div class="stat-val t">S/'+d.presupuesto_70.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">SORTEO OBJETIVO</div><div class="stat-val">'+(d.sorteo_objetivo||hora)+'</div></div><div class="stat-box"><div class="stat-label">LOTE</div><div class="stat-val">'+lot.toUpperCase()+'</div></div>';
+  sm.innerHTML='<div class="stat-box"><div class="stat-label">TOTAL APOSTADO</div><div class="stat-val">'+sm2+d.total_apostado.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PRESUPUESTO 70%</div><div class="stat-val t">'+sm2+d.presupuesto_70.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">SORTEO OBJETIVO</div><div class="stat-val">'+(d.sorteo_objetivo||hora)+'</div></div><div class="stat-box"><div class="stat-label">LOTE</div><div class="stat-val">'+lot.toUpperCase()+'</div></div>';
   let agSel=document.getElementById('riesgo-agencia-sel');agSel.innerHTML='<option value="">-- Filtrar por agencia --</option>';if(d.agencias_hora&&d.agencias_hora.length){d.agencias_hora.forEach(a=>{let opt=document.createElement('option');opt.value=a.id;opt.textContent=a.nombre_agencia;agSel.appendChild(opt);});document.getElementById('riesgo-agencias-btn').style.display='block';}else{document.getElementById('riesgo-agencias-btn').style.display='none';}
   window._riesgoHora=hora;window._riesgoLot=lot;
   if(!d.riesgo||Object.keys(d.riesgo).length===0){document.getElementById('riesgo-tabla').innerHTML='<div style="color:var(--text2);text-align:center;padding:20px;font-size:.75rem">SIN APUESTAS EN ESTE SORTEO</div>';return;}
   let entries=Object.entries(d.riesgo).sort((a,b)=>b[1].apostado-a[1].apostado);
   let html='<table class="tbl"><thead><tr><th>N°</th><th>Animal</th><th>Apostado</th><th>Pagaría</th><th>%</th><th>Tope</th><th>%Bar</th></tr></thead><tbody>';
   let maxPag=Math.max(...entries.map(([_,v])=>v.pagaria));
-  entries.forEach(([k,v])=>{let pct=Math.min(100,maxPag>0?v.pagaria/maxPag*100:0);let col=pct>80?'var(--red)':pct>50?'var(--gold)':'var(--green)';let topeStr=v.libre?'<span class="tag info">LIBRE</span>':'<span style="color:'+(v.apostado>v.tope*.9?'var(--red)':'var(--text)')+';font-family:\'Oswald\',sans-serif;font-size:.75rem">S/'+v.tope+'</span>';let lech=v.es_lechuza?'<span class="tag warn" style="margin-left:4px">x70</span>':'';html+='<tr><td style="font-family:\'Oswald\',sans-serif;color:var(--gold)">'+k+'</td><td>'+v.nombre+lech+'</td><td style="color:var(--teal);font-family:\'Oswald\',sans-serif">S/'+v.apostado.toFixed(2)+'</td><td style="color:'+col+';font-family:\'Oswald\',sans-serif;font-weight:700">S/'+v.pagaria.toFixed(2)+'</td><td style="color:var(--text2)">'+v.porcentaje+'%</td><td>'+topeStr+'</td><td><div class="riesgo-bar"><div class="riesgo-fill" style="width:'+pct+'%;background:'+col+'"></div></div></td></tr>';});
+  entries.forEach(([k,v])=>{let pct=Math.min(100,maxPag>0?v.pagaria/maxPag*100:0);let col=pct>80?'var(--red)':pct>50?'var(--gold)':'var(--green)';let topeStr=v.libre?'<span class="tag info">LIBRE</span>':'<span style="color:'+(v.apostado>v.tope*.9?'var(--red)':'var(--text)')+';font-family:\'Oswald\',sans-serif;font-size:.75rem">'+sm2+v.tope+'</span>';let lech=v.es_lechuza?'<span class="tag warn" style="margin-left:4px">x70</span>':'';html+='<tr><td style="font-family:\'Oswald\',sans-serif;color:var(--gold)">'+k+'</td><td>'+v.nombre+lech+'</td><td style="color:var(--teal);font-family:\'Oswald\',sans-serif">'+sm2+v.apostado.toFixed(2)+'</td><td style="color:'+col+';font-family:\'Oswald\',sans-serif;font-weight:700">'+sm2+v.pagaria.toFixed(2)+'</td><td style="color:var(--text2)">'+v.porcentaje+'%</td><td>'+topeStr+'</td><td><div class="riesgo-bar"><div class="riesgo-fill" style="width:'+pct+'%;background:'+col+'"></div></div></td></tr>';});
   html+='</tbody></table>';document.getElementById('riesgo-tabla').innerHTML=html;}).catch(()=>{});}
 
-function verRiesgoAgencia(){let agId=document.getElementById('riesgo-agencia-sel').value,hora=window._riesgoHora;if(!agId||!hora)return;fetch('/admin/riesgo-agencia',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agencia_id:agId,hora:hora})}).then(r=>r.json()).then(d=>{if(d.error){alert(d.error);return;}let html='<div style="background:var(--card);border:1px solid var(--border);border-radius:4px;padding:10px;margin-top:8px"><div style="color:var(--gold);font-family:\'Oswald\',sans-serif;font-size:.75rem;margin-bottom:8px">'+d.agencia+' — '+d.hora+'</div><table class="tbl"><thead><tr><th>Animal/Esp.</th><th>Apostado</th><th>Pagaría</th><th>Tickets</th></tr></thead><tbody>';d.jugadas.forEach(j=>{html+='<tr><td style="color:var(--teal)">'+j.seleccion+' '+j.nombre+'</td><td style="font-family:\'Oswald\',sans-serif;color:var(--gold)">S/'+j.apostado.toFixed(2)+'</td><td style="color:'+(j.pagaria>0?'var(--red)':'var(--text2)')+'">S/'+j.pagaria.toFixed(2)+'</td><td>'+j.tickets+'</td></tr>';});html+='</tbody></table></div>';document.getElementById('riesgo-tabla').insertAdjacentHTML('afterend',html);}).catch(()=>{});}
+function verRiesgoAgencia(){let agId=document.getElementById('riesgo-agencia-sel').value,hora=window._riesgoHora;if(!agId||!hora)return;fetch('/admin/riesgo-agencia',{method:'POST',headers:{'Content-Type':'application/json'},body:bodyVC({agencia_id:agId,hora:hora})}).then(r=>r.json()).then(d=>{if(d.error){alert(d.error);return;}let html='<div style="background:var(--card);border:1px solid var(--border);border-radius:4px;padding:10px;margin-top:8px"><div style="color:var(--gold);font-family:\'Oswald\',sans-serif;font-size:.75rem;margin-bottom:8px">'+d.agencia+' — '+d.hora+'</div><table class="tbl"><thead><tr><th>Animal/Esp.</th><th>Apostado</th><th>Pagaría</th><th>Tickets</th></tr></thead><tbody>';d.jugadas.forEach(j=>{html+='<tr><td style="color:var(--teal)">'+j.seleccion+' '+j.nombre+'</td><td style="font-family:\'Oswald\',sans-serif;color:var(--gold)">S/'+j.apostado.toFixed(2)+'</td><td style="color:'+(j.pagaria>0?'var(--red)':'var(--text2)')+'">S/'+j.pagaria.toFixed(2)+'</td><td>'+j.tickets+'</td></tr>';});html+='</tbody></table></div>';document.getElementById('riesgo-tabla').insertAdjacentHTML('afterend',html);}).catch(()=>{});}
 
 function selLot7030(l){lot7030=l;document.getElementById('lot-7030-peru').classList.toggle('active',l==='peru');document.getElementById('lot-7030-plus').classList.toggle('active',l==='plus');}
-function cargar7030(){let f=document.getElementById('fecha-7030').value,lot=lot7030;fetch('/admin/reporte-7030',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:f||null,loteria:lot})}).then(r=>r.json()).then(d=>{if(d.error){document.getElementById('res-7030').innerHTML='<div class="card"><div style="color:var(--red);padding:12px">'+d.error+'</div></div>';return;}
+function cargar7030(){let f=document.getElementById('fecha-7030').value,lot=lot7030,sm2=simb(lot);fetch('/admin/reporte-7030',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:f||null,loteria:lot})}).then(r=>r.json()).then(d=>{if(d.error){document.getElementById('res-7030').innerHTML='<div class="card"><div style="color:var(--red);padding:12px">'+d.error+'</div></div>';return;}
 let totales=d.totales,sorteos=d.sorteos;
-let html='<div class="card"><div class="card-title">📊 '+lot7030.toUpperCase()+' — '+d.fecha+'</div><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px"><div class="stat-box"><div class="stat-label">TOTAL VENDIDO</div><div class="stat-val">S/'+totales.vendido.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PRESUPUESTO 70%</div><div class="stat-val t">S/'+totales.presupuesto_70.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PREMIOS PAGADOS</div><div class="stat-val r">S/'+totales.premio_pagado.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">CASA 30% BRUTO</div><div class="stat-val g">S/'+totales.para_casa_30.toFixed(2)+'</div></div></div><div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:14px"><div class="stat-box"><div class="stat-label">ACUM. FIN JORNADA</div><div class="stat-val">S/'+Math.abs(totales.acumulado_fin_jornada).toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">% PAGADO</div><div class="stat-val '+(totales.pct_pagado>70?'r':'g')+'">'+totales.pct_pagado+'%</div></div><div class="stat-box"><div class="stat-label">% CASA</div><div class="stat-val g">'+totales.pct_casa+'%</div></div></div><div style="overflow-x:auto"><table class="reporte-7030-table"><thead><tr><th>HORA</th><th>ANIMAL</th><th>VENDIDO</th><th>70%</th><th>ACUM.REC.</th><th>PRES.TOTAL</th><th>PREMIO</th><th>ACUM.GEN.</th><th>CASA 30%</th><th>MODO</th></tr></thead><tbody>';
-sorteos.forEach(s=>{let modoBadge=s.modo==='auto'?'<span class="modo-badge auto">AUTO</span>':s.modo==='manual'?'<span class="modo-badge manual">MANUAL</span>':'<span class="modo-badge pte">PEND.</span>';let animalStr=s.animal?'<span style="color:#4ade80;font-weight:700">'+s.animal+' — '+s.nombre+'</span>':'<span style="color:var(--text2)">—</span>';let pres_col=s.premio_pagado>s.presupuesto_total?'style="color:var(--red)"':'';html+='<tr class="'+((!s.realizado)?'pte':'')+'"><td style="color:var(--teal);font-family:\'Oswald\',sans-serif;font-size:.7rem;font-weight:700">'+s.hora.replace(':00 ','')+'</td><td>'+animalStr+'</td><td>S/'+s.vendido.toFixed(2)+'</td><td style="color:var(--teal)">S/'+s.presupuesto_70.toFixed(2)+'</td><td style="color:#a855f7">S/'+s.acum_recibido.toFixed(2)+'</td><td style="color:var(--gold)" '+pres_col+'>S/'+s.presupuesto_total.toFixed(2)+'</td><td style="color:var(--red)">S/'+s.premio_pagado.toFixed(2)+'</td><td style="color:var(--green)">S/'+s.acum_generado.toFixed(2)+'</td><td style="color:#22c55e">S/'+s.para_casa_30.toFixed(2)+'</td><td>'+modoBadge+'</td></tr>';});
-html+='</tbody><tfoot><tr><td colspan="2" style="color:var(--gold)">TOTALES</td><td>S/'+totales.vendido.toFixed(2)+'</td><td style="color:var(--teal)">S/'+totales.presupuesto_70.toFixed(2)+'</td><td>—</td><td>—</td><td style="color:var(--red)">S/'+totales.premio_pagado.toFixed(2)+'</td><td>—</td><td style="color:var(--green)">S/'+totales.para_casa_30.toFixed(2)+'</td><td></td></tr></tfoot></table></div></div>';
+let html='<div class="card"><div class="card-title">📊 '+lot7030.toUpperCase()+' — '+d.fecha+'</div><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px"><div class="stat-box"><div class="stat-label">TOTAL VENDIDO</div><div class="stat-val">'+sm2+totales.vendido.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PRESUPUESTO 70%</div><div class="stat-val t">'+sm2+totales.presupuesto_70.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PREMIOS PAGADOS</div><div class="stat-val r">'+sm2+totales.premio_pagado.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">CASA 30% BRUTO</div><div class="stat-val g">'+sm2+totales.para_casa_30.toFixed(2)+'</div></div></div><div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:14px"><div class="stat-box"><div class="stat-label">ACUM. FIN JORNADA</div><div class="stat-val">'+sm2+Math.abs(totales.acumulado_fin_jornada).toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">% PAGADO</div><div class="stat-val '+(totales.pct_pagado>70?'r':'g')+'">'+totales.pct_pagado+'%</div></div><div class="stat-box"><div class="stat-label">% CASA</div><div class="stat-val g">'+totales.pct_casa+'%</div></div></div><div style="overflow-x:auto"><table class="reporte-7030-table"><thead><tr><th>HORA</th><th>ANIMAL</th><th>VENDIDO</th><th>70%</th><th>ACUM.REC.</th><th>PRES.TOTAL</th><th>PREMIO</th><th>ACUM.GEN.</th><th>CASA 30%</th><th>MODO</th></tr></thead><tbody>';
+sorteos.forEach(s=>{let modoBadge=s.modo==='auto'?'<span class="modo-badge auto">AUTO</span>':s.modo==='manual'?'<span class="modo-badge manual">MANUAL</span>':'<span class="modo-badge pte">PEND.</span>';let animalStr=s.animal?'<span style="color:#4ade80;font-weight:700">'+s.animal+' — '+s.nombre+'</span>':'<span style="color:var(--text2)">—</span>';let pres_col=s.premio_pagado>s.presupuesto_total?'style="color:var(--red)"':'';html+='<tr class="'+((!s.realizado)?'pte':'')+'"><td style="color:var(--teal);font-family:\'Oswald\',sans-serif;font-size:.7rem;font-weight:700">'+s.hora.replace(':00 ','')+'</td><td>'+animalStr+'</td><td>'+sm2+s.vendido.toFixed(2)+'</td><td style="color:var(--teal)">'+sm2+s.presupuesto_70.toFixed(2)+'</td><td style="color:#a855f7">'+sm2+s.acum_recibido.toFixed(2)+'</td><td style="color:var(--gold)" '+pres_col+'>'+sm2+s.presupuesto_total.toFixed(2)+'</td><td style="color:var(--red)">'+sm2+s.premio_pagado.toFixed(2)+'</td><td style="color:var(--green)">'+sm2+s.acum_generado.toFixed(2)+'</td><td style="color:#22c55e">'+sm2+s.para_casa_30.toFixed(2)+'</td><td>'+modoBadge+'</td></tr>';});
+html+='</tbody><tfoot><tr><td colspan="2" style="color:var(--gold)">TOTALES</td><td>'+sm2+totales.vendido.toFixed(2)+'</td><td style="color:var(--teal)">'+sm2+totales.presupuesto_70.toFixed(2)+'</td><td>—</td><td>—</td><td style="color:var(--red)">'+sm2+totales.premio_pagado.toFixed(2)+'</td><td>—</td><td style="color:var(--green)">'+sm2+totales.para_casa_30.toFixed(2)+'</td><td></td></tr></tfoot></table></div></div>';
 document.getElementById('res-7030').innerHTML=html;}).catch(e=>document.getElementById('res-7030').innerHTML='<div class="card"><div style="color:var(--red)">Error: '+e+'</div></div>');}
 
 function listarAgencias(){
-  var doRender=function(adminsMap){
-    fetch('/admin/lista-agencias').then(function(r){return r.json();}).then(function(ags){
+  fetch(urlVC('/admin/lista-agencias')).then(function(r){return r.json();}).then(function(ags){
       var html='';
       if(!ags.length){document.getElementById('ag-lista').innerHTML='<div style="color:var(--text2);text-align:center;padding:20px">Sin agencias</div>';return;}
       window._agMap={};
@@ -3818,41 +4120,60 @@ function listarAgencias(){
         var topeStr=ag.tope_taquilla?'S/'+ag.tope_taquilla:'Sin limite';
         var bancoStr=ag.nombre_banco?'<div style="color:#a0b0c0;font-size:.68rem">Banco: '+ag.nombre_banco+'</div>':'';
         var estadoTag='<span class="tag '+(ag.activa?'ok':'err')+'">'+(ag.activa?'ACTIVA':'INACTIVA')+'</span>';
-        var duenoStr='',reasignStr='';
-        if(ES_SUPER){
-          var dnom=(adminsMap&&adminsMap[ag.admin_id])?adminsMap[ag.admin_id]:(ag.admin_id?('ID '+ag.admin_id):'Sin asignar');
-          duenoStr='<div style="color:#c084fc;font-size:.66rem">Dueno: '+dnom+'</div>';
-          var opts='';for(var k in adminsMap){opts+='<option value="'+k+'" '+(String(k)===String(ag.admin_id)?'selected':'')+'>'+adminsMap[k]+'</option>';}
-          reasignStr='<div style="display:flex;gap:4px;margin-top:5px;align-items:center"><span style="color:var(--text2);font-size:.62rem">Dueno:</span><select id="owner-'+ag.id+'" style="flex:1;padding:4px;font-size:.7rem">'+opts+'</select><button class="btn" style="padding:4px 10px;font-size:.65rem;background:#1a0a30;border-color:#a855f7;color:#c084fc" onclick="reasignarDueno('+ag.id+')">Reasignar</button></div>';
-        }
-        html+='<div style="background:var(--card);border:1px solid var(--border);border-radius:4px;padding:10px;margin-bottom:8px"><div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px"><div><div style="color:var(--gold);font-weight:700">'+ag.nombre_agencia+'</div><div style="color:var(--text2);font-size:.72rem">'+ag.usuario+' | Com: '+(ag.comision*100).toFixed(0)+'% | Tope: '+topeStr+'</div>'+bancoStr+duenoStr+'</div><div>'+estadoTag+'</div></div><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:5px"><input id="nb-'+ag.id+'" placeholder="Banco" value="'+(ag.nombre_banco||'')+'" style="padding:4px;font-size:.7rem"><input id="pass-'+ag.id+'" placeholder="Nueva clave" type="password" style="padding:4px;font-size:.7rem"><input id="com-'+ag.id+'" placeholder="Comision%" value="'+(ag.comision*100).toFixed(0)+'" type="number" step="1" style="padding:4px;font-size:.7rem"><input id="tope-'+ag.id+'" placeholder="Tope taquilla" value="'+(ag.tope_taquilla||0)+'" type="number" step="10" style="padding:4px;font-size:.7rem"></div>'+reasignStr+'<div style="display:flex;gap:4px;margin-top:5px;flex-wrap:wrap"><button class="btn" style="padding:4px 10px;font-size:.65rem" onclick="editarAg('+ag.id+')">Guardar</button><button class="btn '+(ag.activa?'red':'green')+'" style="padding:4px 10px;font-size:.65rem" onclick="toggleAg('+ag.id+','+(ag.activa?0:1)+')">'+(ag.activa?'Suspender':'Activar')+'</button><button class="btn" style="padding:4px 10px;font-size:.65rem;background:#1a0a30;border-color:#a855f7;color:#c084fc" onclick="verReporteAgencia('+ag.id+')">Reporte</button><button class="btn red" style="padding:4px 10px;font-size:.65rem" onclick="eliminarAgencia('+ag.id+')">Eliminar</button></div></div>';
+        html+='<div style="background:var(--card);border:1px solid var(--border);border-radius:4px;padding:10px;margin-bottom:8px"><div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px"><div><div style="color:var(--gold);font-weight:700">'+ag.nombre_agencia+'</div><div style="color:var(--text2);font-size:.72rem">'+ag.usuario+' | Com: '+(ag.comision*100).toFixed(0)+'% | Tope: '+topeStr+'</div>'+bancoStr+'</div><div>'+estadoTag+'</div></div><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:5px"><input id="nb-'+ag.id+'" placeholder="Banco" value="'+(ag.nombre_banco||'')+'" style="padding:4px;font-size:.7rem"><input id="pass-'+ag.id+'" placeholder="Nueva clave" type="password" style="padding:4px;font-size:.7rem"><input id="com-'+ag.id+'" placeholder="Comision%" value="'+(ag.comision*100).toFixed(0)+'" type="number" step="1" style="padding:4px;font-size:.7rem"><input id="tope-'+ag.id+'" placeholder="Tope taquilla" value="'+(ag.tope_taquilla||0)+'" type="number" step="10" style="padding:4px;font-size:.7rem"></div><div style="display:flex;gap:4px;margin-top:5px;flex-wrap:wrap"><button class="btn" style="padding:4px 10px;font-size:.65rem" onclick="editarAg('+ag.id+')">Guardar</button><button class="btn '+(ag.activa?'red':'green')+'" style="padding:4px 10px;font-size:.65rem" onclick="toggleAg('+ag.id+','+(ag.activa?0:1)+')">'+(ag.activa?'Suspender':'Activar')+'</button><button class="btn" style="padding:4px 10px;font-size:.65rem;background:#1a0a30;border-color:#a855f7;color:#c084fc" onclick="verReporteAgencia('+ag.id+')">Reporte</button><button class="btn red" style="padding:4px 10px;font-size:.65rem" onclick="eliminarAgencia('+ag.id+')">Eliminar</button></div></div>';
       });
       document.getElementById('ag-lista').innerHTML=html;
-    });
-  };
-  if(ES_SUPER){fetch('/admin/lista-admins').then(function(r){return r.json();}).then(function(admins){var m={};admins.forEach(function(a){m[a.id]=a.nombre_agencia;});doRender(m);}).catch(function(){doRender({});});}
-  else{doRender({});}
+  }).catch(function(){});
 }
-function crearAgencia(){let u=document.getElementById('ag-user').value.trim(),p=document.getElementById('ag-pass').value.trim(),n=document.getElementById('ag-nombre').value.trim(),nb=document.getElementById('ag-banco').value.trim();if(!u||!p||!n){showMsg('msg-ag','Complete todos los campos requeridos','err');return;}let fd=new FormData();fd.append('usuario',u);fd.append('password',p);fd.append('nombre',n);fd.append('nombre_banco',nb);fetch('/admin/crear-agencia',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{if(d.status==='ok'){showMsg('msg-ag',d.mensaje,'ok');['ag-user','ag-pass','ag-nombre','ag-banco'].forEach(i=>document.getElementById(i).value='');listarAgencias();}else showMsg('msg-ag',d.error,'err');});}
-function editarAg(id){let data={id,nombre_banco:document.getElementById('nb-'+id).value,password:document.getElementById('pass-'+id).value,comision:parseFloat(document.getElementById('com-'+id).value)||0,tope_taquilla:parseFloat(document.getElementById('tope-'+id).value)||0};fetch('/admin/editar-agencia',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}).then(r=>r.json()).then(d=>{if(d.status==='ok')alert('✅ Guardado');else alert(d.error);listarAgencias();});}
-function toggleAg(id,activa){fetch('/admin/editar-agencia',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,activa})}).then(r=>r.json()).then(()=>listarAgencias());}
-function eliminarAgencia(id){let nombre=window._agMap&&window._agMap[id]?window._agMap[id]:'Agencia '+id;if(!confirm('¿ELIMINAR la agencia "'+nombre+'"?\n\nEsta acción es permanente.'))return;fetch('/admin/eliminar-agencia',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}).then(r=>r.json()).then(d=>{if(d.status==='ok'){alert('✅ '+d.mensaje);listarAgencias();}else alert('❌ '+d.error);}).catch(()=>alert('Error de conexión'));}
+function crearAgencia(){if(bloquearSiSoloLectura())return;let u=document.getElementById('ag-user').value.trim(),p=document.getElementById('ag-pass').value.trim(),n=document.getElementById('ag-nombre').value.trim(),nb=document.getElementById('ag-banco').value.trim();if(!u||!p||!n){showMsg('msg-ag','Complete todos los campos requeridos','err');return;}let fd=new FormData();fd.append('usuario',u);fd.append('password',p);fd.append('nombre',n);fd.append('nombre_banco',nb);fetch('/admin/crear-agencia',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{if(d.status==='ok'){showMsg('msg-ag',d.mensaje,'ok');['ag-user','ag-pass','ag-nombre','ag-banco'].forEach(i=>document.getElementById(i).value='');listarAgencias();}else showMsg('msg-ag',d.error,'err');});}
+function editarAg(id){if(bloquearSiSoloLectura())return;let data={id,nombre_banco:document.getElementById('nb-'+id).value,password:document.getElementById('pass-'+id).value,comision:parseFloat(document.getElementById('com-'+id).value)||0,tope_taquilla:parseFloat(document.getElementById('tope-'+id).value)||0};fetch('/admin/editar-agencia',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}).then(r=>r.json()).then(d=>{if(d.status==='ok')alert('✅ Guardado');else alert(d.error);listarAgencias();});}
+function toggleAg(id,activa){if(bloquearSiSoloLectura())return;fetch('/admin/editar-agencia',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,activa})}).then(r=>r.json()).then(()=>listarAgencias());}
+function eliminarAgencia(id){if(bloquearSiSoloLectura())return;let nombre=window._agMap&&window._agMap[id]?window._agMap[id]:'Agencia '+id;if(!confirm('¿ELIMINAR la agencia "'+nombre+'"?\n\nEsta acción es permanente.'))return;fetch('/admin/eliminar-agencia',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}).then(r=>r.json()).then(d=>{if(d.status==='ok'){alert('✅ '+d.mensaje);listarAgencias();}else alert('❌ '+d.error);}).catch(()=>alert('Error de conexión'));}
 function verReporteAgencia(id){let nombre=window._agMap&&window._agMap[id]?window._agMap[id]:'Agencia '+id;let ini=prompt('Fecha inicio (YYYY-MM-DD) para '+nombre+':');if(!ini)return;let fin=prompt('Fecha fin (YYYY-MM-DD):');if(!fin)return;fetch('/admin/reporte-agencia-horas',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agencia_id:id,fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json()).then(d=>{if(d.error){alert(d.error);return;}let ventana=window.open('','_blank');let w=ventana.document;w.open();w.write('<html><head><title>Reporte</title></head><body style="font-family:monospace;background:#050a12;color:#c0d8f0;padding:20px">');w.write('<h2 style="color:#f5a623">'+nombre+' ('+d.usuario+')</h2>');w.write('<h3>Total: S/'+d.total_general+'</h3>');d.resumen.forEach(function(h){w.write('<h4 style="color:#00c8e8">'+h.hora+' - S/'+h.total+' ('+h.conteo+' jugadas)</h4>');w.write('<table border=1 cellpadding=4 style="border-collapse:collapse;color:#c0d8f0;border-color:#1a2a4a"><tr><th>Animal</th><th>Tipo</th><th>Apostado</th><th>Tickets</th></tr>');h.jugadas.forEach(function(j){w.write('<tr><td>'+j.seleccion+' '+j.nombre+'</td><td>'+j.tipo+'</td><td>S/'+j.apostado+'</td><td>'+j.cnt+'</td></tr>');});w.write('</table><br>');});w.write('</body></html>');w.close();});}
 
 function selLotTopes(l){lotTopes=l;document.getElementById('lot-topes-peru').classList.toggle('active',l==='peru');document.getElementById('lot-topes-plus').classList.toggle('active',l==='plus');fillHorasTopes();cargarTopes();}
 function fillHorasTopes(){let s=document.getElementById('tope-hora'),lista=lotTopes==='plus'?HPLUS:HPERU;s.innerHTML=lista.map(x=>'<option value="'+x+'">'+x+'</option>').join('');}
-function cargarTopes(){let hora=document.getElementById('tope-hora').value,lot=lotTopes;fetch('/admin/topes?hora='+encodeURIComponent(hora)+'&loteria='+lot).then(r=>r.json()).then(d=>{if(d.error){document.getElementById('topes-body').innerHTML='<div style="color:var(--red)">'+d.error+'</div>';return;}let html='<table class="tbl"><thead><tr><th>N°</th><th>Animal</th><th>Apostado Hoy</th><th>Tope</th><th>Disponible</th>'+(ES_SUPER?'<th>Acción</th>':'')+'</tr></thead><tbody>';ORDEN.forEach(k=>{if(!ANIMALES[k])return;let t=d.topes.find(x=>x.numero===k);let apt=t?t.apostado:0,tope=t?t.tope:0,disp=t?t.disponible:null;let dispStr=disp!==null?'<span style="color:'+(disp<10?'var(--red)':disp<50?'var(--gold)':'var(--green)')+';font-family:\'Oswald\',sans-serif">S/'+disp.toFixed(2)+'</span>':'<span class="tag info">LIBRE</span>';html+='<tr><td style="font-family:\'Oswald\',sans-serif;color:var(--gold)">'+k+'</td><td>'+ANIMALES[k]+'</td><td style="color:var(--teal);font-family:\'Oswald\',sans-serif">'+(apt>0?'S/'+apt.toFixed(2):'—')+'</td><td>'+(ES_SUPER?('<input type="number" id="tope-monto-'+k+'" value="'+(tope||'')+'" placeholder="Sin tope" style="width:90px;padding:4px;font-size:.75rem" min="0" step="5">'):('<span style="font-family:Oswald,sans-serif;color:var(--gold)">'+(tope>0?'S/'+tope.toFixed(2):'—')+'</span>'))+'</td><td>'+dispStr+'</td>'+(ES_SUPER?('<td><button class="btn" style="padding:3px 8px;font-size:.65rem" onclick="guardarTope(\''+k+'\',\''+hora+'\',\''+lot+'\')">💾</button>'+(tope>0?'<button class="btn red" style="padding:3px 8px;font-size:.65rem;margin-left:4px" onclick="liberarTope(\''+k+'\',\''+hora+'\',\''+lot+'\')">✕</button>':'&nbsp;')+'</td>'):'')+'</tr>';});html+='</tbody></table>';document.getElementById('topes-body').innerHTML=html;});}function guardarTope(num,hora,lot){if(!ES_SUPER){alert('Solo el administrador principal puede modificar topes');return;}let monto=parseFloat(document.getElementById('tope-monto-'+num).value)||0;fetch('/admin/topes/guardar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hora,numero:num,monto,loteria:lot})}).then(r=>r.json()).then(d=>{if(d.status==='ok')cargarTopes();else alert(d.error);});}
+function cargarTopes(){let hora=document.getElementById('tope-hora').value,lot=lotTopes,sm2=simb(lot);fetch('/admin/topes?hora='+encodeURIComponent(hora)+'&loteria='+lot).then(r=>r.json()).then(d=>{if(d.error){document.getElementById('topes-body').innerHTML='<div style="color:var(--red)">'+d.error+'</div>';return;}let html='<table class="tbl"><thead><tr><th>N°</th><th>Animal</th><th>Apostado Hoy</th><th>Tope</th><th>Disponible</th>'+(ES_SUPER?'<th>Acción</th>':'')+'</tr></thead><tbody>';ORDEN.forEach(k=>{if(!ANIMALES[k])return;let t=d.topes.find(x=>x.numero===k);let apt=t?t.apostado:0,tope=t?t.tope:0,disp=t?t.disponible:null;let dispStr=disp!==null?'<span style="color:'+(disp<10?'var(--red)':disp<50?'var(--gold)':'var(--green)')+';font-family:\'Oswald\',sans-serif">'+sm2+disp.toFixed(2)+'</span>':'<span class="tag info">LIBRE</span>';html+='<tr><td style="font-family:\'Oswald\',sans-serif;color:var(--gold)">'+k+'</td><td>'+ANIMALES[k]+'</td><td style="color:var(--teal);font-family:\'Oswald\',sans-serif">'+(apt>0?sm2+apt.toFixed(2):'—')+'</td><td>'+(ES_SUPER?('<input type="number" id="tope-monto-'+k+'" value="'+(tope||'')+'" placeholder="Sin tope" style="width:90px;padding:4px;font-size:.75rem" min="0" step="5">'):('<span style="font-family:Oswald,sans-serif;color:var(--gold)">'+(tope>0?sm2+tope.toFixed(2):'—')+'</span>'))+'</td><td>'+dispStr+'</td>'+(ES_SUPER?('<td><button class="btn" style="padding:3px 8px;font-size:.65rem" onclick="guardarTope(\''+k+'\',\''+hora+'\',\''+lot+'\')">💾</button>'+(tope>0?'<button class="btn red" style="padding:3px 8px;font-size:.65rem;margin-left:4px" onclick="liberarTope(\''+k+'\',\''+hora+'\',\''+lot+'\')">✕</button>':'&nbsp;')+'</td>'):'')+'</tr>';});html+='</tbody></table>';document.getElementById('topes-body').innerHTML=html;});}function guardarTope(num,hora,lot){if(!ES_SUPER){alert('Solo el administrador principal puede modificar topes');return;}let monto=parseFloat(document.getElementById('tope-monto-'+num).value)||0;fetch('/admin/topes/guardar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hora,numero:num,monto,loteria:lot})}).then(r=>r.json()).then(d=>{if(d.status==='ok')cargarTopes();else alert(d.error);});}
 function liberarTope(num,hora,lot){if(!ES_SUPER)return;fetch('/admin/topes/guardar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hora,numero:num,monto:0,loteria:lot})}).then(r=>r.json()).then(d=>{if(d.status==='ok')cargarTopes();});}
 function limpiarTopes(){if(!ES_SUPER){alert('Solo el administrador principal puede modificar topes');return;}let hora=document.getElementById('tope-hora').value,lot=lotTopes;if(!confirm('¿Eliminar TODOS los topes de '+hora+' ('+lot+')?'))return;fetch('/admin/topes/limpiar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hora,loteria:lot})}).then(r=>r.json()).then(d=>{if(d.status==='ok')cargarTopes();else alert(d.error);});}
 
-function cargarReporteHoy(){fetch('/admin/reporte-agencias').then(r=>r.json()).then(d=>{let html='<table class="tbl"><thead><tr><th>Agencia</th><th>Tickets</th><th>Ventas</th><th>Premios Pagados</th><th>Pendientes</th><th>Total Premios</th><th>Comision</th><th>Balance</th></tr></thead><tbody>';d.agencias.forEach(a=>{let bc=a.balance>=0?'var(--green)':'var(--red)';let pend=a.premios_pendientes||0;html+='<tr><td><span style="color:var(--gold)">'+a.nombre+'</span><br><span style="color:var(--text2);font-size:.65rem">'+a.usuario+'</span></td><td>'+a.tickets+'</td><td>S/'+a.ventas.toFixed(2)+'</td><td style="color:var(--red)">S/'+a.premios_pagados.toFixed(2)+'</td><td style="color:var(--gold)">'+(pend>0?'S/'+pend.toFixed(2):'—')+'</td><td style="color:var(--red);font-weight:700">S/'+a.premios_total.toFixed(2)+'</td><td>S/'+a.comision.toFixed(2)+'</td><td style="color:'+bc+';font-weight:700">S/'+a.balance.toFixed(2)+'</td></tr>';});html+='<tfoot><tr><td colspan="2" style="color:var(--gold)">GLOBAL</td><td>S/'+d.global.ventas.toFixed(2)+'</td><td style="color:var(--red)">S/'+d.global.pagos.toFixed(2)+'</td><td></td><td></td><td>S/'+d.global.comisiones.toFixed(2)+'</td><td style="color:'+(d.global.balance>=0?'var(--green)':'var(--red)')+';font-weight:700">S/'+d.global.balance.toFixed(2)+'</td></tr></tfoot></table>';document.getElementById('rep-hoy').innerHTML=html;document.getElementById('btn-csv').disabled=false;document.getElementById('btn-csv').style.opacity=1;});}
-function cargarEstadisticas(){let ini=document.getElementById('rep-ini').value,fin=document.getElementById('rep-fin').value;if(!ini||!fin){alert('Seleccione fechas');return;}fetch('/admin/estadisticas-rango',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json()).then(d=>{let t=d.totales;let vAnim=Math.round((t.ventas-(t.tripletas||0))*100)/100;let html='<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin:12px 0"><div class="stat-box"><div class="stat-label">VENTAS ANIMALES</div><div class="stat-val">S/'+vAnim.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">TRIPLETAS</div><div class="stat-val" style="color:#c084fc">S/'+(t.tripletas||0).toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">TOTAL INGRESOS</div><div class="stat-val" style="color:var(--gold)">S/'+t.ventas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PREMIOS</div><div class="stat-val r">S/'+t.premios.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">COMISIONES</div><div class="stat-val">S/'+t.comisiones.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">BALANCE</div><div class="stat-val" style="color:'+(t.balance>=0?'var(--green)':'var(--red)')+'">S/'+t.balance.toFixed(2)+'</div></div></div>';html+='<table class="tbl"><thead><tr><th>Fecha</th><th>Tickets</th><th>V.Animales</th><th style="color:#c084fc">Tripletas</th><th style="color:var(--gold)">Total</th><th>Premios</th><th>Comisiones</th><th>Balance</th></tr></thead><tbody>';d.resumen_por_dia.forEach(function(r){var bc=r.balance>=0?'var(--green)':'var(--red)';var va=Math.round((r.ventas-(r.tripletas||0))*100)/100;html+='<tr><td>'+r.fecha+'</td><td>'+r.tickets+'</td><td>S/'+va.toFixed(2)+'</td><td style="color:#c084fc">S/'+(r.tripletas||0).toFixed(2)+'</td><td style="color:var(--gold);font-weight:700">S/'+r.ventas.toFixed(2)+'</td><td style="color:var(--red)">S/'+r.premios.toFixed(2)+'</td><td>S/'+r.comisiones.toFixed(2)+'</td><td style="color:'+bc+';font-weight:700">S/'+r.balance.toFixed(2)+'</td></tr>';});html+='</tbody></table>';document.getElementById('rep-periodo').innerHTML=html;});}
-function cargarReporteAgencias(){let ini=document.getElementById('rep-ini').value,fin=document.getElementById('rep-fin').value;if(!ini||!fin){alert('Seleccione fechas');return;}fetch('/admin/reporte-agencias-rango',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json()).then(d=>{let html='<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:12px 0"><div class="stat-box"><div class="stat-label">TOTAL VENTAS</div><div class="stat-val">S/'+d.total.ventas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PREMIOS</div><div class="stat-val r">S/'+d.total.premios.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">COMISIONES</div><div class="stat-val">S/'+d.total.comision.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">BALANCE</div><div class="stat-val '+(d.total.balance>=0?'g':'r')+'">S/'+d.total.balance.toFixed(2)+'</div></div></div>';html+='<table class="tbl"><thead><tr><th>Agencia</th><th>Tickets</th><th>Ventas</th><th>% del Total</th><th>Premios</th><th>Comisión</th><th>Balance</th></tr></thead><tbody>';d.agencias.forEach(a=>{let bc=a.balance>=0?'var(--green)':'var(--red)';html+='<tr><td><span style="color:var(--gold)">'+a.nombre+'</span><br><span style="color:var(--text2);font-size:.65rem">'+a.usuario+'</span></td><td>'+a.tickets+'</td><td>S/'+a.ventas.toFixed(2)+'</td><td style="color:var(--text2)">'+(a.porcentaje_ventas||0)+'%</td><td style="color:var(--red)">S/'+a.premios_teoricos.toFixed(2)+'</td><td>S/'+a.comision.toFixed(2)+'</td><td style="color:'+bc+';font-family:\'Oswald\',sans-serif">S/'+a.balance.toFixed(2)+'</td></tr>';});html+='</tbody></table>';document.getElementById('rep-periodo').innerHTML=html;});}
-function exportarCSV(){let ini=document.getElementById('rep-ini').value,fin=document.getElementById('rep-fin').value;if(!ini||!fin){alert('Seleccione fechas');return;}fetch('/admin/exportar-csv',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.blob()).then(blob=>{let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='reporte_'+ini+'_'+fin+'.csv';a.click();});}
+function cargarReporteHoy(){fetch(urlVC('/admin/reporte-agencias')).then(r=>r.json()).then(d=>{let html='<table class="tbl"><thead><tr><th>Agencia</th><th>Tickets</th><th colspan="4" style="text-align:center;color:#0284c7">ZOOLO PERU (S/)</th><th colspan="4" style="text-align:center;color:#a855f7">ZOOLO PLUS (Bs)</th></tr><tr><th></th><th></th><th>Ventas</th><th>Premios</th><th>Comisión</th><th>Balance</th><th>Ventas</th><th>Premios</th><th>Comisión</th><th>Balance</th></tr></thead><tbody>';d.agencias.forEach(a=>{let bcP=a.peru.balance>=0?'var(--green)':'var(--red)';let bcL=a.plus.balance>=0?'var(--green)':'var(--red)';html+='<tr><td><span style="color:var(--gold)">'+a.nombre+'</span><br><span style="color:var(--text2);font-size:.65rem">'+a.usuario+'</span></td><td>'+a.tickets+'</td><td>S/'+a.peru.ventas.toFixed(2)+'</td><td style="color:var(--red)">S/'+a.peru.premios_total.toFixed(2)+'</td><td>S/'+a.peru.comision.toFixed(2)+'</td><td style="color:'+bcP+';font-weight:700">S/'+a.peru.balance.toFixed(2)+'</td><td>Bs'+a.plus.ventas.toFixed(2)+'</td><td style="color:var(--red)">Bs'+a.plus.premios_total.toFixed(2)+'</td><td>Bs'+a.plus.comision.toFixed(2)+'</td><td style="color:'+bcL+';font-weight:700">Bs'+a.plus.balance.toFixed(2)+'</td></tr>';});html+='<tfoot><tr><td colspan="2" style="color:var(--gold)">GLOBAL</td><td>S/'+d.global.peru.ventas.toFixed(2)+'</td><td style="color:var(--red)">S/'+d.global.peru.pagos.toFixed(2)+'</td><td>S/'+d.global.peru.comisiones.toFixed(2)+'</td><td style="color:'+(d.global.peru.balance>=0?'var(--green)':'var(--red)')+';font-weight:700">S/'+d.global.peru.balance.toFixed(2)+'</td><td>Bs'+d.global.plus.ventas.toFixed(2)+'</td><td style="color:var(--red)">Bs'+d.global.plus.pagos.toFixed(2)+'</td><td>Bs'+d.global.plus.comisiones.toFixed(2)+'</td><td style="color:'+(d.global.plus.balance>=0?'var(--green)':'var(--red)')+';font-weight:700">Bs'+d.global.plus.balance.toFixed(2)+'</td></tr></tfoot></table>';document.getElementById('rep-hoy').innerHTML=html;document.getElementById('btn-csv').disabled=false;document.getElementById('btn-csv').style.opacity=1;});}
+function cargarEstadisticas(){let ini=document.getElementById('rep-ini').value,fin=document.getElementById('rep-fin').value;if(!ini||!fin){alert('Seleccione fechas');return;}fetch('/admin/estadisticas-rango',{method:'POST',headers:{'Content-Type':'application/json'},body:bodyVC({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json()).then(d=>{let tp=d.totales.peru,tl=d.totales.plus;let vAnimP=Math.round((tp.ventas-tp.tripletas)*100)/100;let vAnimL=Math.round((tl.ventas-tl.tripletas)*100)/100;let html='<div style="color:#0284c7;font-size:.68rem;letter-spacing:2px;font-family:\'Oswald\',sans-serif;margin-bottom:6px">ZOOLO PERU (S/)</div><div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:12px"><div class="stat-box"><div class="stat-label">VENTAS ANIMALES</div><div class="stat-val">S/'+vAnimP.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">TRIPLETAS</div><div class="stat-val" style="color:#c084fc">S/'+tp.tripletas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">TOTAL INGRESOS</div><div class="stat-val" style="color:var(--gold)">S/'+tp.ventas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PREMIOS</div><div class="stat-val r">S/'+tp.premios.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">COMISIONES</div><div class="stat-val">S/'+tp.comisiones.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">BALANCE</div><div class="stat-val" style="color:'+(tp.balance>=0?'var(--green)':'var(--red)')+'">S/'+tp.balance.toFixed(2)+'</div></div></div>';html+='<div style="color:#a855f7;font-size:.68rem;letter-spacing:2px;font-family:\'Oswald\',sans-serif;margin-bottom:6px">ZOOLO PLUS (Bs)</div><div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:12px"><div class="stat-box"><div class="stat-label">VENTAS ANIMALES</div><div class="stat-val">Bs'+vAnimL.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">TRIPLETAS</div><div class="stat-val" style="color:#c084fc">Bs'+tl.tripletas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">TOTAL INGRESOS</div><div class="stat-val" style="color:var(--gold)">Bs'+tl.ventas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PREMIOS</div><div class="stat-val r">Bs'+tl.premios.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">COMISIONES</div><div class="stat-val">Bs'+tl.comisiones.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">BALANCE</div><div class="stat-val" style="color:'+(tl.balance>=0?'var(--green)':'var(--red)')+'">Bs'+tl.balance.toFixed(2)+'</div></div></div>';html+='<table class="tbl"><thead><tr><th>Fecha</th><th>Tk</th><th colspan="4" style="text-align:center;color:#0284c7">PERU (S/)</th><th colspan="4" style="text-align:center;color:#a855f7">PLUS (Bs)</th></tr><tr><th></th><th></th><th>Ventas</th><th>Trip.</th><th>Premios</th><th>Balance</th><th>Ventas</th><th>Trip.</th><th>Premios</th><th>Balance</th></tr></thead><tbody>';d.resumen_por_dia.forEach(function(r){var bcP=r.peru.balance>=0?'var(--green)':'var(--red)';var bcL=r.plus.balance>=0?'var(--green)':'var(--red)';html+='<tr><td>'+r.fecha+'</td><td>'+r.tickets+'</td><td style="color:var(--gold)">S/'+r.peru.ventas.toFixed(2)+'</td><td style="color:#c084fc">S/'+r.peru.tripletas.toFixed(2)+'</td><td style="color:var(--red)">S/'+r.peru.premios.toFixed(2)+'</td><td style="color:'+bcP+';font-weight:700">S/'+r.peru.balance.toFixed(2)+'</td><td style="color:var(--gold)">Bs'+r.plus.ventas.toFixed(2)+'</td><td style="color:#c084fc">Bs'+r.plus.tripletas.toFixed(2)+'</td><td style="color:var(--red)">Bs'+r.plus.premios.toFixed(2)+'</td><td style="color:'+bcL+';font-weight:700">Bs'+r.plus.balance.toFixed(2)+'</td></tr>';});html+='</tbody></table>';document.getElementById('rep-periodo').innerHTML=html;});}
+function cargarReporteAgencias(){let ini=document.getElementById('rep-ini').value,fin=document.getElementById('rep-fin').value;if(!ini||!fin){alert('Seleccione fechas');return;}fetch('/admin/reporte-agencias-rango',{method:'POST',headers:{'Content-Type':'application/json'},body:bodyVC({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json()).then(d=>{let tp=d.total.peru,tl=d.total.plus;let html='<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:12px 0"><div class="stat-box"><div class="stat-label">VENTAS PERU</div><div class="stat-val">S/'+tp.ventas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">BALANCE PERU</div><div class="stat-val '+(tp.balance>=0?'g':'r')+'">S/'+tp.balance.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">VENTAS PLUS</div><div class="stat-val">Bs'+tl.ventas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">BALANCE PLUS</div><div class="stat-val '+(tl.balance>=0?'g':'r')+'">Bs'+tl.balance.toFixed(2)+'</div></div></div>';html+='<table class="tbl"><thead><tr><th>Agencia</th><th>Tk</th><th colspan="3" style="text-align:center;color:#0284c7">PERU (S/)</th><th colspan="3" style="text-align:center;color:#a855f7">PLUS (Bs)</th></tr><tr><th></th><th></th><th>Ventas</th><th>Premios</th><th>Balance</th><th>Ventas</th><th>Premios</th><th>Balance</th></tr></thead><tbody>';d.agencias.forEach(a=>{let bcP=a.peru.balance>=0?'var(--green)':'var(--red)';let bcL=a.plus.balance>=0?'var(--green)':'var(--red)';html+='<tr><td><span style="color:var(--gold)">'+a.nombre+'</span><br><span style="color:var(--text2);font-size:.65rem">'+a.usuario+'</span></td><td>'+a.tickets+'</td><td>S/'+a.peru.ventas.toFixed(2)+'</td><td style="color:var(--red)">S/'+a.peru.premios_teoricos.toFixed(2)+'</td><td style="color:'+bcP+';font-family:\'Oswald\',sans-serif">S/'+a.peru.balance.toFixed(2)+'</td><td>Bs'+a.plus.ventas.toFixed(2)+'</td><td style="color:var(--red)">Bs'+a.plus.premios_teoricos.toFixed(2)+'</td><td style="color:'+bcL+';font-family:\'Oswald\',sans-serif">Bs'+a.plus.balance.toFixed(2)+'</td></tr>';});html+='</tbody></table>';document.getElementById('rep-periodo').innerHTML=html;});}
 
-function cargarTripletas(){fetch('/admin/tripletas-hoy').then(r=>r.json()).then(d=>{let html='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px"><div class="stat-box"><div class="stat-label">TOTAL</div><div class="stat-val">'+d.total+'</div></div><div class="stat-box"><div class="stat-label">GANADORAS</div><div class="stat-val g">'+d.ganadoras+'</div></div><div class="stat-box"><div class="stat-label">PREMIOS</div><div class="stat-val r">S/'+(d.total_premios||0).toFixed(2)+'</div></div></div>';if(!d.tripletas.length){html+='<div style="color:var(--text2);text-align:center;padding:20px">Sin tripletas hoy</div>';document.getElementById('trip-body').innerHTML=html;return;}html+='<table class="tbl"><thead><tr><th>Serial</th><th>Agencia</th><th>Animales</th><th>Monto</th><th>Hora</th><th>Validez</th><th>Salieron</th><th>Faltan</th><th>Premio</th><th>Estado</th></tr></thead><tbody>';d.tripletas.forEach(function(t){let lotLabel=t.loteria==='plus'?'<span class="tag" style="background:#2e1065;color:#c084fc;border-color:#7c3aed">PLUS</span>':'<span class="tag info">PERÚ</span>';let ans=t.nombres.map(function(n,i){return t['animal'+(i+1)]+'-'+n;}).join(' • ');let animSet=[t.animal1,t.animal2,t.animal3];let salSet=t.salieron||[];let faltanArr=animSet.filter(function(a){return salSet.indexOf(a)<0;});let salStr=salSet.length?salSet.map(function(a){return a+'-'+(ANIMALES[a]||a);}).join(', '):'<span style="color:var(--text2)">Ninguno</span>';let faltanStr=faltanArr.length?faltanArr.map(function(a){return'<span style="color:var(--gold)">'+a+'-'+(ANIMALES[a]||a)+'</span>';}).join(', '):'<span style="color:var(--green)">✅ Todos</span>';let validezStr=t.sorteos_validos+'/'+t.sorteos_totales+' sorteos';html+='<tr style="'+(t.gano?'background:rgba(46,204,113,.04)':'')+'"><td style="color:var(--teal);font-size:.7rem">'+t.serial+'</td><td style="font-size:.72rem">'+t.agencia+'<br>'+lotLabel+'</td><td style="font-size:.72rem;color:#c084fc">'+ans+'</td><td style="color:var(--gold)">S/'+t.monto+'</td><td style="font-size:.68rem;color:var(--text2)">'+t.hora_compra+'</td><td style="font-size:.68rem;color:#6090c0">'+validezStr+'</td><td style="font-size:.72rem;color:#4ade80">'+salStr+'</td><td style="font-size:.72rem">'+faltanStr+'</td><td style="color:var(--red)">'+(t.gano?'S/'+t.premio.toFixed(2):'—')+'</td><td><span class="tag '+(t.gano?(t.pagado?'ok':'warn'):'err')+'">'+(t.gano?(t.pagado?'PAGADO':'PENDIENTE'):'NO GANÓ')+'</span></td></tr>';});html+='</tbody></table>';document.getElementById('trip-body').innerHTML=html;});}
+function cargarTicketsDetalle(){
+  let ini=document.getElementById('tkd-ini').value,fin=document.getElementById('tkd-fin').value;
+  if(!ini||!fin){alert('Seleccione fechas');return;}
+  let filtroAg=document.getElementById('tkd-agencia-filtro').value;
+  let c=document.getElementById('tkd-resultado');
+  c.innerHTML='<p style="color:var(--text2);text-align:center;padding:15px;font-size:.75rem">CARGANDO...</p>';
+  fetch('/admin/tickets-detalle',{method:'POST',headers:{'Content-Type':'application/json'},body:bodyVC({fecha_inicio:ini,fecha_fin:fin})})
+    .then(r=>r.json()).then(d=>{
+      if(d.error){c.innerHTML='<p style="color:var(--red)">'+d.error+'</p>';return;}
+      let tickets=d.tickets;
+      if(filtroAg) tickets=tickets.filter(t=>t.agencia===filtroAg);
+      if(!tickets.length){c.innerHTML='<p style="color:var(--text2);text-align:center;padding:20px">Sin tickets en ese rango</p>';return;}
+      let agenciasSet={};tickets.forEach(t=>agenciasSet[t.agencia]=true);
+      let selAg=document.getElementById('tkd-agencia-filtro');
+      let valActual=selAg.value;
+      selAg.innerHTML='<option value="">Todas</option>'+Object.keys(agenciasSet).sort().map(a=>'<option value="'+a+'" '+(a===valActual?'selected':'')+'>'+a+'</option>').join('');
+      let html='';
+      tickets.forEach(function(t){
+        let estado=t.anulado?'<span class="badge n" style="background:#7c2d12">ANULADO</span>':(t.pagado?'<span class="badge p">PAGADO</span>':'<span class="badge g">PENDIENTE</span>');
+        let totales=[];if(t.total_peru>0)totales.push('S/'+t.total_peru.toFixed(2));if(t.total_plus>0)totales.push('Bs'+t.total_plus.toFixed(2));
+        html+='<div class="tcard"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><div class="ts">#'+t.serial+' <span style="color:#c084fc;font-size:.68rem;font-weight:400">'+t.agencia+'</span> <span style="color:#4a6090;font-size:.68rem;font-weight:400">'+t.fecha+'</span></div><div>'+estado+' <span style="color:var(--gold);font-weight:700">'+totales.join(' / ')+'</span></div></div>';
+        t.jugadas.forEach(function(j){let simbJ=j.loteria==='plus'?'Bs':'S/';html+='<div class="jrow"><span>'+j.hora+' — '+(j.tipo==='animal'?(j.seleccion+' '+j.nombre):j.seleccion)+'</span><span>'+simbJ+j.monto+'</span></div>';});
+        t.tripletas.forEach(function(tr){let simbT=tr.loteria==='plus'?'Bs':'S/';html+='<div class="trip-row"><span>TRIPLETA '+tr.animales+'</span><span>'+simbT+tr.monto+'</span></div>';});
+        html+='</div>';
+      });
+      c.innerHTML=html;
+    }).catch(()=>{c.innerHTML='<p style="color:var(--red);text-align:center">Error de conexión</p>';});
+}
+function exportarCSV(){let ini=document.getElementById('rep-ini').value,fin=document.getElementById('rep-fin').value;if(!ini||!fin){alert('Seleccione fechas');return;}fetch('/admin/exportar-csv',{method:'POST',headers:{'Content-Type':'application/json'},body:bodyVC({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.blob()).then(blob=>{let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='reporte_'+ini+'_'+fin+'.csv';a.click();});}
 
-function cargarAudit(){let ini=document.getElementById('aud-ini').value,fin=document.getElementById('aud-fin').value,filtro=document.getElementById('aud-filtro').value;fetch('/admin/audit-logs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin,filtro,limit:500})}).then(r=>r.json()).then(d=>{let html='<table class="tbl"><thead><tr><th>Fecha</th><th>Agencia</th><th>Acción</th><th>Detalle</th><th>IP</th></tr></thead><tbody>';d.logs.forEach(l=>{let colorAccion=l.accion.includes('DESBLOQUEO')?'#f59e0b':l.accion.includes('AUTO')&&l.accion.includes('TOGGLE')?'var(--teal)':l.accion.includes('PAGO')?'var(--green)':l.accion.includes('ANUL')?'var(--red)':l.accion.includes('RESUL')?'var(--gold)':l.accion.includes('ELIMINAR')?'var(--red)':'var(--text)';html+='<tr><td style="font-size:.68rem;color:var(--text2);white-space:nowrap">'+l.fecha+'</td><td style="font-size:.72rem">'+l.agencia+'</td><td><span class="tag info" style="color:'+colorAccion+'">'+l.accion+'</span></td><td style="font-size:.7rem;max-width:300px;overflow:hidden;text-overflow:ellipsis">'+l.detalle+'</td><td style="font-size:.7rem;color:var(--text2)">'+l.ip+'</td></tr>';});html+='</tbody></table>';document.getElementById('aud-body').innerHTML=html;});}
+function cargarTripletas(){fetch(urlVC('/admin/tripletas-hoy')).then(r=>r.json()).then(d=>{let html='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px"><div class="stat-box"><div class="stat-label">TOTAL</div><div class="stat-val">'+d.total+'</div></div><div class="stat-box"><div class="stat-label">GANADORAS</div><div class="stat-val g">'+d.ganadoras+'</div></div><div class="stat-box"><div class="stat-label">PREMIOS</div><div class="stat-val r">S/'+(d.total_premios||0).toFixed(2)+'</div></div></div>';if(!d.tripletas.length){html+='<div style="color:var(--text2);text-align:center;padding:20px">Sin tripletas hoy</div>';document.getElementById('trip-body').innerHTML=html;return;}html+='<table class="tbl"><thead><tr><th>Serial</th><th>Agencia</th><th>Animales</th><th>Monto</th><th>Hora</th><th>Validez</th><th>Salieron</th><th>Faltan</th><th>Premio</th><th>Estado</th></tr></thead><tbody>';d.tripletas.forEach(function(t){let lotLabel=t.loteria==='plus'?'<span class="tag" style="background:#2e1065;color:#c084fc;border-color:#7c3aed">PLUS</span>':'<span class="tag info">PERÚ</span>';let ans=t.nombres.map(function(n,i){return t['animal'+(i+1)]+'-'+n;}).join(' • ');let animSet=[t.animal1,t.animal2,t.animal3];let salSet=t.salieron||[];let faltanArr=animSet.filter(function(a){return salSet.indexOf(a)<0;});let salStr=salSet.length?salSet.map(function(a){return a+'-'+(ANIMALES[a]||a);}).join(', '):'<span style="color:var(--text2)">Ninguno</span>';let faltanStr=faltanArr.length?faltanArr.map(function(a){return'<span style="color:var(--gold)">'+a+'-'+(ANIMALES[a]||a)+'</span>';}).join(', '):'<span style="color:var(--green)">✅ Todos</span>';let validezStr=t.sorteos_validos+'/'+t.sorteos_totales+' sorteos';html+='<tr style="'+(t.gano?'background:rgba(46,204,113,.04)':'')+'"><td style="color:var(--teal);font-size:.7rem">'+t.serial+'</td><td style="font-size:.72rem">'+t.agencia+'<br>'+lotLabel+'</td><td style="font-size:.72rem;color:#c084fc">'+ans+'</td><td style="color:var(--gold)">S/'+t.monto+'</td><td style="font-size:.68rem;color:var(--text2)">'+t.hora_compra+'</td><td style="font-size:.68rem;color:#6090c0">'+validezStr+'</td><td style="font-size:.72rem;color:#4ade80">'+salStr+'</td><td style="font-size:.72rem">'+faltanStr+'</td><td style="color:var(--red)">'+(t.gano?'S/'+t.premio.toFixed(2):'—')+'</td><td><span class="tag '+(t.gano?(t.pagado?'ok':'warn'):'err')+'">'+(t.gano?(t.pagado?'PAGADO':'PENDIENTE'):'NO GANÓ')+'</span></td></tr>';});html+='</tbody></table>';document.getElementById('trip-body').innerHTML=html;});}
+
+function cargarAudit(){let ini=document.getElementById('aud-ini').value,fin=document.getElementById('aud-fin').value,filtro=document.getElementById('aud-filtro').value;fetch('/admin/audit-logs',{method:'POST',headers:{'Content-Type':'application/json'},body:bodyVC({fecha_inicio:ini,fecha_fin:fin,filtro,limit:500})}).then(r=>r.json()).then(d=>{let html='<table class="tbl"><thead><tr><th>Fecha</th><th>Agencia</th><th>Acción</th><th>Detalle</th><th>IP</th></tr></thead><tbody>';d.logs.forEach(l=>{let colorAccion=l.accion.includes('DESBLOQUEO')?'#f59e0b':l.accion.includes('AUTO')&&l.accion.includes('TOGGLE')?'var(--teal)':l.accion.includes('PAGO')?'var(--green)':l.accion.includes('ANUL')?'var(--red)':l.accion.includes('RESUL')?'var(--gold)':l.accion.includes('ELIMINAR')?'var(--red)':'var(--text)';html+='<tr><td style="font-size:.68rem;color:var(--text2);white-space:nowrap">'+l.fecha+'</td><td style="font-size:.72rem">'+l.agencia+'</td><td><span class="tag info" style="color:'+colorAccion+'">'+l.accion+'</span></td><td style="font-size:.7rem;max-width:300px;overflow:hidden;text-overflow:ellipsis">'+l.detalle+'</td><td style="font-size:.7rem;color:var(--text2)">'+l.ip+'</td></tr>';});html+='</tbody></table>';document.getElementById('aud-body').innerHTML=html;});}
 
 function showMsg(id,msg,tipo){let el=document.getElementById(id);el.textContent=msg;el.className='msg '+tipo;el.style.display='block';clearTimeout(el._t);el._t=setTimeout(()=>el.style.display='none',4000);}
 
@@ -3912,9 +4233,9 @@ function cargarEstadoAutoSorteo(){fetch('/admin/estado-autosorteo').then(functio
 function toggleAutoSorteo(){var btn=document.getElementById('toggle-auto-btn');var nuevoEstado=btn.classList.contains('on')?'off':'on';fetch('/admin/toggle-autosorteo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({estado:nuevoEstado})}).then(function(r){return r.json();}).then(function(d){if(d.status==='ok'){actualizarEstadoToggle(d.estado);showMsg('msg-res',d.mensaje,'ok');}else showMsg('msg-res',d.error||'Error','err');}).catch(function(){showMsg('msg-res','Error de conexión','err');});}
 
 function listarAdmins(){fetch('/admin/lista-admins').then(function(r){return r.json();}).then(function(admins){var html='';if(!admins.length){document.getElementById('adm-lista').innerHTML='<div style="color:var(--text2);text-align:center;padding:20px">Sin administradores</div>';return;}admins.forEach(function(a){var superTag=a.es_superadmin?'<span class="tag warn">SUPER</span>':'<span class="tag info">ADMIN</span>';var delBtn=a.es_superadmin?'':'<button class="btn red" style="padding:4px 10px;font-size:.65rem" onclick="eliminarAdmin('+a.id+',\''+String(a.nombre_agencia).replace(/\x27/g,"")+'\')">Eliminar</button>';html+='<div style="background:var(--card);border:1px solid var(--border);border-radius:4px;padding:10px;margin-bottom:8px"><div style="display:flex;justify-content:space-between;align-items:center"><div><div style="color:var(--gold);font-weight:700">'+a.nombre_agencia+' '+superTag+'</div><div style="color:var(--text2);font-size:.72rem">'+a.usuario+' &middot; '+a.agencias+' agencia(s)</div></div><div>'+delBtn+'</div></div></div>';});document.getElementById('adm-lista').innerHTML=html;}).catch(function(){});}
-function crearAdmin(){var u=document.getElementById('adm-user').value.trim(),p=document.getElementById('adm-pass').value.trim(),n=document.getElementById('adm-nombre').value.trim();if(!u||!p||!n){showMsg('msg-adm','Complete todos los campos','err');return;}var fd=new FormData();fd.append('usuario',u);fd.append('password',p);fd.append('nombre',n);fetch('/admin/crear-admin',{method:'POST',body:fd}).then(function(r){return r.json();}).then(function(d){if(d.status==='ok'){showMsg('msg-adm',d.mensaje,'ok');['adm-user','adm-pass','adm-nombre'].forEach(function(i){document.getElementById(i).value='';});listarAdmins();}else showMsg('msg-adm',d.error,'err');});}
-function eliminarAdmin(id,nombre){if(!confirm('Eliminar al administrador "'+nombre+'"?'))return;fetch('/admin/eliminar-admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})}).then(function(r){return r.json();}).then(function(d){if(d.status==='ok'){alert(d.mensaje);listarAdmins();}else alert(d.error);});}
-function reasignarDueno(id){var sel=document.getElementById('owner-'+id);if(!sel)return;fetch('/admin/editar-agencia',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id,admin_id:parseInt(sel.value)})}).then(function(r){return r.json();}).then(function(d){if(d.status==='ok'){alert('Dueno actualizado');listarAgencias();}else alert(d.error);});}
+function crearAdmin(){if(bloquearSiSoloLectura())return;var u=document.getElementById('adm-user').value.trim(),p=document.getElementById('adm-pass').value.trim(),n=document.getElementById('adm-nombre').value.trim();if(!u||!p||!n){showMsg('msg-adm','Complete todos los campos','err');return;}var fd=new FormData();fd.append('usuario',u);fd.append('password',p);fd.append('nombre',n);fetch('/admin/crear-admin',{method:'POST',body:fd}).then(function(r){return r.json();}).then(function(d){if(d.status==='ok'){showMsg('msg-adm',d.mensaje,'ok');['adm-user','adm-pass','adm-nombre'].forEach(function(i){document.getElementById(i).value='';});listarAdmins();}else showMsg('msg-adm',d.error,'err');});}
+function eliminarAdmin(id,nombre){if(bloquearSiSoloLectura())return;if(!confirm('Eliminar al administrador "'+nombre+'"?'))return;fetch('/admin/eliminar-admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})}).then(function(r){return r.json();}).then(function(d){if(d.status==='ok'){alert(d.mensaje);listarAdmins();}else alert(d.error);});}
+
 function init(){
   let hoy=new Date().toISOString().split('T')[0];
   document.getElementById('res-fecha').value=hoy;
@@ -3923,6 +4244,8 @@ function init(){
   document.getElementById('aud-ini').value=hoy;
   document.getElementById('aud-fin').value=hoy;
   document.getElementById('fecha-7030').value=hoy;
+  document.getElementById('tkd-ini').value=hoy;
+  document.getElementById('tkd-fin').value=hoy;
   fillHorasRes();fillHorasRiesgo();fillHorasTopes();
   renderAMG();
   cargarResultadosAdmin();
@@ -3930,6 +4253,8 @@ function init(){
   cargarBloqueados();
   cargarBloqueos();
   cargarSecuencia();
+  cargarSelectorVerComo();
+  listarAgencias();
   setInterval(cargarEstadoAutoSorteo,30000);
   setInterval(cargarBloqueos,60000);
 }
