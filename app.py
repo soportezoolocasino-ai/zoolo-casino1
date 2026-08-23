@@ -75,6 +75,23 @@ HORARIOS_PLUS_CRON = [
     (18,0),(19,0),(20,0),(21,0),(22,0),(23,0)
 ]
 
+# ─── Juegos Triple / Terminal / Más 1 (pote mensual 67/33) ───────────────────
+PAGO_TRIPLE_EXACTO = 700    # aciertas las 3 cifras
+PAGO_TRIPLE_APROX  = 20     # ±1 sobre el número (incentivo por acercarse)
+PAGO_TERMINAL      = 65     # 2 últimas cifras del triple
+PAGO_MAS1_COMPLETO = 250    # dígito 0-9 + animal
+PAGO_MAS1_ANIMAL   = 35     # solo el animal (el 40 no dobla aquí)
+MAS1_MIN           = 5      # apuesta mínima Más 1
+PORC_CASA_TRIPLE   = 0.33   # la casa se lleva el 33%; premios salen del 67%
+PORC_PREMIO_TRIPLE = round(1 - PORC_CASA_TRIPLE, 2)  # 0.67
+
+HORARIOS_TRIPLE = ["09:00 AM", "12:00 PM", "03:00 PM", "06:00 PM"]  # todos los días
+# UTC = Perú (UTC-5) + 5h
+HORARIOS_TRIPLE_UTC = [("09:00 AM", 14), ("12:00 PM", 17), ("03:00 PM", 20), ("06:00 PM", 23)]
+MAS1_HORA = "05:00 PM"   # viernes 5:00 PM hora Perú
+MAS1_HORA_UTC = 22       # 17:00 Perú (vie) = 22:00 UTC (vie)
+
+
 ANIMALES = {
     "00":"Ballena","0":"Delfin","1":"Carnero","2":"Toro","3":"Ciempies",
     "4":"Alacran","5":"Leon","6":"Rana","7":"Perico","8":"Raton","9":"Aguila",
@@ -401,6 +418,30 @@ def init_db():
             UNIQUE(numero, loteria, fecha))""")
         # ─────────────────────────────────────────────────────────────────────
 
+        # ── TABLAS Triple / Terminal / Más 1 (Fase 1) ─────────────────────────
+        db.execute(f"""CREATE TABLE IF NOT EXISTS resultados_triple (
+            id {pk}, fecha TEXT NOT NULL, hora TEXT NOT NULL,
+            numero TEXT NOT NULL, moneda TEXT NOT NULL DEFAULT 'peru',
+            UNIQUE(fecha, hora, moneda))""")
+        db.execute(f"""CREATE TABLE IF NOT EXISTS resultado_mas1 (
+            id {pk}, fecha TEXT NOT NULL,
+            digito TEXT NOT NULL, animal TEXT NOT NULL,
+            moneda TEXT NOT NULL DEFAULT 'peru',
+            UNIQUE(fecha, moneda))""")
+        db.execute(f"""CREATE TABLE IF NOT EXISTS jugadas_triple (
+            id {pk}, ticket_id INTEGER NOT NULL,
+            fecha_sorteo TEXT NOT NULL, hora TEXT NOT NULL,
+            tipo TEXT NOT NULL, seleccion TEXT NOT NULL,
+            monto REAL NOT NULL, moneda TEXT NOT NULL DEFAULT 'peru')""")
+        db.execute(f"""CREATE TABLE IF NOT EXISTS sorteo_triple_acum (
+            id {pk}, mes TEXT NOT NULL, fecha TEXT NOT NULL, hora TEXT NOT NULL,
+            juego TEXT NOT NULL, moneda TEXT NOT NULL DEFAULT 'peru',
+            vendido_sorteo REAL DEFAULT 0, premio_pagado REAL DEFAULT 0,
+            numero_ganador TEXT, animal_ganador TEXT,
+            modo TEXT DEFAULT 'auto', creado TEXT {ts},
+            UNIQUE(fecha, hora, juego, moneda))""")
+        # ─────────────────────────────────────────────────────────────────────
+
         for idx in [
             "CREATE INDEX IF NOT EXISTS idx_tickets_agencia ON tickets(agencia_id)",
             "CREATE INDEX IF NOT EXISTS idx_tickets_fecha ON tickets(fecha)",
@@ -411,6 +452,10 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_sorteo_acum_fecha ON sorteo_acumulado(fecha, loteria)",
             "CREATE INDEX IF NOT EXISTS idx_bloq_hist_fecha ON bloqueos_historicos(fecha_bloqueo, loteria)",
             "CREATE INDEX IF NOT EXISTS idx_bloq_trip_fecha ON bloqueos_tripleta(fecha, loteria)",
+            "CREATE INDEX IF NOT EXISTS idx_jugtriple_sorteo ON jugadas_triple(fecha_sorteo, hora, moneda)",
+            "CREATE INDEX IF NOT EXISTS idx_jugtriple_ticket ON jugadas_triple(ticket_id)",
+            "CREATE INDEX IF NOT EXISTS idx_striacum_mes ON sorteo_triple_acum(mes, moneda)",
+            "CREATE INDEX IF NOT EXISTS idx_restriple_fecha ON resultados_triple(fecha, moneda)",
         ]:
             db.execute(idx)
         db.commit()
@@ -426,6 +471,7 @@ def init_db():
             "ALTER TABLE tripletas ADD COLUMN loteria TEXT NOT NULL DEFAULT 'peru'",
             "ALTER TABLE tickets ADD COLUMN total_peru REAL DEFAULT 0",
             "ALTER TABLE tickets ADD COLUMN total_plus REAL DEFAULT 0",
+            "ALTER TABLE tickets ADD COLUMN total_triple REAL DEFAULT 0",
         ]
         for sql in migraciones:
             try:
@@ -443,6 +489,10 @@ def init_db():
         db.execute("""INSERT OR IGNORE INTO config_sistema (clave, valor)
             VALUES ('auto_sorteo', 'off')""" if USE_SQLITE else """INSERT INTO config_sistema (clave, valor)
             VALUES ('auto_sorteo', 'off')
+            ON CONFLICT(clave) DO NOTHING""")
+        db.execute("""INSERT OR IGNORE INTO config_sistema (clave, valor)
+            VALUES ('auto_sorteo_triple', 'off')""" if USE_SQLITE else """INSERT INTO config_sistema (clave, valor)
+            VALUES ('auto_sorteo_triple', 'off')
             ON CONFLICT(clave) DO NOTHING""")
         db.commit()
 
@@ -1036,6 +1086,505 @@ def recuperar_sorteos_perdidos():
     except Exception as e:
         logger.error(f"[RECUPERACION] Error: {e}")
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# MOTOR TRIPLE / TERMINAL / MÁS 1  — pote mensual 67/33
+# ═══════════════════════════════════════════════════════════════════════════════
+# Reglas:
+#   Triple (diario 9AM/12PM/3PM/6PM): sale nº de 3 cifras.
+#       exacto -> 700x | aproximado ±1 -> 20x
+#   Terminal: las 2 últimas cifras de ESE triple -> 65x (mismo sorteo/resultado)
+#   Más 1 (viernes 8PM Perú): dígito 0-9 + animal -> 250x | solo animal -> 35x
+#   Pote: TODAS las ventas (triple+terminal+mas1) en una bolsa por moneda.
+#       La casa toma 33% (protegido). Premios salen del 67% del mes.
+#       El motor elige el ganador que quepa en el 67% sin tocar el 33%.
+#       El pote corre todo el mes y se reinicia por fecha (mes calendario):
+#       como todo se agrupa por el MES del sorteo, el corte es automático.
+
+def _mes_de(fecha_ddmmyyyy):
+    """'21/08/2026' -> '2026-08'."""
+    try:
+        return datetime.strptime(fecha_ddmmyyyy, "%d/%m/%Y").strftime("%Y-%m")
+    except Exception:
+        return ahora_peru().strftime("%Y-%m")
+
+def _last2(numero):
+    """Terminal = 2 últimas cifras del triple. 500->'00', 7->'07'."""
+    return str(int(numero)).zfill(3)[-2:]
+
+def _vendido_mes_triple(mes, moneda, db):
+    """Total vendido del mes (triple+terminal+mas1) en esa moneda,
+    agrupado por el MES del sorteo (fecha_sorteo DD/MM/YYYY)."""
+    r = db.execute("""
+        SELECT COALESCE(SUM(jt.monto),0) as v
+        FROM jugadas_triple jt
+        JOIN tickets tk ON jt.ticket_id = tk.id
+        WHERE jt.moneda=%s AND tk.anulado=0
+          AND SUBSTR(jt.fecha_sorteo,7,4) || '-' || SUBSTR(jt.fecha_sorteo,4,2) = %s
+    """, (moneda, mes)).fetchone()
+    return float(r['v']) if r else 0.0
+
+def _disponible_pote_triple(fecha, moneda, db, excluir=None):
+    """Presupuesto de premios disponible AHORA en el pote del mes.
+    excluir=(fecha,hora,juego) para recalcular un sorteo sin contarse a sí mismo.
+    Devuelve (disponible, vendido_mes, presupuesto_67, pagados_mes)."""
+    mes = _mes_de(fecha)
+    vendido = _vendido_mes_triple(mes, moneda, db)
+    presupuesto = round(vendido * PORC_PREMIO_TRIPLE, 2)
+    if excluir:
+        ef, eh, ej = excluir
+        r = db.execute("""SELECT COALESCE(SUM(premio_pagado),0) as p
+            FROM sorteo_triple_acum WHERE mes=%s AND moneda=%s
+              AND NOT (fecha=%s AND hora=%s AND juego=%s)""",
+            (mes, moneda, ef, eh, ej)).fetchone()
+    else:
+        r = db.execute("""SELECT COALESCE(SUM(premio_pagado),0) as p
+            FROM sorteo_triple_acum WHERE mes=%s AND moneda=%s""", (mes, moneda)).fetchone()
+    pagados = float(r['p']) if r else 0.0
+    return round(presupuesto - pagados, 2), round(vendido, 2), presupuesto, round(pagados, 2)
+
+def _mapas_apuestas_triple(fecha, hora, moneda, db):
+    """Devuelve (exacto_map, terminal_map) de apuestas del sorteo."""
+    ex_rows = db.execute("""SELECT jt.seleccion, COALESCE(SUM(jt.monto),0) as m
+        FROM jugadas_triple jt JOIN tickets tk ON jt.ticket_id=tk.id
+        WHERE jt.tipo='triple' AND jt.hora=%s AND jt.fecha_sorteo=%s AND jt.moneda=%s AND tk.anulado=0
+        GROUP BY jt.seleccion""", (hora, fecha, moneda)).fetchall()
+    tm_rows = db.execute("""SELECT jt.seleccion, COALESCE(SUM(jt.monto),0) as m
+        FROM jugadas_triple jt JOIN tickets tk ON jt.ticket_id=tk.id
+        WHERE jt.tipo='terminal' AND jt.hora=%s AND jt.fecha_sorteo=%s AND jt.moneda=%s AND tk.anulado=0
+        GROUP BY jt.seleccion""", (hora, fecha, moneda)).fetchall()
+    ex = {str(r['seleccion']).zfill(3): float(r['m']) for r in ex_rows}
+    tm = {str(r['seleccion']).zfill(2): float(r['m']) for r in tm_rows}
+    return ex, tm
+
+def _pago_triple_con_mapas(n, ex, tm):
+    """Cuánto pagaría el pote si sale el número entero n (0-999)."""
+    n3 = str(n).zfill(3)
+    pago = ex.get(n3, 0.0) * PAGO_TRIPLE_EXACTO
+    if n - 1 >= 0:   pago += ex.get(str(n-1).zfill(3), 0.0) * PAGO_TRIPLE_APROX
+    if n + 1 <= 999: pago += ex.get(str(n+1).zfill(3), 0.0) * PAGO_TRIPLE_APROX
+    pago += tm.get(n3[-2:], 0.0) * PAGO_TERMINAL
+    return round(pago, 2)
+
+def _pago_triple_si_sale(numero, fecha, hora, moneda, db):
+    ex, tm = _mapas_apuestas_triple(fecha, hora, moneda, db)
+    return _pago_triple_con_mapas(int(numero), ex, tm)
+
+def _elegir_ganador_triple(fecha, hora, moneda, db):
+    """Elige el nº 000-999 que quepa en el 67% sin tocar el 33%.
+    Prefiere números con apuestas (resultado natural). Si NINGUNO cabe,
+    devuelve (None, None, info): el sorteo NO se publica (jamás se toca el 33%)."""
+    disp, vendido, presupuesto, pagados = _disponible_pote_triple(
+        fecha, moneda, db, excluir=(fecha, hora, 'triple'))
+    ex, tm = _mapas_apuestas_triple(fecha, hora, moneda, db)
+    candidatos = []
+    for n in range(0, 1000):
+        p = _pago_triple_con_mapas(n, ex, tm)
+        if p <= disp:
+            candidatos.append((str(n).zfill(3), p))
+    if not candidatos:
+        return None, None, (disp, vendido, presupuesto, pagados)
+    con_pago = [c for c in candidatos if c[1] > 0]
+    e = random.choice(con_pago) if con_pago else random.choice(candidatos)
+    return e[0], e[1], (disp, vendido, presupuesto, pagados)
+
+def _mapa_apuestas_mas1(fecha, moneda, db):
+    rows = db.execute("""SELECT jt.seleccion, COALESCE(SUM(jt.monto),0) as m
+        FROM jugadas_triple jt JOIN tickets tk ON jt.ticket_id=tk.id
+        WHERE jt.tipo='mas1' AND jt.fecha_sorteo=%s AND jt.moneda=%s AND tk.anulado=0
+        GROUP BY jt.seleccion""", (fecha, moneda)).fetchall()
+    return {str(r['seleccion']): float(r['m']) for r in rows}
+
+def _pago_mas1_con_mapa(dg, an, m):
+    """Pago si el Más 1 sale dígito dg + animal an. Formato de jugada 'D-ANIMAL'."""
+    dg = str(dg); an = str(an)
+    sel = dg + '-' + an
+    pago = m.get(sel, 0.0) * PAGO_MAS1_COMPLETO
+    suf = '-' + an
+    for k, v in m.items():
+        if k != sel and k.endswith(suf):
+            pre = k[:-len(suf)]
+            if len(pre) == 1:   # exactamente un dígito antes del guión
+                pago += v * PAGO_MAS1_ANIMAL
+    return round(pago, 2)
+
+def _pago_mas1_si_sale(digito, animal, fecha, moneda, db):
+    return _pago_mas1_con_mapa(digito, animal, _mapa_apuestas_mas1(fecha, moneda, db))
+
+def _guardar_acum_triple(db, mes, fecha, hora, juego, moneda, vendido_sorteo, pago, numero, animal, modo):
+    if USE_SQLITE:
+        db.execute("""INSERT OR REPLACE INTO sorteo_triple_acum
+            (mes,fecha,hora,juego,moneda,vendido_sorteo,premio_pagado,numero_ganador,animal_ganador,modo)
+            VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (mes, fecha, hora, juego, moneda, float(vendido_sorteo), pago, numero, animal, modo))
+    else:
+        db.execute("""INSERT INTO sorteo_triple_acum
+            (mes,fecha,hora,juego,moneda,vendido_sorteo,premio_pagado,numero_ganador,animal_ganador,modo)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(fecha,hora,juego,moneda) DO UPDATE SET
+                mes=EXCLUDED.mes, vendido_sorteo=EXCLUDED.vendido_sorteo,
+                premio_pagado=EXCLUDED.premio_pagado, numero_ganador=EXCLUDED.numero_ganador,
+                animal_ganador=EXCLUDED.animal_ganador, modo=EXCLUDED.modo""",
+            (mes, fecha, hora, juego, moneda, float(vendido_sorteo), pago, numero, animal, modo))
+
+def _viernes_mas1(ahora=None):
+    """DD/MM/YYYY del viernes al que pertenece una compra de Más 1.
+    Toda compra de la semana va al viernes siguiente; si hoy es viernes y ya
+    cerró el sorteo (5PM - buffer), pasa al viernes de la próxima semana."""
+    d = ahora or ahora_peru()
+    dias = (4 - d.weekday()) % 7
+    objetivo = d + timedelta(days=dias)
+    if dias == 0:
+        cierre = objetivo.replace(hour=17, minute=0, second=0, microsecond=0) - timedelta(minutes=MINUTOS_BLOQUEO)
+        if d >= cierre:
+            objetivo = objetivo + timedelta(days=7)
+    return objetivo.strftime("%d/%m/%Y")
+
+def _validar_jugada_triple(j):
+    """Valida/normaliza una jugada triple/terminal/mas1.
+    Devuelve (ok, error, seleccion_normalizada)."""
+    tipo = j.get('tipo')
+    sel = str(j.get('seleccion', '')).strip()
+    try:
+        monto = float(j.get('monto', 0))
+    except (TypeError, ValueError):
+        return False, 'Monto inválido', None
+    if monto <= 0:
+        return False, 'Monto inválido', None
+    if tipo == 'triple':
+        if not (sel.isdigit() and 0 <= int(sel) <= 999):
+            return False, f'Triple inválido: {sel} (debe ser 000-999)', None
+        return True, None, str(int(sel)).zfill(3)
+    if tipo == 'terminal':
+        if not (sel.isdigit() and 0 <= int(sel) <= 99):
+            return False, f'Terminal inválido: {sel} (debe ser 00-99)', None
+        return True, None, str(int(sel)).zfill(2)
+    if tipo == 'mas1':
+        if monto < MAS1_MIN:
+            return False, f'Más 1: la jugada mínima es S/{MAS1_MIN}', None
+        partes = sel.split('-')
+        if len(partes) != 2:
+            return False, 'Más 1 inválido (formato dígito-animal)', None
+        dg, an = partes[0].strip(), partes[1].strip()
+        if not (dg.isdigit() and 0 <= int(dg) <= 9):
+            return False, 'Más 1: dígito debe ser 0-9', None
+        if an not in ANIMALES:
+            return False, 'Más 1: animal inválido', None
+        return True, None, f'{int(dg)}-{an}'
+    return False, 'Tipo desconocido', None
+
+def _lock_sorteo(db, clave):
+    """Serializa check->elegir->guardar de un sorteo entre procesos.
+    Postgres: advisory lock a nivel de transacción (se suelta al commit/rollback).
+    SQLite: innecesario (un solo proceso)."""
+    if USE_SQLITE:
+        return
+    try:
+        db.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (clave,))
+    except Exception as e:
+        logger.error(f"[LOCK] {clave}: {e}")
+
+
+def ejecutar_auto_sorteo_triple(fecha, hora, moneda='peru', forzar_numero=None, modo='auto'):
+    """Sortea (auto) o registra (manual con forzar_numero) el triple de (fecha,hora).
+    NUNCA guarda un resultado cuyo premio supere el 67% disponible.
+    Devuelve {numero, terminal, pago} en éxito, o {'error': ...} si no procede."""
+    moneda = 'peru'   # pote único en soles por ahora
+    try:
+        with get_db() as db:
+            _lock_sorteo(db, f"triple:{fecha}:{hora}:{moneda}")
+            ya = db.execute("SELECT id FROM resultados_triple WHERE fecha=%s AND hora=%s AND moneda=%s",
+                            (fecha, hora, moneda)).fetchone()
+            if ya and modo == 'auto':
+                logger.info(f"[TRIPLE] Ya existe {fecha} {hora} {moneda}, saltando.")
+                return None
+            disp, vendido, presupuesto, pagados = _disponible_pote_triple(
+                fecha, moneda, db, excluir=(fecha, hora, 'triple'))
+            if forzar_numero is not None:
+                try:
+                    ni = int(forzar_numero)
+                except (TypeError, ValueError):
+                    return {'error': 'Número inválido (debe ser 000-999)'}
+                if ni < 0 or ni > 999:
+                    return {'error': 'El triple debe estar entre 000 y 999'}
+                elegido = str(ni).zfill(3)
+                pago = _pago_triple_si_sale(elegido, fecha, hora, moneda, db)
+                if pago > disp:
+                    return {'error': f'No permitido: {elegido} pagaría S/{pago:.2f} y el pote sólo tiene S/{disp:.2f} disponible (protege el 33%).',
+                            'pago': pago, 'disponible': disp}
+            else:
+                elegido, pago, (disp, vendido, presupuesto, pagados) = _elegir_ganador_triple(fecha, hora, moneda, db)
+                if elegido is None:
+                    logger.warning(f"[TRIPLE] {fecha} {hora}: pote insuficiente, NO se publica (protege el 33%).")
+                    return {'error': 'Pote insuficiente: ningún número cabe sin tocar el 33%. Sorteo no publicado.',
+                            'disponible': disp}
+            mes = _mes_de(fecha)
+            vend_sorteo = db.execute("""SELECT COALESCE(SUM(jt.monto),0) as m FROM jugadas_triple jt
+                JOIN tickets tk ON jt.ticket_id=tk.id
+                WHERE jt.hora=%s AND jt.fecha_sorteo=%s AND jt.moneda=%s AND tk.anulado=0
+                  AND jt.tipo IN ('triple','terminal')""", (hora, fecha, moneda)).fetchone()['m']
+            if USE_SQLITE:
+                db.execute("INSERT OR REPLACE INTO resultados_triple (fecha,hora,numero,moneda) VALUES (?,?,?,?)",
+                    (fecha, hora, elegido, moneda))
+            else:
+                db.execute("""INSERT INTO resultados_triple (fecha,hora,numero,moneda) VALUES (%s,%s,%s,%s)
+                    ON CONFLICT(fecha,hora,moneda) DO UPDATE SET numero=EXCLUDED.numero""",
+                    (fecha, hora, elegido, moneda))
+            _guardar_acum_triple(db, mes, fecha, hora, 'triple', moneda, vend_sorteo, pago, elegido, None, modo)
+            db.commit()
+            logger.info(f"[TRIPLE] {moneda} {fecha} {hora} -> {elegido} (term {_last2(elegido)}) | "
+                        f"vend_mes:{vendido} pres67:{presupuesto} disp:{disp} pago:{pago} [{modo}]")
+            return {'numero': elegido, 'terminal': _last2(elegido), 'pago': pago}
+    except Exception as e:
+        import traceback
+        logger.error(f"[TRIPLE] Error {fecha} {hora}: {e}\n{traceback.format_exc()}")
+        return {'error': str(e)}
+
+def ejecutar_auto_sorteo_mas1(fecha, moneda='peru', forzar_digito=None, forzar_animal=None, modo='auto'):
+    """Sortea (auto) o registra (manual) el Más 1 del viernes 'fecha'.
+    NUNCA guarda un resultado cuyo premio supere el 67% disponible.
+    Devuelve {digito, animal, nombre, pago} en éxito, o {'error': ...}."""
+    moneda = 'peru'
+    try:
+        with get_db() as db:
+            _lock_sorteo(db, f"mas1:{fecha}:{moneda}")
+            ya = db.execute("SELECT id FROM resultado_mas1 WHERE fecha=%s AND moneda=%s",
+                            (fecha, moneda)).fetchone()
+            if ya and modo == 'auto':
+                logger.info(f"[MAS1] Ya existe {fecha} {moneda}, saltando.")
+                return None
+            disp, vendido, presupuesto, pagados = _disponible_pote_triple(
+                fecha, moneda, db, excluir=(fecha, MAS1_HORA, 'mas1'))
+            m = _mapa_apuestas_mas1(fecha, moneda, db)
+            if forzar_digito is not None and forzar_animal is not None:
+                try:
+                    di = int(forzar_digito)
+                except (TypeError, ValueError):
+                    return {'error': 'Dígito inválido (0-9)'}
+                if di < 0 or di > 9:
+                    return {'error': 'El dígito del Más 1 debe estar entre 0 y 9'}
+                an = str(forzar_animal)
+                if an not in ANIMALES:
+                    return {'error': 'Animal inválido'}
+                dg = str(di)
+                pago = _pago_mas1_con_mapa(dg, an, m)
+                if pago > disp:
+                    return {'error': f'No permitido: {dg}+{ANIMALES.get(an,an)} pagaría S/{pago:.2f} y el pote sólo tiene S/{disp:.2f} disponible (protege el 33%).',
+                            'pago': pago, 'disponible': disp}
+            else:
+                candidatos = []
+                for d in range(0, 10):
+                    for an in ANIMALES.keys():
+                        p = _pago_mas1_con_mapa(d, an, m)
+                        if p <= disp:
+                            candidatos.append((str(d), an, p))
+                if not candidatos:
+                    logger.warning(f"[MAS1] {fecha}: pote insuficiente, NO se publica (protege el 33%).")
+                    return {'error': 'Pote insuficiente: ninguna combinación cabe sin tocar el 33%. Sorteo no publicado.',
+                            'disponible': disp}
+                con_pago = [c for c in candidatos if c[2] > 0]
+                dg, an, pago = random.choice(con_pago) if con_pago else random.choice(candidatos)
+            mes = _mes_de(fecha)
+            vend_sorteo = db.execute("""SELECT COALESCE(SUM(jt.monto),0) as m FROM jugadas_triple jt
+                JOIN tickets tk ON jt.ticket_id=tk.id
+                WHERE jt.tipo='mas1' AND jt.fecha_sorteo=%s AND jt.moneda=%s AND tk.anulado=0""",
+                (fecha, moneda)).fetchone()['m']
+            if USE_SQLITE:
+                db.execute("INSERT OR REPLACE INTO resultado_mas1 (fecha,digito,animal,moneda) VALUES (?,?,?,?)",
+                    (fecha, dg, an, moneda))
+            else:
+                db.execute("""INSERT INTO resultado_mas1 (fecha,digito,animal,moneda) VALUES (%s,%s,%s,%s)
+                    ON CONFLICT(fecha,moneda) DO UPDATE SET digito=EXCLUDED.digito, animal=EXCLUDED.animal""",
+                    (fecha, dg, an, moneda))
+            _guardar_acum_triple(db, mes, fecha, MAS1_HORA, 'mas1', moneda, vend_sorteo, pago, dg, an, modo)
+            db.commit()
+            logger.info(f"[MAS1] {moneda} {fecha} -> {dg}+{an}({ANIMALES.get(an,'?')}) | "
+                        f"disp:{disp} pago:{pago} [{modo}]")
+            return {'digito': dg, 'animal': an, 'nombre': ANIMALES.get(an, '?'), 'pago': pago}
+    except Exception as e:
+        import traceback
+        logger.error(f"[MAS1] Error {fecha}: {e}\n{traceback.format_exc()}")
+        return {'error': str(e)}
+
+def calcular_premio_triple_ticket(ticket_id, db=None):
+    """Premio de las jugadas triple/terminal/mas1 de un ticket, por moneda.
+    Devuelve {moneda: premio}."""
+    close = False
+    if db is None:
+        db = get_db(); close = True
+    try:
+        total = {}
+        jugs = db.execute("SELECT * FROM jugadas_triple WHERE ticket_id=%s", (ticket_id,)).fetchall()
+        res_cache = {}; mas1_cache = {}
+        for j in jugs:
+            mon = j['moneda'] if 'moneda' in j.keys() else 'peru'
+            total.setdefault(mon, 0.0)
+            if j['tipo'] in ('triple', 'terminal'):
+                key = (j['fecha_sorteo'], j['hora'], mon)
+                if key not in res_cache:
+                    r = db.execute("SELECT numero FROM resultados_triple WHERE fecha=%s AND hora=%s AND moneda=%s",
+                                   (j['fecha_sorteo'], j['hora'], mon)).fetchone()
+                    res_cache[key] = str(r['numero']).zfill(3) if r else None
+                num = res_cache[key]
+                if not num:
+                    continue
+                if j['tipo'] == 'triple':
+                    sel = str(j['seleccion']).zfill(3)
+                    if sel == num:
+                        total[mon] += j['monto'] * PAGO_TRIPLE_EXACTO
+                    elif abs(int(sel) - int(num)) == 1:
+                        total[mon] += j['monto'] * PAGO_TRIPLE_APROX
+                else:
+                    if str(j['seleccion']).zfill(2) == num[-2:]:
+                        total[mon] += j['monto'] * PAGO_TERMINAL
+            elif j['tipo'] == 'mas1':
+                key = (j['fecha_sorteo'], mon)
+                if key not in mas1_cache:
+                    r = db.execute("SELECT digito,animal FROM resultado_mas1 WHERE fecha=%s AND moneda=%s",
+                                   (j['fecha_sorteo'], mon)).fetchone()
+                    mas1_cache[key] = (str(r['digito']), str(r['animal'])) if r else None
+                rr = mas1_cache[key]
+                if not rr:
+                    continue
+                dg, an = rr
+                parts = str(j['seleccion']).split('-')
+                if len(parts) == 2:
+                    jdg, jan = parts[0], parts[1]
+                    if jdg == dg and jan == an:
+                        total[mon] += j['monto'] * PAGO_MAS1_COMPLETO
+                    elif jan == an:
+                        total[mon] += j['monto'] * PAGO_MAS1_ANIMAL
+        return {k: round(v, 2) for k, v in total.items()}
+    finally:
+        if close:
+            db.close()
+
+def _detalle_triple_ticket(ticket_id, db=None):
+    """Lista las jugadas triple/terminal/mas1 de un ticket con su resultado y premio."""
+    close = False
+    if db is None:
+        db = get_db(); close = True
+    try:
+        out = []
+        jugs = db.execute("SELECT * FROM jugadas_triple WHERE ticket_id=%s ORDER BY id", (ticket_id,)).fetchall()
+        res_cache = {}; mas1_cache = {}
+        for j in jugs:
+            mon = j['moneda'] if 'moneda' in j.keys() else 'peru'
+            tipo = j['tipo']; sel = str(j['seleccion']); monto = j['monto']
+            gano = False; premio = 0.0; resultado = None
+            if tipo in ('triple', 'terminal'):
+                key = (j['fecha_sorteo'], j['hora'])
+                if key not in res_cache:
+                    r = db.execute("SELECT numero FROM resultados_triple WHERE fecha=%s AND hora=%s AND moneda=%s",
+                                   (j['fecha_sorteo'], j['hora'], mon)).fetchone()
+                    res_cache[key] = str(r['numero']).zfill(3) if r else None
+                num = res_cache[key]; resultado = num
+                if num:
+                    if tipo == 'triple':
+                        s3 = sel.zfill(3)
+                        if s3 == num:
+                            gano = True; premio = monto * PAGO_TRIPLE_EXACTO
+                        elif abs(int(s3) - int(num)) == 1:
+                            gano = True; premio = monto * PAGO_TRIPLE_APROX
+                    else:
+                        if sel.zfill(2) == num[-2:]:
+                            gano = True; premio = monto * PAGO_TERMINAL
+                etiqueta = ('Triple ' + sel.zfill(3)) if tipo == 'triple' else ('Terminal ' + sel.zfill(2))
+                hora_lbl = j['hora']
+            else:  # mas1
+                key = j['fecha_sorteo']
+                if key not in mas1_cache:
+                    r = db.execute("SELECT digito,animal FROM resultado_mas1 WHERE fecha=%s AND moneda=%s",
+                                   (j['fecha_sorteo'], mon)).fetchone()
+                    mas1_cache[key] = (str(r['digito']), str(r['animal'])) if r else None
+                rr = mas1_cache[key]
+                partes = sel.split('-'); jdg = partes[0]; jan = partes[1] if len(partes) > 1 else ''
+                if rr:
+                    dg, an = rr; resultado = f"{dg}+{ANIMALES.get(an, an)}"
+                    if jdg == dg and jan == an:
+                        gano = True; premio = monto * PAGO_MAS1_COMPLETO
+                    elif jan == an:
+                        gano = True; premio = monto * PAGO_MAS1_ANIMAL
+                etiqueta = f"Más 1 {jdg}+{ANIMALES.get(jan, jan)}"
+                hora_lbl = 'Vie ' + str(j['fecha_sorteo'])
+            out.append({'tipo': tipo, 'seleccion': sel, 'etiqueta': etiqueta, 'hora': hora_lbl,
+                        'monto': monto, 'resultado': resultado, 'gano': gano, 'premio': round(premio, 2)})
+        return out
+    finally:
+        if close:
+            db.close()
+
+def job_auto_sorteo_triple(hora_str, moneda='peru'):
+    if get_config('auto_sorteo_triple', 'off') == 'on':
+        ejecutar_auto_sorteo_triple(ahora_peru().strftime("%d/%m/%Y"), hora_str, moneda)
+
+def job_auto_sorteo_mas1(moneda='peru'):
+    if get_config('auto_sorteo_triple', 'off') == 'on':
+        fecha = ahora_peru().strftime("%d/%m/%Y")
+        if datetime.strptime(fecha, "%d/%m/%Y").weekday() == 4:   # viernes
+            ejecutar_auto_sorteo_mas1(fecha, moneda)
+
+def recuperar_sorteos_triple_perdidos():
+    try:
+        if get_config('auto_sorteo_triple', 'off') != 'on':
+            return
+        import time as _t
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        now_peru = now_utc - timedelta(hours=5)
+        fecha = now_peru.strftime("%d/%m/%Y")
+        # Triple: comparar por datetime completo (seguro al cruzar medianoche UTC)
+        for hora_str, _hu in HORARIOS_TRIPLE_UTC:
+            t = datetime.strptime(hora_str, "%I:%M %p")
+            sorteo_peru = datetime(now_peru.year, now_peru.month, now_peru.day, t.hour, t.minute)
+            sorteo_utc = sorteo_peru + timedelta(hours=5)
+            if now_utc >= sorteo_utc + timedelta(minutes=2):
+                with get_db() as db:
+                    ex = db.execute("SELECT id FROM resultados_triple WHERE fecha=%s AND hora=%s AND moneda='peru'",
+                                    (fecha, hora_str)).fetchone()
+                if not ex:
+                    logger.info(f"[TRIPLE-REC] Recuperando {fecha} {hora_str}")
+                    ejecutar_auto_sorteo_triple(fecha, hora_str, 'peru'); _t.sleep(0.3)
+        # Más 1: recupera el ÚLTIMO viernes cuyo sorteo (17:02 Perú) ya pasó
+        # y todavía no tiene resultado. Funciona aunque hoy sea sábado, domingo, etc.
+        dias_desde_vie = (now_peru.weekday() - 4) % 7          # 0 si hoy es viernes
+        ultimo_vie = (now_peru - timedelta(days=dias_desde_vie)).date()
+        sorteo_uv = datetime(ultimo_vie.year, ultimo_vie.month, ultimo_vie.day, 17, 0) + timedelta(hours=5)
+        if now_utc < sorteo_uv + timedelta(minutes=2):
+            # el viernes más reciente aún no ha sorteado: el último con sorteo pasado es el anterior
+            ultimo_vie = ultimo_vie - timedelta(days=7)
+        vie_str = ultimo_vie.strftime("%d/%m/%Y")
+        with get_db() as db:
+            ex = db.execute("SELECT id FROM resultado_mas1 WHERE fecha=%s AND moneda='peru'", (vie_str,)).fetchone()
+        if not ex:
+            logger.info(f"[MAS1-REC] Recuperando último viernes {vie_str}")
+            ejecutar_auto_sorteo_mas1(vie_str, 'peru')
+    except Exception as e:
+        logger.error(f"[TRIPLE-REC] Error: {e}")
+
+
+_sched_lock_conn = None
+def _try_lock_scheduler():
+    """Garantiza un solo scheduler entre múltiples workers (Gunicorn).
+    Postgres: advisory lock de sesión mantenido mientras viva el proceso.
+    SQLite (local): siempre True."""
+    global _sched_lock_conn
+    if USE_SQLITE:
+        return True
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("SELECT pg_try_advisory_lock(915623123)")
+        got = cur.fetchone()[0]
+        if got:
+            _sched_lock_conn = conn   # mantener viva la conexión = mantener el lock
+            return True
+        cur.close(); conn.close()
+        return False
+    except Exception as e:
+        logger.error(f"[SCHEDULER-LOCK] {e}")
+        return False
+
+
 def iniciar_scheduler():
     try:
         with get_db() as db:
@@ -1047,6 +1596,10 @@ def iniciar_scheduler():
             db.commit()
     except Exception:
         pass
+
+    if not _try_lock_scheduler():
+        logger.info("[SCHEDULER] Otro worker ya tiene el lock; este proceso no inicia el scheduler.")
+        return None
 
     scheduler = BackgroundScheduler(timezone='UTC')
 
@@ -1083,6 +1636,29 @@ def iniciar_scheduler():
             misfire_grace_time=300
         )
 
+    for hora_str, hora_utc in HORARIOS_TRIPLE_UTC:
+        scheduler.add_job(
+            func=lambda hs=hora_str: job_auto_sorteo_triple(hs, 'peru'),
+            trigger=CronTrigger(hour=hora_utc, minute=2, second=0),
+            id=f'triple_{hora_utc}',
+            replace_existing=True,
+            misfire_grace_time=300
+        )
+    scheduler.add_job(
+        func=lambda: job_auto_sorteo_mas1('peru'),
+        trigger=CronTrigger(day_of_week='fri', hour=MAS1_HORA_UTC, minute=2, second=0),
+        id='mas1_semanal',
+        replace_existing=True,
+        misfire_grace_time=600
+    )
+    scheduler.add_job(
+        func=recuperar_sorteos_triple_perdidos,
+        trigger=CronTrigger(minute='*/10'),
+        id='guardia_triple',
+        replace_existing=True,
+        misfire_grace_time=60
+    )
+
     scheduler.add_job(
         func=recuperar_sorteos_perdidos,
         trigger=CronTrigger(minute='*/10'),
@@ -1096,6 +1672,7 @@ def iniciar_scheduler():
     logger.info("[SCHEDULER] APScheduler iniciado con todos los jobs de sorteo.")
     import threading
     threading.Thread(target=recuperar_sorteos_perdidos, daemon=True).start()
+    threading.Thread(target=recuperar_sorteos_triple_perdidos, daemon=True).start()
     return scheduler
 
 # ─── Decoradores ─────────────────────────────────────────────────────────────
@@ -1315,21 +1892,45 @@ def procesar_venta():
         jugadas = data.get('jugadas', [])
         if not jugadas: return jsonify({'error':'Ticket vacío'}),400
 
-        jugadas_peru = [j for j in jugadas if j.get('loteria','peru') == 'peru']
-        jugadas_plus = [j for j in jugadas if j.get('loteria','peru') == 'plus']
+        TIPOS_TRIPLE = ('triple','terminal','mas1')
+        jugadas_tri = [j for j in jugadas if j.get('tipo') in TIPOS_TRIPLE]
+        jugadas_zoo = [j for j in jugadas if j.get('tipo') not in TIPOS_TRIPLE]
+        jugadas_peru = [j for j in jugadas_zoo if j.get('loteria','peru') == 'peru']
+        jugadas_plus = [j for j in jugadas_zoo if j.get('loteria','peru') == 'plus']
+
+        # Validar y preparar Triple / Terminal / Más 1
+        viernes_mas1 = _viernes_mas1()
+        prep_tri = []
+        for j in jugadas_tri:
+            ok, err, sel = _validar_jugada_triple(j)
+            if not ok:
+                return jsonify({'error': err}), 400
+            tipo = j['tipo']
+            if tipo == 'mas1':
+                fs, hora_j = viernes_mas1, MAS1_HORA
+            else:
+                hora_j = j.get('hora')
+                if hora_j not in HORARIOS_TRIPLE:
+                    return jsonify({'error': f'Hora de {tipo} inválida: {hora_j}'}), 400
+                if not puede_vender(hora_j):
+                    return jsonify({'error': f'{tipo.capitalize()} — Sorteo {hora_j} ya cerró (3 min antes)'}), 400
+                fs = ahora_peru().strftime("%d/%m/%Y")
+            prep_tri.append({'tipo': tipo, 'fecha_sorteo': fs, 'hora': hora_j,
+                             'seleccion': sel, 'monto': float(j['monto'])})
 
         for j in jugadas_peru:
             if j['tipo']!='tripleta' and not puede_vender(j['hora']):
-                return jsonify({'error':f"PERU — Sorteo {j['hora']} ya cerró (5 min antes)"}),400
+                return jsonify({'error':f"PERU — Sorteo {j['hora']} ya cerró (3 min antes)"}),400
         for j in jugadas_plus:
             if j['tipo']!='tripleta' and not puede_vender_plus(j['hora']):
-                return jsonify({'error':f"PLUS — Sorteo {j['hora']} ya cerró (5 min antes)"}),400
+                return jsonify({'error':f"PLUS — Sorteo {j['hora']} ya cerró (3 min antes)"}),400
 
         hoy = ahora_peru().strftime("%d/%m/%Y")
         agencia_id = session['user_id']
         total = sum(j['monto'] for j in jugadas)
         total_peru = round(sum(j['monto'] for j in jugadas_peru), 2)
         total_plus = round(sum(j['monto'] for j in jugadas_plus), 2)
+        total_triple = round(sum(x['monto'] for x in prep_tri), 2)
 
         with get_db() as db:
             ag = db.execute("SELECT tope_taquilla, comision FROM agencias WHERE id=%s", (agencia_id,)).fetchone()
@@ -1366,16 +1967,16 @@ def procesar_venta():
             fecha  = ahora_peru().strftime("%d/%m/%Y %I:%M %p")
 
             if USE_SQLITE:
-                db.execute("INSERT INTO tickets (serial,agencia_id,fecha,total,total_peru,total_plus) VALUES (?,?,?,?,?,?)",
-                    (serial, agencia_id, fecha, total, total_peru, total_plus))
+                db.execute("INSERT INTO tickets (serial,agencia_id,fecha,total,total_peru,total_plus,total_triple) VALUES (?,?,?,?,?,?,?)",
+                    (serial, agencia_id, fecha, total, total_peru, total_plus, total_triple))
                 ticket_id = db._cur.lastrowid
             else:
                 db._cur.execute(
-                    "INSERT INTO tickets (serial,agencia_id,fecha,total,total_peru,total_plus) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
-                    (serial, agencia_id, fecha, total, total_peru, total_plus))
+                    "INSERT INTO tickets (serial,agencia_id,fecha,total,total_peru,total_plus,total_triple) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                    (serial, agencia_id, fecha, total, total_peru, total_plus, total_triple))
                 ticket_id = db._cur.fetchone()[0]
 
-            for j in jugadas:
+            for j in jugadas_zoo:
                 lot = j.get('loteria','peru')
                 if j['tipo']=='tripleta':
                     nums = j['seleccion'].split(',')
@@ -1384,6 +1985,9 @@ def procesar_venta():
                 else:
                     db.execute("INSERT INTO jugadas (ticket_id,hora,seleccion,monto,tipo,loteria) VALUES (%s,%s,%s,%s,%s,%s)",
                         (ticket_id, j['hora'], j['seleccion'], j['monto'], j['tipo'], lot))
+            for x in prep_tri:
+                db.execute("INSERT INTO jugadas_triple (ticket_id,fecha_sorteo,hora,tipo,seleccion,monto,moneda) VALUES (%s,%s,%s,%s,%s,%s,'peru')",
+                    (ticket_id, x['fecha_sorteo'], x['hora'], x['tipo'], x['seleccion'], x['monto']))
             db.commit()
 
         log_audit('VENTA', f"Ticket #{ticket_id} serial:{serial} total:S/{total}")
@@ -1480,11 +2084,37 @@ def procesar_venta():
                 lineas.append("  TRIPLETA: " + " - ".join(partes) + f" x {fmt(t['monto'])} SL")
             lineas.append("-------------------------------")
 
+        if prep_tri:
+            lineas.append("------------------------")
+            lineas.append("*ZOOLO TRIPLE / TERMINAL / MAS 1*")
+            porh = defaultdict(list)
+            for x in prep_tri:
+                if x['tipo'] in ('triple','terminal'):
+                    porh[x['hora']].append(x)
+            for hp in HORARIOS_TRIPLE:
+                if hp not in porh: continue
+                lineas.append(f"* {fmt_h_ticket(hp)} *")
+                items = []
+                for x in porh[hp]:
+                    et = 'TRP' if x['tipo']=='triple' else 'TER'
+                    items.append(f"{et} {x['seleccion']}x{fmt(x['monto'])}")
+                lineas.append(" ".join(items))
+            m1 = [x for x in prep_tri if x['tipo']=='mas1']
+            if m1:
+                lineas.append(f"*MAS 1 (vie {viernes_mas1})*")
+                items = []
+                for x in m1:
+                    dg, an = x['seleccion'].split('-')
+                    items.append(f"{dg}+{an}({ANIMALES.get(an,'')[0:3].upper()})x{fmt(x['monto'])}")
+                lineas.append(" ".join(items))
+
         totales_lineas = ["------------------------"]
         if total_peru > 0:
             totales_lineas.append(f"*TOTAL PERU: S/{fmt(total_peru)}*")
         if total_plus > 0:
             totales_lineas.append(f"*TOTAL PLUS: Bs{fmt(total_plus)}*")
+        if total_triple > 0:
+            totales_lineas.append(f"*TOTAL TRIPLE: S/{fmt(total_triple)}*")
         lineas += totales_lineas + [
                    "",
                    "Buena Suerte! 🍀",
@@ -1502,6 +2132,7 @@ def procesar_venta():
             'total':total,
             'total_peru':total_peru,
             'total_plus':total_plus,
+            'total_triple':total_triple,
             'url_whatsapp':url_wa
         })
     except Exception as e:
@@ -1638,16 +2269,20 @@ def mis_tickets():
                         'monto':tr['monto'],'salieron':salidos,'gano':gano_t,'premio':round(pt,2),
                         'pagado':bool(tr['pagado']),'loteria':lot_tr
                     })
+                _tri_det = _detalle_triple_ticket(t['id'], db)
+                _tri_prem = round(sum(x['premio'] for x in _tri_det), 2)
+                premio_total += _tri_prem; premio_peru += _tri_prem
                 if est=='por_pagar' and (t['pagado'] or premio_total==0): continue
                 tot_peru = t['total_peru'] if 'total_peru' in t.keys() and t['total_peru'] else 0
                 tot_plus = t['total_plus'] if 'total_plus' in t.keys() and t['total_plus'] else 0
+                tot_tri = t['total_triple'] if 'total_triple' in t.keys() and t['total_triple'] else 0
                 tickets_out.append({
                     'id':t['id'],'serial':t['serial'],'fecha':t['fecha'],
-                    'total':t['total'],'total_peru':round(tot_peru,2),'total_plus':round(tot_plus,2),
+                    'total':t['total'],'total_peru':round(tot_peru,2),'total_plus':round(tot_plus,2),'total_triple':round(tot_tri,2),
                     'pagado':bool(t['pagado']),
                     'premio_calculado':round(premio_total,2),
                     'premio_peru':round(premio_peru,2),'premio_plus':round(premio_plus,2),
-                    'jugadas':jugadas_det,'tripletas':trips_det
+                    'jugadas':jugadas_det,'tripletas':trips_det,'triples':_tri_det
                 })
         tv_peru = sum(t['total_peru'] for t in tickets_out)
         tv_plus = sum(t['total_plus'] for t in tickets_out)
@@ -1729,17 +2364,21 @@ def consultar_ticket_detalle():
                 'monto':tr['monto'],'salieron':salidos,'gano':gano_t,
                 'premio':round(pt,2),'pagado':bool(tr['pagado']),'loteria':lot_tr
             })
+        _tri = _detalle_triple_ticket(t['id'])
+        _tp = round(sum(x['premio'] for x in _tri), 2)
+        premio_total += _tp; premio_peru += _tp
         return jsonify({
             'status':'ok',
             'ticket':{
                 'id':t['id'],'serial':t['serial'],'fecha':t['fecha'],
                 'total_apostado':t['total'],
                 'total_peru':t.get('total_peru',0),'total_plus':t.get('total_plus',0),
+                'total_triple':t.get('total_triple',0),
                 'pagado':bool(t['pagado']),
                 'anulado':bool(t['anulado']),'premio_total':round(premio_total,2),
                 'premio_peru':round(premio_peru,2),'premio_plus':round(premio_plus,2)
             },
-            'jugadas':jdet,'tripletas':tdet
+            'jugadas':jdet,'tripletas':tdet,'triples':_tri
         })
     except Exception as e:
         return jsonify({'error':str(e)}),500
@@ -1757,11 +2396,14 @@ def verificar_ticket():
             if t['anulado']: return jsonify({'error':'TICKET ANULADO'})
             if t['pagado']:  return jsonify({'error':'YA FUE PAGADO'})
             premio = calcular_premio_ticket_split(t['id'], db)
+            ptri = calcular_premio_triple_ticket(t['id'], db).get('peru', 0)
+        peru_tot = round(premio['peru'] + ptri, 2)
         return jsonify({
             'status':'ok','ticket_id':t['id'],
-            'total_ganado':round(premio['peru']+premio['plus'],2),
-            'total_ganado_peru':premio['peru'],
-            'total_ganado_plus':premio['plus']
+            'total_ganado':round(peru_tot+premio['plus'],2),
+            'total_ganado_peru':peru_tot,
+            'total_ganado_plus':premio['plus'],
+            'total_ganado_triple':round(ptri,2)
         })
     except Exception as e:
         return jsonify({'error':str(e)}),500
@@ -1821,6 +2463,22 @@ def anular_ticket():
                     if cerrado:
                         lot_label = 'PLUS' if lot_j == 'plus' else 'PERÚ'
                         return jsonify({'error':f"No se puede anular: el sorteo {j['hora']} ({lot_label}) ya cerró"})
+                hoy_an = ahora_peru().strftime("%d/%m/%Y")
+                ahora_naive = ahora_peru().replace(tzinfo=None)
+                jtri = db.execute("SELECT tipo, hora, fecha_sorteo FROM jugadas_triple WHERE ticket_id=%s",(t['id'],)).fetchall()
+                for j in jtri:
+                    if j['tipo'] == 'mas1':
+                        try:
+                            fv = datetime.strptime(j['fecha_sorteo'], "%d/%m/%Y").replace(hour=17, minute=0)
+                        except Exception:
+                            fv = None
+                        if fv is not None and ahora_naive >= fv - timedelta(minutes=MINUTOS_BLOQUEO):
+                            return jsonify({'error':"No se puede anular: el sorteo del Más 1 ya cerró"})
+                    else:
+                        if j['fecha_sorteo'] != hoy_an:
+                            return jsonify({'error':"No se puede anular: el sorteo de ese día ya pasó"})
+                        if not puede_vender(j['hora']):
+                            return jsonify({'error':f"No se puede anular: el {j['tipo']} de {j['hora']} ya cerró"})
             db.execute("UPDATE tickets SET anulado=1 WHERE id=%s",(t['id'],))
             db.commit()
         log_audit('ANULACION', f"Ticket serial:{serial} anulado")
@@ -1842,11 +2500,13 @@ def caja_agencia():
             for t in tickets:
                 tp = t['total_peru'] if 'total_peru' in t.keys() and t['total_peru'] else 0
                 tl = t['total_plus'] if 'total_plus' in t.keys() and t['total_plus'] else 0
-                ventas_peru += tp; ventas_plus += tl
+                ttri = t['total_triple'] if 'total_triple' in t.keys() and t['total_triple'] else 0
+                ventas_peru += tp + ttri; ventas_plus += tl
                 prem = calcular_premio_ticket_split(t['id'], db)
+                ptri = calcular_premio_triple_ticket(t['id'], db).get('peru', 0)
                 if t['pagado']:
-                    premios_peru += prem['peru']; premios_plus += prem['plus']
-                elif (prem['peru']+prem['plus']) > 0:
+                    premios_peru += prem['peru'] + ptri; premios_plus += prem['plus']
+                elif (prem['peru']+prem['plus']+ptri) > 0:
                     pendientes += 1
         def _resumen(ventas, premios):
             com = round(ventas*com_pct, 2)
@@ -1956,7 +2616,7 @@ def tickets_detalle():
                     'total_peru': t['total_peru'] if 'total_peru' in t.keys() else 0,
                     'total_plus': t['total_plus'] if 'total_plus' in t.keys() else 0,
                     'pagado': bool(t['pagado']), 'anulado': bool(t['anulado']),
-                    'jugadas': jdet, 'tripletas': tdet
+                    'jugadas': jdet, 'tripletas': tdet, 'triples': _detalle_triple_ticket(t['id'], db)
                 })
         return jsonify({'status': 'ok', 'tickets': out, 'total': len(out)})
     except Exception as e:
@@ -2120,6 +2780,140 @@ def toggle_autosorteo():
 def estado_autosorteo():
     estado = get_config('auto_sorteo', 'off')
     return jsonify({'estado': estado})
+
+@app.route('/admin/toggle-autosorteo-triple', methods=['POST'])
+@superadmin_required
+def toggle_autosorteo_triple():
+    try:
+        data = request.get_json() or {}
+        nuevo = data.get('estado', 'off')
+        if nuevo not in ('on', 'off'):
+            return jsonify({'error': 'Estado inválido'}), 400
+        set_config('auto_sorteo_triple', nuevo)
+        lbl = 'ACTIVADO ✅' if nuevo == 'on' else 'DESACTIVADO ⛔'
+        log_audit('AUTO_SORTEO_TRIPLE_TOGGLE', f"Auto-sorteo Triple {lbl}")
+        return jsonify({'status': 'ok', 'estado': nuevo, 'mensaje': f'Auto-sorteo Triple {lbl}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/estado-autosorteo-triple')
+@admin_required
+def estado_autosorteo_triple():
+    return jsonify({'estado': get_config('auto_sorteo_triple', 'off')})
+
+@app.route('/admin/guardar-resultado-triple', methods=['POST'])
+@superadmin_required
+def guardar_resultado_triple():
+    try:
+        data = request.get_json() or {}
+        hora = data.get('hora')
+        numero = data.get('numero')
+        fi = data.get('fecha')
+        if hora not in HORARIOS_TRIPLE:
+            return jsonify({'error': 'Hora inválida'}), 400
+        if fi:
+            try: fecha = datetime.strptime(fi, "%Y-%m-%d").strftime("%d/%m/%Y")
+            except Exception: fecha = ahora_peru().strftime("%d/%m/%Y")
+        else:
+            fecha = ahora_peru().strftime("%d/%m/%Y")
+        r = ejecutar_auto_sorteo_triple(fecha, hora, 'peru', forzar_numero=numero, modo='manual')
+        if r and r.get('error'):
+            return jsonify({'error': r['error']}), 400
+        if not r:
+            return jsonify({'error': 'No se pudo registrar el resultado'}), 500
+        log_audit('RESULTADO_TRIPLE', f"Manual {fecha} {hora} -> {r['numero']} (term {r['terminal']})")
+        return jsonify({'status': 'ok', 'mensaje': f"Triple {hora} = {r['numero']} (terminal {r['terminal']})", 'fecha': fecha, **r})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/guardar-resultado-mas1', methods=['POST'])
+@superadmin_required
+def guardar_resultado_mas1():
+    try:
+        data = request.get_json() or {}
+        digito = data.get('digito')
+        animal = data.get('animal')
+        fi = data.get('fecha')
+        if fi:
+            try: fecha = datetime.strptime(fi, "%Y-%m-%d").strftime("%d/%m/%Y")
+            except Exception: fecha = _viernes_mas1()
+        else:
+            fecha = _viernes_mas1()
+        try:
+            if datetime.strptime(fecha, "%d/%m/%Y").weekday() != 4:
+                return jsonify({'error': 'La fecha del Más 1 debe ser un viernes'}), 400
+        except Exception:
+            pass
+        r = ejecutar_auto_sorteo_mas1(fecha, 'peru', forzar_digito=digito, forzar_animal=animal, modo='manual')
+        if r and r.get('error'):
+            return jsonify({'error': r['error']}), 400
+        if not r:
+            return jsonify({'error': 'No se pudo registrar el resultado'}), 500
+        log_audit('RESULTADO_MAS1', f"Manual {fecha} -> {r['digito']}+{r['animal']}")
+        return jsonify({'status': 'ok', 'mensaje': f"Más 1 = {r['digito']} + {r['animal']} ({r['nombre']})", 'fecha': fecha, **r})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/resultados-triple-hoy')
+@admin_required
+def resultados_triple_hoy():
+    try:
+        fi = request.args.get('fecha')
+        if fi:
+            try: fecha = datetime.strptime(fi, "%Y-%m-%d").strftime("%d/%m/%Y")
+            except Exception: fecha = ahora_peru().strftime("%d/%m/%Y")
+        else:
+            fecha = ahora_peru().strftime("%d/%m/%Y")
+        with get_db() as db:
+            rows = db.execute("SELECT hora,numero FROM resultados_triple WHERE fecha=%s AND moneda='peru'", (fecha,)).fetchall()
+            rmap = {r['hora']: r['numero'] for r in rows}
+            vie = _viernes_mas1()
+            m = db.execute("SELECT digito,animal FROM resultado_mas1 WHERE fecha=%s AND moneda='peru'", (vie,)).fetchone()
+        triples = []
+        for h in HORARIOS_TRIPLE:
+            n = rmap.get(h)
+            triples.append({'hora': h, 'numero': n, 'terminal': _last2(n) if n else None})
+        mas1 = None
+        if m:
+            mas1 = {'fecha': vie, 'digito': m['digito'], 'animal': m['animal'], 'nombre': ANIMALES.get(m['animal'], '?')}
+        return jsonify({'status': 'ok', 'fecha': fecha, 'triples': triples, 'mas1': mas1, 'viernes': vie})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/riesgo-triple')
+@superadmin_required
+def riesgo_triple():
+    try:
+        fi = request.args.get('fecha')
+        hora = request.args.get('hora', HORARIOS_TRIPLE[0])
+        if hora not in HORARIOS_TRIPLE:
+            hora = HORARIOS_TRIPLE[0]
+        if fi:
+            try: fecha = datetime.strptime(fi, "%Y-%m-%d").strftime("%d/%m/%Y")
+            except Exception: fecha = ahora_peru().strftime("%d/%m/%Y")
+        else:
+            fecha = ahora_peru().strftime("%d/%m/%Y")
+        moneda = 'peru'
+        with get_db() as db:
+            disp, vendido, presupuesto, pagados = _disponible_pote_triple(fecha, moneda, db)
+            ex, tm = _mapas_apuestas_triple(fecha, hora, moneda, db)
+            filas = []
+            for n3, monto in ex.items():
+                filas.append({'tipo': 'triple', 'sel': n3, 'apostado': round(monto, 2), 'pagaria': round(monto * PAGO_TRIPLE_EXACTO, 2)})
+            for t2, monto in tm.items():
+                filas.append({'tipo': 'terminal', 'sel': t2, 'apostado': round(monto, 2), 'pagaria': round(monto * PAGO_TERMINAL, 2)})
+            filas.sort(key=lambda x: -x['pagaria'])
+            vie = _viernes_mas1()
+            m1map = _mapa_apuestas_mas1(vie, moneda, db)
+            m1 = []
+            for sel, monto in m1map.items():
+                m1.append({'sel': sel, 'apostado': round(monto, 2), 'pagaria_completo': round(monto * PAGO_MAS1_COMPLETO, 2)})
+            m1.sort(key=lambda x: -x['pagaria_completo'])
+        return jsonify({'status': 'ok', 'fecha': fecha, 'hora': hora, 'viernes': vie,
+                        'pote': {'vendido_mes': vendido, 'presupuesto_67': presupuesto, 'pagado_mes': pagados, 'disponible': disp},
+                        'triple_terminal': filas[:60], 'mas1': m1[:60]})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/admin/forzar-autosorteo', methods=['POST'])
 @admin_required
@@ -3024,7 +3818,7 @@ def admin_tickets_detalle():
                     'total_peru': t['total_peru'] if 'total_peru' in t.keys() else 0,
                     'total_plus': t['total_plus'] if 'total_plus' in t.keys() else 0,
                     'pagado': bool(t['pagado']), 'anulado': bool(t['anulado']),
-                    'jugadas': jdet, 'tripletas': tdet
+                    'jugadas': jdet, 'tripletas': tdet, 'triples': _detalle_triple_ticket(t['id'], db)
                 })
         return jsonify({'status': 'ok', 'tickets': out, 'total': len(out)})
     except Exception as e:
@@ -3308,6 +4102,47 @@ def public_resultados_hoy():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/public/resultados-triple')
+def public_resultados_triple():
+    try:
+        fecha_param = request.args.get('fecha')
+        if not fecha_param:
+            fecha = ahora_peru().strftime("%d/%m/%Y")
+        else:
+            fecha = datetime.strptime(fecha_param, "%Y-%m-%d").strftime("%d/%m/%Y")
+        with get_db() as db:
+            rows = db.execute("SELECT hora, numero FROM resultados_triple WHERE fecha=%s AND moneda='peru'", (fecha,)).fetchall()
+        def h24(hora_str):
+            try:
+                return datetime.strptime(hora_str.strip(), "%I:%M %p").strftime("%H:%M")
+            except Exception:
+                return hora_str
+        triples = {}; terminales = {}
+        for r in rows:
+            k = h24(r['hora']); num = str(r['numero']).zfill(3)
+            triples[k] = num; terminales[k] = num[-2:]
+        try:
+            dref = datetime.strptime(fecha, "%d/%m/%Y")
+        except Exception:
+            dref = ahora_peru()
+        vie = (dref + timedelta(days=(4 - dref.weekday()))).strftime("%d/%m/%Y")
+        with get_db() as db:
+            m = db.execute("SELECT digito, animal FROM resultado_mas1 WHERE fecha=%s AND moneda='peru'", (vie,)).fetchone()
+        mas1 = None
+        if m:
+            mas1 = {'fecha': vie, 'digito': m['digito'], 'animal': m['animal'], 'nombre': ANIMALES.get(m['animal'], '?')}
+        return jsonify({
+            'status': 'ok',
+            'fecha': fecha,
+            'horarios': ['09:00', '12:00', '15:00', '18:00'],
+            'triples': triples,
+            'terminales': terminales,
+            'mas1': mas1,
+            'updated_at': ahora_peru().strftime("%d/%m/%Y %I:%M %p")
+        }), 200, {'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache'}
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/public/resultados-fecha')
 def public_resultados_fecha():
     try:
@@ -3570,6 +4405,7 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
       <div class="btns-row"><div class="abtn res" onclick="openResultados()">RESULTADOS</div><div class="abtn caja" onclick="openCaja()">CAJA</div></div>
       <div class="btns-row"><div class="abtn pagar" onclick="openPagar()">PAGAR</div><div class="abtn anular" onclick="openAnular()">ANULAR</div></div>
       <div class="btns-row2"><div class="abtn trip" onclick="openTripletaModal()">TRIPLETA</div><div class="abtn rep" onclick="openRepetirModal()">REPETIR</div><div class="abtn borrar" onclick="borrarTodo()">BORRAR</div></div>
+      <div style="margin-top:3px"><div class="abtn" style="background:#6b21a8;border-color:#a855f7;text-align:center;padding:10px" onclick="openTripleModal()">🎲 TRIPLE · TERMINAL · MÁS 1</div></div>
     </div>
   </div>
 </div>
@@ -3591,6 +4427,31 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 <div class="modal" id="mod-pagar"><div class="mc"><div class="mh"><h3>VERIFICAR / PAGAR</h3><button class="btn-close" onclick="closeMod('mod-pagar')">X</button></div><div class="mbody"><div class="frow"><input type="text" id="pag-serial" placeholder="Serial del ticket"></div><button class="btn-q" onclick="verificarTicket()">VERIFICAR</button><div id="pag-res"></div></div></div></div>
 <div class="modal" id="mod-anular"><div class="mc"><div class="mh"><h3>ANULAR TICKET</h3><button class="btn-close" onclick="closeMod('mod-anular')">X</button></div><div class="mbody"><div class="frow"><input type="text" id="an-serial" placeholder="Serial del ticket"></div><button class="btn-q" style="background:linear-gradient(135deg,#3a1010,#280808);border-color:#6b1515;color:#e05050" onclick="anularTicket()">ANULAR</button><div id="an-res"></div></div></div></div>
 <div class="modal" id="mod-caja"><div class="mc"><div class="mh"><h3>CAJA HOY</h3><button class="btn-close" onclick="closeMod('mod-caja')">X</button></div><div class="mbody" id="caja-body"></div></div></div>
+<div class="modal" id="mod-triple"><div class="mc"><div class="mh" style="border-color:#a855f7;background:linear-gradient(135deg,#1a0a30,#0c1a3a)"><h3 style="color:#e0d0ff">TRIPLE / TERMINAL / MAS 1</h3><button class="btn-close" onclick="closeMod('mod-triple')">X</button></div><div class="mbody">
+  <div style="display:flex;gap:4px;margin-bottom:12px">
+    <button id="tg-triple" onclick="selTripleGame('triple')">TRIPLE<br><span style="font-size:.58rem;opacity:.8">700x / aprox 20x</span></button>
+    <button id="tg-terminal" onclick="selTripleGame('terminal')">TERMINAL<br><span style="font-size:.58rem;opacity:.8">65x</span></button>
+    <button id="tg-mas1" onclick="selTripleGame('mas1')">MAS 1<br><span style="font-size:.58rem;opacity:.8">250x / 35x</span></button>
+  </div>
+  <div id="tg-num-box">
+    <div class="manual-label" style="margin-bottom:4px"><span id="tg-num-label">NUMERO (000-999)</span></div>
+    <input type="text" id="tg-numero" inputmode="numeric" placeholder="Ej: 500" class="manual-input" style="margin-bottom:10px">
+    <div class="rlabel">SORTEO(S) DE HOY</div>
+    <div class="horas-grid" id="tg-horas"></div>
+    <div class="horas-btns-row"><button class="hsel-btn" onclick="tgTodos()">Todos</button><button class="hsel-btn" onclick="tgLimpiar()">Limpiar</button></div>
+  </div>
+  <div id="tg-mas1-box" style="display:none">
+    <div style="background:#1a0a30;border:1px solid #a855f7;border-radius:4px;padding:8px;margin-bottom:10px;color:#c084fc;font-size:.72rem;text-align:center">Sorteo del <b id="tg-vie">viernes</b> &middot; minimo S/5</div>
+    <div class="rlabel">DIGITO (0-9)</div>
+    <div id="tg-digitos" style="display:grid;grid-template-columns:repeat(10,1fr);gap:3px;margin-bottom:10px"></div>
+    <div class="rlabel">ANIMAL</div>
+    <div id="tg-animales" style="display:grid;grid-template-columns:repeat(7,1fr);gap:3px;max-height:180px;overflow-y:auto"></div>
+  </div>
+  <div class="monto-sec" style="border:none;padding:8px 0">
+    <div class="monto-input-wrap"><span class="monto-label">S/</span><input type="number" class="monto-input" id="tg-monto" value="1" min="0.5" step="0.5"></div>
+  </div>
+  <button class="btn-q" style="background:#6b21a8;border-color:#a855f7" onclick="addTriple()">AGREGAR AL TICKET</button>
+</div></div></div>
 <script>
 const ANIMALES = {{ animales | tojson }};
 const COLORES  = {{ colores | tojson }};
@@ -3632,7 +4493,27 @@ function agregarItemRepetir(idx,tipo,seleccion,loteria){let monto=parseFloat(doc
 function agregarTodoRepetir(){let btns=document.querySelectorAll('#rep-contenido .rep-item button');btns.forEach(btn=>btn.click());}
 function setM(v){document.getElementById('monto').value=v;}
 function agregar(){let monto=parseFloat(document.getElementById('monto').value)||0;if(monto<=0){toast('Monto invalido','err');return;}let lot=loteriaActiva,sel=lot==='plus'?horasSelPlus:horasSel;if(espSel){if(sel.length===0){toast('Seleccione horario','err');return;}sel.forEach(h=>{let labels={'ROJO':'ROJO x2','NEGRO':'NEGRO x2','PAR':'PAR x2','IMPAR':'IMPAR x2'};carrito.push({tipo:'especial',hora:h,seleccion:espSel,monto,desc:labels[espSel],loteria:lot});});renderCarrito();toast('Especial agregado','ok');return;}if(animalesSel.length===0){toast('Seleccione animal(es)','err');return;}if(sel.length===0){toast('Seleccione horario(s)','err');return;}sel.forEach(h=>{animalesSel.forEach(k=>{carrito.push({tipo:'animal',hora:h,seleccion:k,monto,desc:k+'-'+ANIMALES[k],loteria:lot});});});animalesSel=[];document.querySelectorAll('.animals-grid .acard').forEach(c=>c.classList.remove('sel'));document.getElementById('manual-input').value='';renderCarrito();toast('Jugadas agregadas ('+lot.toUpperCase()+')','ok');}
-function renderCarrito(){let list=document.getElementById('ticket-list'),tot=document.getElementById('ticket-total');window._carritoLen=carrito.length;document.getElementById('btn-wa').disabled=(carrito.length===0||_sinConexion);if(!carrito.length){list.innerHTML='<div class="ticket-empty">TICKET VACIO</div>';tot.style.display='none';return;}let html='',totalPeru=0,totalPlus=0;carrito.forEach((it,i)=>{let lot=it.loteria||'peru';if(lot==='plus')totalPlus+=it.monto;else totalPeru+=it.monto;let lotLabel=lot==='plus'?'<span style="background:#4c1d95;border:1px solid #a855f7;color:#e9d5ff;font-size:.58rem;font-family:\'Oswald\',sans-serif;padding:1px 5px;border-radius:3px;flex-shrink:0">PLUS</span>':'<span style="background:#0c2461;border:1px solid #3b9eff;color:#bae6fd;font-size:.58rem;font-family:\'Oswald\',sans-serif;padding:1px 5px;border-radius:3px;flex-shrink:0">PERU</span>';let horaLabel=it.hora==='TODO DIA'?'x60':it.hora.replace(':00','').replace(' ','');html+='<div class="ti"><span class="ti-hora">'+horaLabel+'</span>'+lotLabel+'<span class="ti-desc">'+it.desc+'</span><span class="ti-monto">'+simb(lot)+it.monto+'</span><button class="ti-del" onclick="quitarItem('+i+')">X</button></div>';});list.innerHTML=html;tot.style.display='block';let lineas=[];if(totalPeru>0)lineas.push('PERU: S/ '+totalPeru.toFixed(2));if(totalPlus>0)lineas.push('PLUS: Bs '+totalPlus.toFixed(2));tot.innerHTML=lineas.map(l=>'TOTAL '+l).join('<br>');}
+let tgGame='triple', tgHoras=[], tgDigito=null, tgAnimal=null;
+const HTRIPLE=['09:00 AM','12:00 PM','03:00 PM','06:00 PM'];
+function _proxViernes(){let d=new Date();let add=(5-d.getDay()+7)%7;d.setDate(d.getDate()+add);return d.toLocaleDateString('es-PE');}
+function openTripleModal(){tgHoras=[];tgDigito=null;tgAnimal=null;document.getElementById('tg-numero').value='';document.getElementById('tg-monto').value='1';document.getElementById('tg-vie').textContent=_proxViernes();renderTgHoras();renderTgDigitos();renderTgAnimales();selTripleGame('triple');openMod('mod-triple');}
+function selTripleGame(g){tgGame=g;['triple','terminal','mas1'].forEach(function(x){var b=document.getElementById('tg-'+x);if(!b)return;var on=(x===g);b.style.cssText='flex:1;padding:9px 4px;border-radius:4px;cursor:pointer;font-family:Oswald,sans-serif;font-size:.78rem;font-weight:700;line-height:1.1;border:2px solid '+(on?'#a855f7':'#2a3a6a')+';background:'+(on?'#6b21a8':'#0c1020')+';color:'+(on?'#f3e8ff':'#8090b0');});document.getElementById('tg-num-box').style.display=(g==='mas1')?'none':'block';document.getElementById('tg-mas1-box').style.display=(g==='mas1')?'block':'none';if(g==='triple'){document.getElementById('tg-num-label').textContent='NUMERO (000-999)';document.getElementById('tg-numero').placeholder='Ej: 500';}if(g==='terminal'){document.getElementById('tg-num-label').textContent='TERMINAL (00-99)';document.getElementById('tg-numero').placeholder='Ej: 00';}}
+function renderTgHoras(){var g=document.getElementById('tg-horas');g.innerHTML='';HTRIPLE.forEach(function(h){var b=document.createElement('div');b.className='hbtn'+(tgHoras.indexOf(h)>=0?' sel':'');b.innerHTML='<div class="hperu">'+h.replace(':00','')+'</div>';b.onclick=function(){var i=tgHoras.indexOf(h);if(i>=0)tgHoras.splice(i,1);else tgHoras.push(h);renderTgHoras();};g.appendChild(b);});}
+function tgTodos(){tgHoras=HTRIPLE.slice();renderTgHoras();}
+function tgLimpiar(){tgHoras=[];renderTgHoras();}
+function renderTgDigitos(){var g=document.getElementById('tg-digitos');g.innerHTML='';for(var d=0;d<=9;d++){var b=document.createElement('div');b.className='hbtn'+(String(d)===String(tgDigito)?' sel':'');b.style.padding='8px 2px';b.textContent=d;b.onclick=(function(dd){return function(){tgDigito=String(dd);renderTgDigitos();};})(d);g.appendChild(b);}}
+function renderTgAnimales(){var g=document.getElementById('tg-animales');g.innerHTML='';ORDEN.forEach(function(k){if(!ANIMALES[k])return;var d=document.createElement('div');var on=(k===tgAnimal);d.style.cssText='background:'+(on?'#0a2a10':'#f8fafc')+';border:1px solid '+(on?'#22c55e':'#e2e8f0')+';border-radius:3px;padding:4px 2px;text-align:center;cursor:pointer';d.innerHTML='<div style="font-weight:700;font-family:Oswald,sans-serif;font-size:.72rem;color:'+(on?'#4ade80':'#1e293b')+'">'+k+'</div><div style="font-size:.5rem;color:#64748b">'+ANIMALES[k].substring(0,5)+'</div>';d.onclick=(function(kk){return function(){tgAnimal=kk;renderTgAnimales();};})(k);g.appendChild(d);});}
+function addTriple(){var monto=parseFloat(document.getElementById('tg-monto').value)||0;if(monto<=0){toast('Monto invalido','err');return;}
+  if(tgGame==='mas1'){if(tgDigito===null){toast('Elige un digito 0-9','err');return;}if(!tgAnimal){toast('Elige un animal','err');return;}if(monto<5){toast('Mas 1: minimo S/5','err');return;}carrito.push({tipo:'mas1',hora:'',seleccion:tgDigito+'-'+tgAnimal,monto:monto,loteria:'peru',desc:'M1 '+tgDigito+'+'+tgAnimal+'-'+(ANIMALES[tgAnimal]||'').substring(0,4)});renderCarrito();toast('Mas 1 agregado','ok');return;}
+  var num=document.getElementById('tg-numero').value.trim();
+  if(tgGame==='triple'){if(!/^[0-9]{1,3}$/.test(num)){toast('Triple: 000-999','err');return;}while(num.length<3)num='0'+num;}
+  else{if(!/^[0-9]{1,2}$/.test(num)){toast('Terminal: 00-99','err');return;}while(num.length<2)num='0'+num;}
+  if(!tgHoras.length){toast('Elige al menos un sorteo','err');return;}
+  var et=(tgGame==='triple')?'TRP':'TER';
+  tgHoras.forEach(function(h){carrito.push({tipo:tgGame,hora:h,seleccion:num,monto:monto,loteria:'peru',desc:et+' '+num});});
+  renderCarrito();toast((tgGame==='triple'?'Triple':'Terminal')+' agregado','ok');
+}
+function renderCarrito(){var list=document.getElementById('ticket-list'),tot=document.getElementById('ticket-total');window._carritoLen=carrito.length;document.getElementById('btn-wa').disabled=(carrito.length===0||_sinConexion);if(!carrito.length){list.innerHTML='<div class="ticket-empty">TICKET VACIO</div>';tot.style.display='none';return;}var html='',totalPeru=0,totalPlus=0,totalTri=0;carrito.forEach(function(it,i){var esTri=(it.tipo==='triple'||it.tipo==='terminal'||it.tipo==='mas1');var lot=it.loteria||'peru';if(esTri)totalTri+=it.monto;else if(lot==='plus')totalPlus+=it.monto;else totalPeru+=it.monto;var label;if(esTri)label='<span style="background:#2e1065;border:1px solid #a855f7;color:#e9d5ff;font-size:.58rem;font-family:Oswald,sans-serif;padding:1px 5px;border-radius:3px;flex-shrink:0">TRIPLE</span>';else if(lot==='plus')label='<span style="background:#4c1d95;border:1px solid #a855f7;color:#e9d5ff;font-size:.58rem;font-family:Oswald,sans-serif;padding:1px 5px;border-radius:3px;flex-shrink:0">PLUS</span>';else label='<span style="background:#0c2461;border:1px solid #3b9eff;color:#bae6fd;font-size:.58rem;font-family:Oswald,sans-serif;padding:1px 5px;border-radius:3px;flex-shrink:0">PERU</span>';var horaLabel;if(it.tipo==='mas1')horaLabel='VIE';else if(it.hora==='TODO DIA')horaLabel='x60';else horaLabel=(it.hora||'').replace(':00','').replace(' ','');html+='<div class="ti"><span class="ti-hora">'+horaLabel+'</span>'+label+'<span class="ti-desc">'+it.desc+'</span><span class="ti-monto">'+(esTri?'S/':simb(lot))+it.monto+'</span><button class="ti-del" onclick="quitarItem('+i+')">X</button></div>';});list.innerHTML=html;tot.style.display='block';var lineas=[];if(totalPeru>0)lineas.push('TOTAL PERU: S/ '+totalPeru.toFixed(2));if(totalPlus>0)lineas.push('TOTAL PLUS: Bs '+totalPlus.toFixed(2));if(totalTri>0)lineas.push('TOTAL TRIPLE: S/ '+totalTri.toFixed(2));tot.innerHTML=lineas.join('<br>');}
 function quitarItem(i){carrito.splice(i,1);renderCarrito();}
 function borrarTodo(){carrito=[];animalesSel=[];espSel=null;horasSel=[];horasSelPlus=[];document.querySelectorAll('.acard').forEach(c=>c.classList.remove('sel'));document.querySelectorAll('.esp-btn').forEach(e=>e.classList.remove('sel'));renderCarrito();toast('Ticket borrado','err');}
 async function vender(){if(!carrito.length){toast('Ticket vacio','err');return;}let btn=document.getElementById('btn-wa');btn.disabled=true;btn.textContent='PROCESANDO...';try{let r=await fetch('/api/procesar-venta',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({jugadas:carrito.map(c=>({hora:c.hora,seleccion:c.seleccion,monto:c.monto,tipo:c.tipo,loteria:c.loteria||'peru'}))})});let d=await r.json();if(d.error){toast(d.error,'err');}else{window.open(d.url_whatsapp,'_blank');toast('Ticket #'+d.ticket_id+' generado!','ok');carrito=[];animalesSel=[];if(espSel){document.getElementById('esp-'+espSel).classList.remove('sel');espSel=null;}horasSel=[];horasSelPlus=[];document.getElementById('manual-input').value='';renderCarrito();renderAnimales();renderHoras();}}catch(e){toast('Error de conexion','err');}finally{btn.disabled=false;btn.textContent='ENVIAR POR WHATSAPP';}}
@@ -3752,6 +4633,7 @@ body.solo-lectura .tc button,body.solo-lectura .tc input,body.solo-lectura .tc s
   <div class="tab" onclick="showTab('tripletas')">🎯 TRIPLETAS</div>
   <div class="tab" onclick="showTab('auditoria')">📋 AUDITORÍA</div>
   {% if es_superadmin %}<div class="tab" onclick="showTab('admins')">👑 ADMINS</div>{% endif %}
+  {% if es_superadmin %}<div class="tab" onclick="showTab('triple')">🎲 TRIPLE</div>{% endif %}
 </div>
 
 <!-- TAB RESULTADOS -->
@@ -3979,6 +4861,62 @@ body.solo-lectura .tc button,body.solo-lectura .tc input,body.solo-lectura .tc s
 </div>
 {% endif %}
 
+{% if es_superadmin %}
+<!-- TAB TRIPLE / TERMINAL / MÁS 1 (solo super-admin) -->
+<div id="tc-triple" class="tc">
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+      <div class="card-title" style="border:none;padding:0;margin:0">🎲 TRIPLE · TERMINAL · MÁS 1 — pote mensual 67/33</div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="color:var(--text2);font-size:.7rem;font-family:Oswald,sans-serif;letter-spacing:1px">AUTO-SORTEO:</span>
+        <button class="toggle-btn off" id="toggle-triple-btn" onclick="toggleAutoTriple()">⏸ DESACTIVADO</button>
+      </div>
+    </div>
+  </div>
+  <div class="grid2">
+    <div class="card">
+      <div class="card-title">✍️ CARGAR TRIPLE (manual)</div>
+      <div class="frow">
+        <div class="fg"><label>FECHA</label><input type="date" id="tri-fecha"></div>
+        <div class="fg"><label>HORA</label><select id="tri-hora"></select></div>
+        <div class="fg"><label>NÚMERO 000-999</label><input type="text" id="tri-numero" inputmode="numeric" placeholder="Ej: 500"></div>
+      </div>
+      <div id="msg-tri" class="msg"></div>
+      <button class="btn btn-block green" onclick="guardarTripleManual()">GUARDAR TRIPLE</button>
+      <div style="color:var(--text2);font-size:.66rem;margin-top:6px">El terminal se calcula solo (2 últimas cifras). No se permite un número que supere el 67% disponible.</div>
+    </div>
+    <div class="card">
+      <div class="card-title">✍️ CARGAR MÁS 1 (viernes)</div>
+      <div class="frow">
+        <div class="fg"><label>VIERNES</label><input type="date" id="m1-fecha"></div>
+        <div class="fg"><label>DÍGITO 0-9</label><input type="number" id="m1-digito" min="0" max="9" placeholder="0-9"></div>
+        <div class="fg"><label>ANIMAL</label><select id="m1-animal"></select></div>
+      </div>
+      <div id="msg-m1" class="msg"></div>
+      <button class="btn btn-block green" onclick="guardarMas1Manual()">GUARDAR MÁS 1</button>
+    </div>
+  </div>
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <div class="card-title" style="border:none;margin:0;padding:0">📋 RESULTADOS DEL DÍA</div>
+      <button class="btn" style="padding:4px 10px;font-size:.65rem" onclick="cargarTripleResultados()">🔄 Actualizar</button>
+    </div>
+    <div id="tri-resultados" style="margin-top:8px"></div>
+  </div>
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+      <div class="card-title" style="border:none;margin:0;padding:0">⚡ RIESGO DEL POTE</div>
+      <div style="display:flex;gap:6px;align-items:center">
+        <select id="tri-riesgo-hora" style="width:auto;padding:4px 8px;font-size:.72rem"></select>
+        <button class="btn" style="padding:4px 10px;font-size:.65rem" onclick="cargarTripleRiesgo()">🔄</button>
+      </div>
+    </div>
+    <div id="tri-pote" style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:10px 0"></div>
+    <div id="tri-riesgo"></div>
+  </div>
+</div>
+{% endif %}
+
 <script>
 const ANIMALES = {{ animales | tojson }};
 const HPERU = {{ horarios | tojson }};
@@ -4025,12 +4963,13 @@ function showTab(id){
   document.querySelectorAll('.tc').forEach(t=>t.classList.remove('active'));
   document.getElementById('tc-'+id).classList.add('active');
   let tabs=document.querySelectorAll('.tab');
-  let tabMap={resultados:0,riesgo:1,setentaytreinta:2,agencias:3,topes:4,reportes:5,tripletas:6,auditoria:7,admins:8};
+  let tabMap={resultados:0,riesgo:1,setentaytreinta:2,agencias:3,topes:4,reportes:5,tripletas:6,auditoria:7,admins:8,triple:9};
   if(tabMap[id]!==undefined)tabs[tabMap[id]].classList.add('active');
   if(id==='riesgo'){fillHorasRiesgo();cargarRiesgo();}
   if(id==='tripletas')cargarTripletas();
   if(id==='agencias')listarAgencias();
   if(id==='admins')listarAdmins();
+  if(id==='triple')cargarTriplePanel();
 }
 
 function actualizarClockAdmin(){let now=new Date(),utcMs=now.getTime()+now.getTimezoneOffset()*60000,peruMs=utcMs-5*3600000,peru=new Date(peruMs),h=peru.getHours(),m=peru.getMinutes(),ap=h>=12?'PM':'AM';h=h%12||12;document.getElementById('clock-admin').textContent=h+':'+String(m).padStart(2,'0')+' '+ap+' · LIMA';}
@@ -4241,6 +5180,27 @@ function listarAdmins(){fetch('/admin/lista-admins').then(function(r){return r.j
 function crearAdmin(){if(bloquearSiSoloLectura())return;var u=document.getElementById('adm-user').value.trim(),p=document.getElementById('adm-pass').value.trim(),n=document.getElementById('adm-nombre').value.trim();if(!u||!p||!n){showMsg('msg-adm','Complete todos los campos','err');return;}var fd=new FormData();fd.append('usuario',u);fd.append('password',p);fd.append('nombre',n);fetch('/admin/crear-admin',{method:'POST',body:fd}).then(function(r){return r.json();}).then(function(d){if(d.status==='ok'){showMsg('msg-adm',d.mensaje,'ok');['adm-user','adm-pass','adm-nombre'].forEach(function(i){document.getElementById(i).value='';});listarAdmins();}else showMsg('msg-adm',d.error,'err');});}
 function eliminarAdmin(id,nombre){if(bloquearSiSoloLectura())return;if(!confirm('Eliminar al administrador "'+nombre+'"?'))return;fetch('/admin/eliminar-admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})}).then(function(r){return r.json();}).then(function(d){if(d.status==='ok'){alert(d.mensaje);listarAdmins();}else alert(d.error);});}
 
+var HTRIPLE_ADM=['09:00 AM','12:00 PM','03:00 PM','06:00 PM'];
+function _proxViernesISO(){var d=new Date();var add=(5-d.getDay()+7)%7;d.setDate(d.getDate()+add);return d.toISOString().split('T')[0];}
+function cargarTriplePanel(){
+  var sh=document.getElementById('tri-hora');
+  if(sh&&!sh.options.length)HTRIPLE_ADM.forEach(function(h){var o=document.createElement('option');o.value=h;o.textContent=h;sh.appendChild(o);});
+  var rh=document.getElementById('tri-riesgo-hora');
+  if(rh&&!rh.options.length)HTRIPLE_ADM.forEach(function(h){var o=document.createElement('option');o.value=h;o.textContent=h;rh.appendChild(o);});
+  var sa=document.getElementById('m1-animal');
+  if(sa&&!sa.options.length)ORDEN.forEach(function(k){if(!ANIMALES[k])return;var o=document.createElement('option');o.value=k;o.textContent=k+' - '+ANIMALES[k];sa.appendChild(o);});
+  var hoy=new Date().toISOString().split('T')[0];
+  var tf=document.getElementById('tri-fecha'); if(tf&&!tf.value)tf.value=hoy;
+  var mf=document.getElementById('m1-fecha'); if(mf&&!mf.value)mf.value=_proxViernesISO();
+  cargarEstadoAutoTriple();cargarTripleResultados();cargarTripleRiesgo();
+}
+function actualizarEstadoToggleTriple(e){var b=document.getElementById('toggle-triple-btn');if(!b)return;if(e==='on'){b.className='toggle-btn on';b.textContent='▶ ACTIVADO';}else{b.className='toggle-btn off';b.textContent='⏸ DESACTIVADO';}}
+function cargarEstadoAutoTriple(){fetch('/admin/estado-autosorteo-triple').then(function(r){return r.json();}).then(function(d){actualizarEstadoToggleTriple(d.estado);}).catch(function(){});}
+function toggleAutoTriple(){if(typeof bloquearSiSoloLectura==='function'&&bloquearSiSoloLectura())return;var b=document.getElementById('toggle-triple-btn');var nu=b.classList.contains('on')?'off':'on';fetch('/admin/toggle-autosorteo-triple',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({estado:nu})}).then(function(r){return r.json();}).then(function(d){if(d.status==='ok')actualizarEstadoToggleTriple(d.estado);else alert(d.error||'Error');}).catch(function(){});}
+function guardarTripleManual(){var f=document.getElementById('tri-fecha').value,h=document.getElementById('tri-hora').value,n=document.getElementById('tri-numero').value.trim();if(!/^[0-9]{1,3}$/.test(n)){showMsg('msg-tri','Número 000-999','err');return;}fetch('/admin/guardar-resultado-triple',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:f,hora:h,numero:n})}).then(function(r){return r.json();}).then(function(d){if(d.status==='ok'){showMsg('msg-tri','✅ '+d.mensaje,'ok');cargarTripleResultados();cargarTripleRiesgo();}else showMsg('msg-tri','❌ '+d.error,'err');}).catch(function(){showMsg('msg-tri','Error de conexión','err');});}
+function guardarMas1Manual(){var f=document.getElementById('m1-fecha').value,dg=document.getElementById('m1-digito').value,an=document.getElementById('m1-animal').value;if(dg===''){showMsg('msg-m1','Dígito 0-9','err');return;}fetch('/admin/guardar-resultado-mas1',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:f,digito:dg,animal:an})}).then(function(r){return r.json();}).then(function(d){if(d.status==='ok'){showMsg('msg-m1','✅ '+d.mensaje,'ok');cargarTripleResultados();}else showMsg('msg-m1','❌ '+d.error,'err');}).catch(function(){showMsg('msg-m1','Error de conexión','err');});}
+function cargarTripleResultados(){var tf=document.getElementById('tri-fecha');var f=tf?tf.value:'';fetch('/admin/resultados-triple-hoy'+(f?('?fecha='+f):'')).then(function(r){return r.json();}).then(function(d){var html='<table class="tbl"><thead><tr><th>Hora</th><th>Triple</th><th>Terminal</th></tr></thead><tbody>';d.triples.forEach(function(t){html+='<tr><td style="color:var(--teal);font-family:Oswald,sans-serif">'+t.hora+'</td><td style="color:var(--gold);font-family:Oswald,sans-serif;font-size:1rem">'+(t.numero||'—')+'</td><td style="color:#4ade80;font-family:Oswald,sans-serif">'+(t.terminal||'—')+'</td></tr>';});html+='</tbody></table><div style="margin-top:10px;padding:8px;background:var(--card);border:1px solid #7c3aed;border-radius:4px;color:#c084fc"><b>MÁS 1</b> (vie '+d.viernes+'): '+(d.mas1?(d.mas1.digito+' + '+d.mas1.animal+' - '+d.mas1.nombre):'Sin resultado')+'</div>';document.getElementById('tri-resultados').innerHTML=html;}).catch(function(){});}
+function cargarTripleRiesgo(){var tf=document.getElementById('tri-fecha');var f=tf?tf.value:'';var rh=document.getElementById('tri-riesgo-hora');var h=rh?rh.value:'09:00 AM';fetch('/admin/riesgo-triple?hora='+encodeURIComponent(h)+(f?('&fecha='+f):'')).then(function(r){return r.json();}).then(function(d){if(d.error){document.getElementById('tri-riesgo').innerHTML='<div style="color:var(--red)">'+d.error+'</div>';return;}var p=d.pote;document.getElementById('tri-pote').innerHTML='<div class="stat-box"><div class="stat-label">VENDIDO MES</div><div class="stat-val">S/'+p.vendido_mes.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PRESUP. 67%</div><div class="stat-val t">S/'+p.presupuesto_67.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PAGADO MES</div><div class="stat-val r">S/'+p.pagado_mes.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">DISPONIBLE</div><div class="stat-val g">S/'+p.disponible.toFixed(2)+'</div></div>';var html='<div style="color:var(--text2);font-size:.68rem;letter-spacing:1px;margin:6px 0;font-family:Oswald,sans-serif">TRIPLE / TERMINAL — '+d.hora+'</div>';if(!d.triple_terminal.length)html+='<div style="color:var(--text2);padding:6px">Sin apuestas</div>';else{html+='<table class="tbl"><thead><tr><th>Tipo</th><th>N°</th><th>Apostado</th><th>Pagaría</th></tr></thead><tbody>';d.triple_terminal.forEach(function(x){html+='<tr><td>'+(x.tipo==='triple'?'Triple':'Terminal')+'</td><td style="color:var(--gold);font-family:Oswald,sans-serif">'+x.sel+'</td><td style="color:var(--teal)">S/'+x.apostado.toFixed(2)+'</td><td style="color:var(--red);font-family:Oswald,sans-serif">S/'+x.pagaria.toFixed(2)+'</td></tr>';});html+='</tbody></table>';}html+='<div style="color:var(--text2);font-size:.68rem;letter-spacing:1px;margin:10px 0 6px;font-family:Oswald,sans-serif">MÁS 1 — vie '+d.viernes+'</div>';if(!d.mas1.length)html+='<div style="color:var(--text2);padding:6px">Sin apuestas</div>';else{html+='<table class="tbl"><thead><tr><th>Dígito+Animal</th><th>Apostado</th><th>Pagaría</th></tr></thead><tbody>';d.mas1.forEach(function(x){var pa=x.sel.split('-');html+='<tr><td style="color:#c084fc;font-family:Oswald,sans-serif">'+x.sel+' ('+(ANIMALES[pa[1]]||'')+')</td><td style="color:var(--teal)">S/'+x.apostado.toFixed(2)+'</td><td style="color:var(--red);font-family:Oswald,sans-serif">S/'+x.pagaria_completo.toFixed(2)+'</td></tr>';});html+='</tbody></table>';}document.getElementById('tri-riesgo').innerHTML=html;}).catch(function(){});}
 function init(){
   let hoy=new Date().toISOString().split('T')[0];
   document.getElementById('res-fecha').value=hoy;
