@@ -20,6 +20,7 @@ from flask import Flask, render_template_string, request, session, redirect, jso
 from collections import defaultdict
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 import atexit
 
 logging.basicConfig(level=logging.INFO)
@@ -48,6 +49,7 @@ def setup():
     if not _db_ready:
         init_db()
         _db_ready = True
+    _chequeo_ligero_recovery()
 
 PAGO_ANIMAL_NORMAL = 35
 PAGO_LECHUZA       = 70
@@ -798,6 +800,7 @@ def ejecutar_auto_sorteo(hora_str, loteria):
         logger.info(f"[AUTO-SORTEO] {loteria.upper()} {hora_str} — {fecha_hoy}")
 
         with get_db() as db:
+            _lock_sorteo(db, f"zoolo:{fecha_hoy}:{hora_str}:{loteria}")
             ya_existe = db.execute(
                 "SELECT id FROM resultados WHERE fecha=%s AND hora=%s AND loteria=%s",
                 (fecha_hoy, hora_str, loteria)
@@ -971,13 +974,17 @@ def ejecutar_auto_sorteo(hora_str, loteria):
                 logger.error(f"[AUTO-SORTEO] No se pudo elegir animal para {hora_str} {loteria}")
                 return
 
+            # Con el advisory lock ya adquirido arriba, este INSERT nunca debería
+            # chocar con otro worker. Aun así, por defensa en profundidad, un
+            # resultado AUTOMÁTICO jamás sobrescribe uno ya existente (fue
+            # verificado en 'ya_existe' bajo el mismo lock transaccional).
             if USE_SQLITE:
-                db.execute("INSERT OR REPLACE INTO resultados (fecha,hora,animal,loteria) VALUES (?,?,?,?)",
+                db.execute("INSERT OR IGNORE INTO resultados (fecha,hora,animal,loteria) VALUES (?,?,?,?)",
                     (fecha_hoy, hora_str, animal_elegido, loteria))
             else:
                 db.execute("""INSERT INTO resultados (fecha,hora,animal,loteria)
                     VALUES (%s,%s,%s,%s)
-                    ON CONFLICT(fecha,hora,loteria) DO UPDATE SET animal=EXCLUDED.animal""",
+                    ON CONFLICT(fecha,hora,loteria) DO NOTHING""",
                     (fecha_hoy, hora_str, animal_elegido, loteria))
 
             acumulado_generado = round(max(0, presupuesto_total - premio_a_pagar), 2)
@@ -1028,6 +1035,7 @@ def ejecutar_auto_sorteo(hora_str, loteria):
 def job_auto_sorteo(hora_str, loteria):
     estado = get_config('auto_sorteo', 'off')
     if estado == 'on':
+        logger.info(f"[AUTO-ZOOLO] disparando {loteria.upper()} {hora_str}")
         ejecutar_auto_sorteo(hora_str, loteria)
     else:
         logger.info(f"[AUTO-SORTEO] Desactivado, saltando {hora_str} {loteria}")
@@ -1093,7 +1101,7 @@ def recuperar_sorteos_perdidos():
 #   Triple (diario 9AM/12PM/3PM/6PM): sale nº de 3 cifras.
 #       exacto -> 700x | aproximado ±1 -> 20x
 #   Terminal: las 2 últimas cifras de ESE triple -> 65x (mismo sorteo/resultado)
-#   Más 1 (viernes 8PM Perú): dígito 0-9 + animal -> 250x | solo animal -> 35x
+#   Más 1 (viernes 5:00 PM Perú, publicación 5:02 PM): dígito 0-9 + animal -> 250x | solo animal -> 35x
 #   Pote: TODAS las ventas (triple+terminal+mas1) en una bolsa por moneda.
 #       La casa toma 33% (protegido). Premios salen del 67% del mes.
 #       El motor elige el ganador que quepa en el 67% sin tocar el 33%.
@@ -1275,13 +1283,18 @@ def _validar_jugada_triple(j):
 def _lock_sorteo(db, clave):
     """Serializa check->elegir->guardar de un sorteo entre procesos.
     Postgres: advisory lock a nivel de transacción (se suelta al commit/rollback).
-    SQLite: innecesario (un solo proceso)."""
+    SQLite: innecesario (un solo proceso).
+    FALLA CERRADO: si el lock no se puede adquirir, se aborta el sorteo entero
+    (nunca se continúa sin protección). El caller (ejecutar_auto_sorteo* ) ya
+    envuelve esto en try/except, así que la excepción cancela limpiamente ese
+    sorteo sin tumbar el proceso."""
     if USE_SQLITE:
         return
     try:
         db.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (clave,))
     except Exception as e:
-        logger.error(f"[LOCK] {clave}: {e}")
+        logger.error(f"[LOCK] No se pudo adquirir el lock para '{clave}': {e} — sorteo ABORTADO por seguridad.")
+        raise RuntimeError(f"No se pudo adquirir el lock de sorteo para '{clave}'") from e
 
 
 def ejecutar_auto_sorteo_triple(fecha, hora, moneda='peru', forzar_numero=None, modo='auto'):
@@ -1513,14 +1526,213 @@ def _detalle_triple_ticket(ticket_id, db=None):
         if close:
             db.close()
 
+def _rango_periodo(periodo, fi=None, ff=None):
+    """Convierte 'hoy'/'semana'/'mes'/'rango' en (datetime_inicio, datetime_fin)."""
+    hoy = ahora_peru().replace(tzinfo=None)
+    if periodo == 'hoy':
+        d0 = hoy.replace(hour=0, minute=0, second=0, microsecond=0)
+        d1 = hoy.replace(hour=23, minute=59, second=59, microsecond=0)
+    elif periodo == 'semana':
+        d0 = (hoy - timedelta(days=hoy.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        d1 = hoy.replace(hour=23, minute=59, second=59, microsecond=0)
+    elif periodo == 'mes':
+        d0 = hoy.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        d1 = hoy.replace(hour=23, minute=59, second=59, microsecond=0)
+    else:  # 'rango'
+        try:
+            d0 = datetime.strptime(fi, "%Y-%m-%d")
+        except Exception:
+            d0 = hoy.replace(hour=0, minute=0, second=0, microsecond=0)
+        try:
+            d1 = datetime.strptime(ff, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+        except Exception:
+            d1 = hoy.replace(hour=23, minute=59, second=59, microsecond=0)
+    return d0, d1
+
+def _triple_resumen(db, dt_ini, dt_fin, admin_filtro=None, agencia_filtro=None, por='compra'):
+    """
+    Agregador masivo de Triple/Terminal/Más1 por agencia, con venta y premio
+    desglosados por tipo. Identifica siempre agencia y administrador dueño
+    (agencias.admin_id), para que el superadmin sepa el origen de cada venta.
+
+    por='compra' filtra por la fecha en que se vendió el ticket (tk.fecha) —
+        así se contabiliza el dinero que entró ese día/semana/mes.
+    por='sorteo' filtra por la fecha del sorteo (jugadas_triple.fecha_sorteo) —
+        se usa para el ciclo semanal del Más 1 y para el pote 67/33.
+
+    Devuelve dict {agencia_id: {...}} — nunca mezcla estos números con el
+    70/30 de animalitos (son tablas y cálculos completamente separados).
+    """
+    filtros = ["tk.anulado=0", "jt.moneda='peru'"]
+    params = []
+    if agencia_filtro:
+        filtros.append("tk.agencia_id=%s"); params.append(agencia_filtro)
+    if admin_filtro:
+        filtros.append("ag.admin_id=%s"); params.append(admin_filtro)
+    where = " AND ".join(filtros)
+
+    rows = db.execute(f"""
+        SELECT jt.ticket_id, jt.tipo, jt.seleccion, jt.hora, jt.fecha_sorteo, jt.monto,
+               tk.agencia_id, tk.fecha as fecha_ticket,
+               ag.nombre_agencia, ag.usuario as agencia_usuario, ag.admin_id
+        FROM jugadas_triple jt
+        JOIN tickets tk ON jt.ticket_id = tk.id
+        JOIN agencias ag ON tk.agencia_id = ag.id
+        WHERE {where}
+        ORDER BY jt.id
+    """, tuple(params)).fetchall()
+
+    out = {}
+    res_cache = {}
+    mas1_cache = {}
+    admin_nombres = {}
+
+    for j in rows:
+        if por == 'compra':
+            dt = parse_fecha(j['fecha_ticket'])
+            if not dt or dt < dt_ini or dt > dt_fin:
+                continue
+        else:
+            try:
+                dt_s = datetime.strptime(j['fecha_sorteo'], "%d/%m/%Y")
+            except Exception:
+                continue
+            if dt_s < dt_ini or dt_s > dt_fin:
+                continue
+
+        aid = j['agencia_id']
+        if aid not in out:
+            oid = j['admin_id'] or 0
+            out[aid] = {
+                'agencia_id': aid, 'nombre': j['nombre_agencia'], 'usuario': j['agencia_usuario'],
+                'admin_id': oid,
+                'venta_triple': 0.0, 'venta_terminal': 0.0, 'venta_mas1': 0.0,
+                'premio_triple': 0.0, 'premio_aprox': 0.0, 'premio_terminal': 0.0, 'premio_mas1': 0.0,
+                'tickets': set(),
+            }
+        d = out[aid]
+        d['tickets'].add(j['ticket_id'])
+        tipo = j['tipo']; monto = float(j['monto']); sel = str(j['seleccion'])
+
+        if tipo in ('triple', 'terminal'):
+            key = (j['fecha_sorteo'], j['hora'])
+            if key not in res_cache:
+                r = db.execute("SELECT numero FROM resultados_triple WHERE fecha=%s AND hora=%s AND moneda='peru'",
+                               (j['fecha_sorteo'], j['hora'])).fetchone()
+                res_cache[key] = str(r['numero']).zfill(3) if r else None
+            num = res_cache[key]
+            if tipo == 'triple':
+                d['venta_triple'] += monto
+                if num:
+                    s3 = sel.zfill(3)
+                    if s3 == num:
+                        d['premio_triple'] += monto * PAGO_TRIPLE_EXACTO
+                    elif abs(int(s3) - int(num)) == 1:
+                        d['premio_aprox'] += monto * PAGO_TRIPLE_APROX
+            else:
+                d['venta_terminal'] += monto
+                if num and sel.zfill(2) == num[-2:]:
+                    d['premio_terminal'] += monto * PAGO_TERMINAL
+        elif tipo == 'mas1':
+            d['venta_mas1'] += monto
+            key = j['fecha_sorteo']
+            if key not in mas1_cache:
+                r = db.execute("SELECT digito,animal FROM resultado_mas1 WHERE fecha=%s AND moneda='peru'",
+                               (key,)).fetchone()
+                mas1_cache[key] = (str(r['digito']), str(r['animal'])) if r else None
+            rr = mas1_cache[key]
+            if rr:
+                dg, an = rr
+                partes = sel.split('-')
+                if len(partes) == 2:
+                    if partes[0] == dg and partes[1] == an:
+                        d['premio_mas1'] += monto * PAGO_MAS1_COMPLETO
+                    elif partes[1] == an:
+                        d['premio_mas1'] += monto * PAGO_MAS1_ANIMAL
+
+    for aid, d in out.items():
+        oid = d['admin_id']
+        if oid and oid not in admin_nombres:
+            ar = db.execute("SELECT nombre_agencia FROM agencias WHERE id=%s", (oid,)).fetchone()
+            admin_nombres[oid] = ar['nombre_agencia'] if ar else f"Admin {oid}"
+        d['admin_nombre'] = admin_nombres.get(oid, 'Sin asignar') if oid else 'Sin asignar'
+        d['tickets'] = len(d['tickets'])
+        d['total_triple_terminal'] = round(d['venta_triple'] + d['venta_terminal'], 2)
+        d['total_mas1'] = round(d['venta_mas1'], 2)
+        d['total'] = round(d['venta_triple'] + d['venta_terminal'] + d['venta_mas1'], 2)
+        d['premio_total'] = round(d['premio_triple'] + d['premio_aprox'] + d['premio_terminal'] + d['premio_mas1'], 2)
+        d['balance'] = round(d['total'] - d['premio_total'], 2)
+        for k in ('venta_triple', 'venta_terminal', 'venta_mas1',
+                  'premio_triple', 'premio_aprox', 'premio_terminal', 'premio_mas1'):
+            d[k] = round(d[k], 2)
+    return out
+
+def _mapas_apuestas_triple_origen(fecha, hora, moneda, db):
+    """Igual que _mapas_apuestas_triple pero con el desglose por administrador/agencia
+    de cada monto apostado, para que el superadmin sepa de dónde viene el riesgo."""
+    rows = db.execute("""SELECT jt.tipo, jt.seleccion, jt.monto, tk.agencia_id,
+                                ag.nombre_agencia, ag.admin_id
+        FROM jugadas_triple jt JOIN tickets tk ON jt.ticket_id=tk.id
+        JOIN agencias ag ON tk.agencia_id=ag.id
+        WHERE jt.tipo IN ('triple','terminal') AND jt.hora=%s AND jt.fecha_sorteo=%s
+          AND jt.moneda=%s AND tk.anulado=0""", (hora, fecha, moneda)).fetchall()
+    ex = {}; tm = {}
+    admin_nombres = {}
+    for r in rows:
+        sel = str(r['seleccion']).zfill(3 if r['tipo'] == 'triple' else 2)
+        target = ex if r['tipo'] == 'triple' else tm
+        if sel not in target:
+            target[sel] = {'total': 0.0, 'origenes': {}}
+        target[sel]['total'] += float(r['monto'])
+        oid = r['admin_id'] or 0
+        key = (oid, r['agencia_id'])
+        if key not in target[sel]['origenes']:
+            if oid and oid not in admin_nombres:
+                ar = db.execute("SELECT nombre_agencia FROM agencias WHERE id=%s", (oid,)).fetchone()
+                admin_nombres[oid] = ar['nombre_agencia'] if ar else f"Admin {oid}"
+            target[sel]['origenes'][key] = {
+                'admin_id': oid, 'admin_nombre': admin_nombres.get(oid, 'Sin asignar') if oid else 'Sin asignar',
+                'agencia_id': r['agencia_id'], 'agencia_nombre': r['nombre_agencia'], 'monto': 0.0
+            }
+        target[sel]['origenes'][key]['monto'] += float(r['monto'])
+    return ex, tm
+
+def _mapa_apuestas_mas1_origen(fecha, moneda, db):
+    rows = db.execute("""SELECT jt.seleccion, jt.monto, tk.agencia_id, ag.nombre_agencia, ag.admin_id
+        FROM jugadas_triple jt JOIN tickets tk ON jt.ticket_id=tk.id
+        JOIN agencias ag ON tk.agencia_id=ag.id
+        WHERE jt.tipo='mas1' AND jt.fecha_sorteo=%s AND jt.moneda=%s AND tk.anulado=0""",
+        (fecha, moneda)).fetchall()
+    out = {}
+    admin_nombres = {}
+    for r in rows:
+        sel = str(r['seleccion'])
+        if sel not in out:
+            out[sel] = {'total': 0.0, 'origenes': {}}
+        out[sel]['total'] += float(r['monto'])
+        oid = r['admin_id'] or 0
+        key = (oid, r['agencia_id'])
+        if key not in out[sel]['origenes']:
+            if oid and oid not in admin_nombres:
+                ar = db.execute("SELECT nombre_agencia FROM agencias WHERE id=%s", (oid,)).fetchone()
+                admin_nombres[oid] = ar['nombre_agencia'] if ar else f"Admin {oid}"
+            out[sel]['origenes'][key] = {
+                'admin_id': oid, 'admin_nombre': admin_nombres.get(oid, 'Sin asignar') if oid else 'Sin asignar',
+                'agencia_id': r['agencia_id'], 'agencia_nombre': r['nombre_agencia'], 'monto': 0.0
+            }
+        out[sel]['origenes'][key]['monto'] += float(r['monto'])
+    return out
+
 def job_auto_sorteo_triple(hora_str, moneda='peru'):
     if get_config('auto_sorteo_triple', 'off') == 'on':
+        logger.info(f"[AUTO-TRIPLE] disparando {hora_str}")
         ejecutar_auto_sorteo_triple(ahora_peru().strftime("%d/%m/%Y"), hora_str, moneda)
 
 def job_auto_sorteo_mas1(moneda='peru'):
     if get_config('auto_sorteo_triple', 'off') == 'on':
         fecha = ahora_peru().strftime("%d/%m/%Y")
         if datetime.strptime(fecha, "%d/%m/%Y").weekday() == 4:   # viernes
+            logger.info(f"[AUTO-MAS1] disparando viernes {fecha}")
             ejecutar_auto_sorteo_mas1(fecha, moneda)
 
 def recuperar_sorteos_triple_perdidos():
@@ -1585,7 +1797,127 @@ def _try_lock_scheduler():
         return False
 
 
+_ES_SCHEDULER_LIDER = False
+_SCHEDULER_OBJ = None
+_ULTIMA_VERIF_RECOVERY = 0.0
+
+def _actualizar_heartbeat():
+    """Se ejecuta cada 60s SOLO en el proceso líder. Si deja de verse fresco,
+    el sistema asume que el scheduler líder cayó."""
+    try:
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        now_peru = now_utc - timedelta(hours=5)
+        set_config('scheduler_heartbeat', now_utc.strftime("%Y-%m-%d %H:%M:%S"))
+        set_config('scheduler_heartbeat_peru', now_peru.strftime("%d/%m/%Y %I:%M:%S %p"))
+        logger.info("[SCHEDULER] heartbeat")
+    except Exception as e:
+        logger.error(f"[SCHEDULER] Error al escribir heartbeat: {e}")
+
+def _scheduler_esta_vivo(umbral_seg=150):
+    """True si hubo un heartbeat en los últimos ~2.5 minutos (heartbeat cada 60s)."""
+    try:
+        hb = get_config('scheduler_heartbeat', '')
+        if not hb:
+            return False
+        hb_dt = datetime.strptime(hb, "%Y-%m-%d %H:%M:%S")
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        return (now_utc - hb_dt).total_seconds() <= umbral_seg
+    except Exception:
+        return False
+
+def _scheduler_local_muerto():
+    """True si ESTE proceso cree ser líder pero su APScheduler realmente ya
+    no está corriendo (un hilo interno pudo morir) o su propio heartbeat dejó
+    de refrescarse. _ES_SCHEDULER_LIDER por sí solo nunca vuelve a False, así
+    que hay que comprobar el estado real cada vez."""
+    if not _ES_SCHEDULER_LIDER:
+        return False
+    if _SCHEDULER_OBJ is None or not _SCHEDULER_OBJ.running:
+        return True
+    return not _scheduler_esta_vivo()
+
+def _liberar_liderazgo_local():
+    """Limpia el estado de liderazgo de este proceso (scheduler + conexión
+    del advisory lock) para poder reintentar arrancar limpio."""
+    global _ES_SCHEDULER_LIDER, _SCHEDULER_OBJ, _sched_lock_conn
+    try:
+        if _SCHEDULER_OBJ is not None:
+            _SCHEDULER_OBJ.shutdown(wait=False)
+    except Exception as e:
+        logger.error(f"[SCHEDULER] Error al apagar scheduler muerto: {e}")
+    try:
+        if _sched_lock_conn is not None:
+            _sched_lock_conn.close()
+    except Exception:
+        pass
+    _sched_lock_conn = None
+    _SCHEDULER_OBJ = None
+    _ES_SCHEDULER_LIDER = False
+
+def _intentar_convertirse_en_lider():
+    """Si este proceso ya es líder Y su scheduler sigue vivo de verdad, no
+    hace nada. Si el heartbeat GLOBAL sigue vivo (de otro proceso), asume que
+    ese otro sigue al mando y no hace nada (evita duplicar schedulers). Si
+    este mismo proceso creía ser líder pero su scheduler murió internamente,
+    libera su propio estado primero. Solo si el heartbeat está CAÍDO intenta
+    tomar el liderazgo llamando de nuevo a iniciar_scheduler() (que usa el
+    advisory lock de Postgres, así que nunca quedan dos procesos disparando
+    el mismo sorteo)."""
+    global _ES_SCHEDULER_LIDER
+    if _scheduler_local_muerto():
+        logger.error("[SCHEDULER] Este proceso creía ser líder pero su scheduler está muerto — liberando y reintentando...")
+        _liberar_liderazgo_local()
+    if _ES_SCHEDULER_LIDER:
+        return
+    if _scheduler_esta_vivo():
+        return
+    logger.info("[SCHEDULER] Heartbeat caído/ausente — intentando tomar liderazgo...")
+    nuevo = iniciar_scheduler()
+    if nuevo:
+        logger.info("[SCHEDULER] Liderazgo recuperado por este proceso.")
+    else:
+        logger.info("[SCHEDULER] No se pudo tomar liderazgo (otro proceso sigue vivo).")
+
+def _chequeo_ligero_recovery():
+    """Se llama en cada request (before_request), pero con throttling: como
+    máximo una comprobación real cada 90 segundos. Si algún auto-sorteo está
+    en 'on', intenta recuperar el liderazgo si hace falta y dispara la
+    recuperación de sorteos vencidos, protegida por un lock transaccional
+    para que solo UN worker la ejecute aunque varios reciban tráfico a la vez."""
+    global _ULTIMA_VERIF_RECOVERY
+    import time as _t
+    ahora = _t.time()
+    if ahora - _ULTIMA_VERIF_RECOVERY < 90:
+        return
+    _ULTIMA_VERIF_RECOVERY = ahora
+    try:
+        auto_z = get_config('auto_sorteo', 'off')
+        auto_t = get_config('auto_sorteo_triple', 'off')
+        if auto_z != 'on' and auto_t != 'on':
+            return
+        _intentar_convertirse_en_lider()
+        with get_db() as db:
+            if USE_SQLITE:
+                puede = True
+            else:
+                r = db.execute("SELECT pg_try_advisory_xact_lock(hashtext('recovery_check'))").fetchone()
+                puede = bool(r[0]) if r else False
+            if puede:
+                if auto_z == 'on':
+                    recuperar_sorteos_perdidos()
+                if auto_t == 'on':
+                    recuperar_sorteos_triple_perdidos()
+    except Exception as e:
+        logger.error(f"[RECOVERY-LIGERA] Error: {e}")
+
 def iniciar_scheduler():
+    global _db_ready
+    if not _db_ready:
+        try:
+            init_db()
+            _db_ready = True
+        except Exception as e:
+            logger.error(f"[SCHEDULER] init_db() fallo antes de arrancar: {e}")
     try:
         with get_db() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS scheduler_lock (
@@ -1600,6 +1932,10 @@ def iniciar_scheduler():
     if not _try_lock_scheduler():
         logger.info("[SCHEDULER] Otro worker ya tiene el lock; este proceso no inicia el scheduler.")
         return None
+
+    global _ES_SCHEDULER_LIDER, _SCHEDULER_OBJ
+    _ES_SCHEDULER_LIDER = True
+    logger.info("[SCHEDULER] líder adquirido")
 
     scheduler = BackgroundScheduler(timezone='UTC')
 
@@ -1666,10 +2002,19 @@ def iniciar_scheduler():
         replace_existing=True,
         misfire_grace_time=60
     )
+    scheduler.add_job(
+        func=_actualizar_heartbeat,
+        trigger=IntervalTrigger(seconds=60),
+        id='scheduler_heartbeat',
+        replace_existing=True,
+        misfire_grace_time=60
+    )
 
     scheduler.start()
     atexit.register(lambda: scheduler.shutdown())
     logger.info("[SCHEDULER] APScheduler iniciado con todos los jobs de sorteo.")
+    _SCHEDULER_OBJ = scheduler
+    _actualizar_heartbeat()
     import threading
     threading.Thread(target=recuperar_sorteos_perdidos, daemon=True).start()
     threading.Thread(target=recuperar_sorteos_triple_perdidos, daemon=True).start()
@@ -2270,8 +2615,8 @@ def mis_tickets():
                         'pagado':bool(tr['pagado']),'loteria':lot_tr
                     })
                 _tri_det = _detalle_triple_ticket(t['id'], db)
-                _tri_prem = round(sum(x['premio'] for x in _tri_det), 2)
-                premio_total += _tri_prem; premio_peru += _tri_prem
+                premio_triple = round(sum(x['premio'] for x in _tri_det), 2)
+                premio_total += premio_triple  # premio_peru/premio_plus NO se tocan: quedan solo Zoolo
                 if est=='por_pagar' and (t['pagado'] or premio_total==0): continue
                 tot_peru = t['total_peru'] if 'total_peru' in t.keys() and t['total_peru'] else 0
                 tot_plus = t['total_plus'] if 'total_plus' in t.keys() and t['total_plus'] else 0
@@ -2281,15 +2626,16 @@ def mis_tickets():
                     'total':t['total'],'total_peru':round(tot_peru,2),'total_plus':round(tot_plus,2),'total_triple':round(tot_tri,2),
                     'pagado':bool(t['pagado']),
                     'premio_calculado':round(premio_total,2),
-                    'premio_peru':round(premio_peru,2),'premio_plus':round(premio_plus,2),
+                    'premio_peru':round(premio_peru,2),'premio_plus':round(premio_plus,2),'premio_triple':premio_triple,
                     'jugadas':jugadas_det,'tripletas':trips_det,'triples':_tri_det
                 })
         tv_peru = sum(t['total_peru'] for t in tickets_out)
         tv_plus = sum(t['total_plus'] for t in tickets_out)
+        tv_tri = sum(t['total_triple'] for t in tickets_out)
         return jsonify({
             'status':'ok',
             'tickets':tickets_out,
-            'totales':{'cantidad':len(tickets_out),'ventas_peru':round(tv_peru,2),'ventas_plus':round(tv_plus,2)}
+            'totales':{'cantidad':len(tickets_out),'ventas_peru':round(tv_peru,2),'ventas_plus':round(tv_plus,2),'ventas_triple':round(tv_tri,2)}
         })
     except Exception as e:
         return jsonify({'error':str(e)}),500
@@ -2365,8 +2711,8 @@ def consultar_ticket_detalle():
                 'premio':round(pt,2),'pagado':bool(tr['pagado']),'loteria':lot_tr
             })
         _tri = _detalle_triple_ticket(t['id'])
-        _tp = round(sum(x['premio'] for x in _tri), 2)
-        premio_total += _tp; premio_peru += _tp
+        premio_triple = round(sum(x['premio'] for x in _tri), 2)
+        premio_total += premio_triple  # premio_peru/premio_plus NO se tocan: quedan solo Zoolo
         return jsonify({
             'status':'ok',
             'ticket':{
@@ -2376,7 +2722,7 @@ def consultar_ticket_detalle():
                 'total_triple':t.get('total_triple',0),
                 'pagado':bool(t['pagado']),
                 'anulado':bool(t['anulado']),'premio_total':round(premio_total,2),
-                'premio_peru':round(premio_peru,2),'premio_plus':round(premio_plus,2)
+                'premio_peru':round(premio_peru,2),'premio_plus':round(premio_plus,2),'premio_triple':premio_triple
             },
             'jugadas':jdet,'tripletas':tdet,'triples':_tri
         })
@@ -2397,11 +2743,12 @@ def verificar_ticket():
             if t['pagado']:  return jsonify({'error':'YA FUE PAGADO'})
             premio = calcular_premio_ticket_split(t['id'], db)
             ptri = calcular_premio_triple_ticket(t['id'], db).get('peru', 0)
-        peru_tot = round(premio['peru'] + ptri, 2)
+        # premio['peru'] queda EXCLUSIVAMENTE Zoolo Perú; ptri (Triple+Terminal+Más1)
+        # se reporta aparte y solo se suma en el total general, nunca dentro de "peru".
         return jsonify({
             'status':'ok','ticket_id':t['id'],
-            'total_ganado':round(peru_tot+premio['plus'],2),
-            'total_ganado_peru':peru_tot,
+            'total_ganado':round(premio['peru']+premio['plus']+ptri,2),
+            'total_ganado_peru':round(premio['peru'],2),
             'total_ganado_plus':premio['plus'],
             'total_ganado_triple':round(ptri,2)
         })
@@ -2497,23 +2844,29 @@ def caja_agencia():
             ag = db.execute("SELECT comision FROM agencias WHERE id=%s",(session['user_id'],)).fetchone()
             com_pct = ag['comision'] if ag else COMISION_AGENCIA
             ventas_peru=premios_peru=0.0; ventas_plus=premios_plus=0.0; pendientes=0
+            ventas_tri=premios_tri=0.0
             for t in tickets:
                 tp = t['total_peru'] if 'total_peru' in t.keys() and t['total_peru'] else 0
                 tl = t['total_plus'] if 'total_plus' in t.keys() and t['total_plus'] else 0
                 ttri = t['total_triple'] if 'total_triple' in t.keys() and t['total_triple'] else 0
-                ventas_peru += tp + ttri; ventas_plus += tl
+                ventas_peru += tp; ventas_plus += tl; ventas_tri += ttri
                 prem = calcular_premio_ticket_split(t['id'], db)
                 ptri = calcular_premio_triple_ticket(t['id'], db).get('peru', 0)
                 if t['pagado']:
-                    premios_peru += prem['peru'] + ptri; premios_plus += prem['plus']
+                    premios_peru += prem['peru']; premios_plus += prem['plus']; premios_tri += ptri
                 elif (prem['peru']+prem['plus']+ptri) > 0:
                     pendientes += 1
         def _resumen(ventas, premios):
             com = round(ventas*com_pct, 2)
             return {'ventas':round(ventas,2),'premios':round(premios,2),'comision':com,'balance':round(ventas-premios-com,2)}
+        # Triple/Terminal/Mas1: pote independiente 67/33, SIN comisión automática de agencia
+        # (no se mezcla con la caja 70/30 de Zoolo Perú/Plus).
+        triple_resumen = {'ventas':round(ventas_tri,2),'premios':round(premios_tri,2),
+                          'balance':round(ventas_tri-premios_tri,2)}
         return jsonify({
             'peru': _resumen(ventas_peru, premios_peru),
             'plus': _resumen(ventas_plus, premios_plus),
+            'triple_games': triple_resumen,
             'tickets_pendientes':pendientes,
             'total_tickets':len(tickets)
         })
@@ -2552,6 +2905,22 @@ def caja_historico():
                     dias[dk]['premios_peru']+=prem['peru']
                     dias[dk]['premios_plus']+=prem['plus']
                     tp_peru+=prem['peru']; tp_plus+=prem['plus']
+            # Triple/Terminal/Mas1: pote independiente 67/33, por día, misma agencia,
+            # calculado con jugadas_triple (NUNCA mezclado con peru/plus arriba).
+            _tri_hist = _triple_resumen(db, dti, dtf, agencia_filtro=session['user_id'], por='compra')
+            _tri_por_dia = {}
+            if session['user_id'] in _tri_hist:
+                _rows_tri = db.execute("""SELECT jt.monto, jt.tipo, tk.fecha as fecha_ticket
+                    FROM jugadas_triple jt JOIN tickets tk ON jt.ticket_id=tk.id
+                    WHERE tk.agencia_id=%s AND tk.anulado=0 AND jt.moneda='peru'""",
+                    (session['user_id'],)).fetchall()
+                for r in _rows_tri:
+                    dtt = parse_fecha(r['fecha_ticket'])
+                    if not dtt or dtt < dti or dtt > dtf: continue
+                    dkk = dtt.strftime("%d/%m/%Y")
+                    if dkk not in _tri_por_dia:
+                        _tri_por_dia[dkk] = 0.0
+                    _tri_por_dia[dkk] += float(r['monto'])
         resumen=[]
         for dk in sorted(dias.keys()):
             d=dias[dk]
@@ -2561,15 +2930,18 @@ def caja_historico():
                 'fecha':dk,
                 'tickets':d['tickets'],
                 'peru':{'ventas':round(d['ventas_peru'],2),'premios':round(d['premios_peru'],2),'comision':round(cd_peru,2),'balance':round(d['ventas_peru']-d['premios_peru']-cd_peru,2)},
-                'plus':{'ventas':round(d['ventas_plus'],2),'premios':round(d['premios_plus'],2),'comision':round(cd_plus,2),'balance':round(d['ventas_plus']-d['premios_plus']-cd_plus,2)}
+                'plus':{'ventas':round(d['ventas_plus'],2),'premios':round(d['premios_plus'],2),'comision':round(cd_plus,2),'balance':round(d['ventas_plus']-d['premios_plus']-cd_plus,2)},
+                'triple_games':{'ventas':round(_tri_por_dia.get(dk,0.0),2)}
             })
         tc_peru=tv_peru*com_pct
         tc_plus=tv_plus*com_pct
+        _tri_h = _tri_hist.get(session['user_id'], {'venta_triple':0,'venta_terminal':0,'venta_mas1':0,'total':0,'premio_total':0,'balance':0})
         return jsonify({
             'resumen_por_dia':resumen,
             'totales':{
                 'peru':{'ventas':round(tv_peru,2),'premios':round(tp_peru,2),'comision':round(tc_peru,2),'balance':round(tv_peru-tp_peru-tc_peru,2)},
-                'plus':{'ventas':round(tv_plus,2),'premios':round(tp_plus,2),'comision':round(tc_plus,2),'balance':round(tv_plus-tp_plus-tc_plus,2)}
+                'plus':{'ventas':round(tv_plus,2),'premios':round(tp_plus,2),'comision':round(tc_plus,2),'balance':round(tv_plus-tp_plus-tc_plus,2)},
+                'triple_games':{'ventas':round(_tri_h['total'],2),'premios':round(_tri_h['premio_total'],2),'balance':round(_tri_h['balance'],2)}
             }
         })
     except Exception as e:
@@ -2615,6 +2987,7 @@ def tickets_detalle():
                     'id': t['id'], 'serial': t['serial'], 'fecha': t['fecha'],
                     'total_peru': t['total_peru'] if 'total_peru' in t.keys() else 0,
                     'total_plus': t['total_plus'] if 'total_plus' in t.keys() else 0,
+                    'total_triple': t['total_triple'] if 'total_triple' in t.keys() else 0,
                     'pagado': bool(t['pagado']), 'anulado': bool(t['anulado']),
                     'jugadas': jdet, 'tripletas': tdet, 'triples': _detalle_triple_ticket(t['id'], db)
                 })
@@ -2761,7 +3134,7 @@ def borrar_resultado():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/admin/toggle-autosorteo', methods=['POST'])
-@admin_required
+@superadmin_required
 def toggle_autosorteo():
     try:
         data = request.get_json() or {}
@@ -2854,6 +3227,440 @@ def guardar_resultado_mas1():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/admin/triple/reporte')
+@admin_required
+def triple_reporte():
+    """Venta/premio de Triple+Terminal+Más1 por agencia, con origen (administrador)
+    para el superadmin. NUNCA se mezcla con el 70/30 de animalitos."""
+    try:
+        periodo = request.args.get('periodo', 'hoy')
+        fi = request.args.get('fecha_inicio'); ff = request.args.get('fecha_fin')
+        por = request.args.get('por', 'compra')
+        if por not in ('compra', 'sorteo'):
+            por = 'compra'
+        d0, d1 = _rango_periodo(periodo, fi, ff)
+
+        admin_filtro = request.args.get('admin_id')
+        agencia_filtro = request.args.get('agencia_id')
+        es_super = bool(session.get('es_superadmin'))
+
+        if not es_super:
+            admin_filtro = session.get('user_id')
+            if agencia_filtro:
+                with get_db() as db:
+                    ag = db.execute("SELECT admin_id FROM agencias WHERE id=%s AND es_admin=0", (agencia_filtro,)).fetchone()
+                if not ag or (ag['admin_id'] or 0) != session.get('user_id'):
+                    return jsonify({'error': 'Esta agencia no pertenece a tu administración'}), 403
+        else:
+            admin_filtro = int(admin_filtro) if admin_filtro else None
+            agencia_filtro = int(agencia_filtro) if agencia_filtro else None
+
+        with get_db() as db:
+            resumen = _triple_resumen(db, d0, d1, admin_filtro=admin_filtro, agencia_filtro=agencia_filtro, por=por)
+
+        agencias_list = list(resumen.values())
+        agencias_list.sort(key=lambda x: -x['total'])
+
+        total = {
+            'venta_triple': round(sum(a['venta_triple'] for a in agencias_list), 2),
+            'venta_terminal': round(sum(a['venta_terminal'] for a in agencias_list), 2),
+            'venta_mas1': round(sum(a['venta_mas1'] for a in agencias_list), 2),
+            'premio_triple': round(sum(a['premio_triple'] for a in agencias_list), 2),
+            'premio_aprox': round(sum(a['premio_aprox'] for a in agencias_list), 2),
+            'premio_terminal': round(sum(a['premio_terminal'] for a in agencias_list), 2),
+            'premio_mas1': round(sum(a['premio_mas1'] for a in agencias_list), 2),
+            'total': round(sum(a['total'] for a in agencias_list), 2),
+            'premio_total': round(sum(a['premio_total'] for a in agencias_list), 2),
+            'balance': round(sum(a['balance'] for a in agencias_list), 2),
+            'tickets': sum(a['tickets'] for a in agencias_list),
+        }
+
+        resultado = {'status': 'ok', 'periodo': periodo, 'por': por,
+                     'fecha_inicio': d0.strftime("%d/%m/%Y"), 'fecha_fin': d1.strftime("%d/%m/%Y"),
+                     'agencias': agencias_list, 'total': total}
+
+        if es_super and admin_filtro is None and agencia_filtro is None:
+            origenes = {}
+            for a in agencias_list:
+                oid = a['admin_id'] or 0
+                if oid not in origenes:
+                    origenes[oid] = {'admin_id': oid, 'admin_nombre': a['admin_nombre'], 'agencias': [],
+                                     'venta_triple': 0.0, 'venta_terminal': 0.0, 'venta_mas1': 0.0,
+                                     'total': 0.0, 'premio_total': 0.0, 'balance': 0.0, 'tickets': 0}
+                o = origenes[oid]
+                o['agencias'].append(a)
+                for k in ('venta_triple', 'venta_terminal', 'venta_mas1', 'total', 'premio_total', 'balance', 'tickets'):
+                    o[k] += a[k]
+            for o in origenes.values():
+                for k in ('venta_triple', 'venta_terminal', 'venta_mas1', 'total', 'premio_total', 'balance'):
+                    o[k] = round(o[k], 2)
+            resultado['origenes'] = sorted(origenes.values(), key=lambda x: -x['total'])
+
+        return jsonify(resultado)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/triple/tickets', methods=['POST'])
+@admin_required
+def triple_tickets():
+    """Drill-down: Administrador -> Agencias -> Tickets -> Jugadas (Triple/Terminal/Más1)."""
+    try:
+        data = request.get_json() or {}
+        agencia_id = data.get('agencia_id')
+        admin_id = data.get('admin_id')
+        periodo = data.get('periodo', 'rango')
+        fi = data.get('fecha_inicio'); ff = data.get('fecha_fin')
+        por = data.get('por', 'compra')
+        if por not in ('compra', 'sorteo'):
+            por = 'compra'
+        d0, d1 = _rango_periodo(periodo, fi, ff)
+
+        es_super = bool(session.get('es_superadmin'))
+        if not es_super:
+            admin_id = session.get('user_id')
+            if agencia_id:
+                with get_db() as db:
+                    ag = db.execute("SELECT admin_id FROM agencias WHERE id=%s AND es_admin=0", (agencia_id,)).fetchone()
+                if not ag or (ag['admin_id'] or 0) != session.get('user_id'):
+                    return jsonify({'error': 'Esta agencia no pertenece a tu administración'}), 403
+
+        filtros = ["tk.anulado=0", "jt.moneda='peru'"]
+        params = []
+        if agencia_id:
+            filtros.append("tk.agencia_id=%s"); params.append(agencia_id)
+        elif admin_id:
+            filtros.append("ag.admin_id=%s"); params.append(admin_id)
+        where = " AND ".join(filtros)
+
+        with get_db() as db:
+            rows = db.execute(f"""
+                SELECT jt.ticket_id, jt.tipo, jt.seleccion, jt.hora, jt.fecha_sorteo, jt.monto,
+                       tk.serial, tk.fecha as fecha_ticket, tk.agencia_id, ag.nombre_agencia
+                FROM jugadas_triple jt
+                JOIN tickets tk ON jt.ticket_id = tk.id
+                JOIN agencias ag ON tk.agencia_id = ag.id
+                WHERE {where}
+                ORDER BY jt.ticket_id DESC LIMIT 5000
+            """, tuple(params)).fetchall()
+
+        tickets_map = {}
+        for j in rows:
+            if por == 'compra':
+                dt = parse_fecha(j['fecha_ticket'])
+                if not dt or dt < d0 or dt > d1:
+                    continue
+            else:
+                try:
+                    dt_s = datetime.strptime(j['fecha_sorteo'], "%d/%m/%Y")
+                except Exception:
+                    continue
+                if dt_s < d0 or dt_s > d1:
+                    continue
+            tid = j['ticket_id']
+            if tid not in tickets_map:
+                tickets_map[tid] = {'id': tid, 'serial': j['serial'], 'fecha': j['fecha_ticket'],
+                                    'agencia': j['nombre_agencia'], 'agencia_id': j['agencia_id'], 'jugadas': []}
+            tickets_map[tid]['jugadas'].append({'tipo': j['tipo'], 'seleccion': j['seleccion'],
+                                                'hora': j['hora'], 'fecha_sorteo': j['fecha_sorteo'],
+                                                'monto': j['monto']})
+        out = sorted(tickets_map.values(), key=lambda x: -x['id'])[:500]
+        return jsonify({'status': 'ok', 'tickets': out, 'total': len(out)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/mas1/reporte')
+@admin_required
+def mas1_reporte():
+    """Reporte semanal independiente del Más 1 (ciclo = un viernes concreto)."""
+    try:
+        ciclo = request.args.get('ciclo', 'actual')  # actual|anterior|fecha
+        fecha_param = request.args.get('viernes')
+        if ciclo == 'fecha' and fecha_param:
+            try:
+                vdt = datetime.strptime(fecha_param, "%Y-%m-%d")
+            except Exception:
+                return jsonify({'error': 'Fecha inválida'}), 400
+            if vdt.weekday() != 4:
+                return jsonify({'error': 'La fecha debe ser un viernes'}), 400
+            viernes = vdt.strftime("%d/%m/%Y")
+        elif ciclo == 'anterior':
+            actual = datetime.strptime(_viernes_mas1(), "%d/%m/%Y")
+            viernes = (actual - timedelta(days=7)).strftime("%d/%m/%Y")
+        else:
+            viernes = _viernes_mas1()
+
+        admin_filtro = request.args.get('admin_id')
+        agencia_filtro = request.args.get('agencia_id')
+        es_super = bool(session.get('es_superadmin'))
+        if not es_super:
+            admin_filtro = session.get('user_id')
+        else:
+            admin_filtro = int(admin_filtro) if admin_filtro else None
+            agencia_filtro = int(agencia_filtro) if agencia_filtro else None
+
+        vdt = datetime.strptime(viernes, "%d/%m/%Y")
+        d0 = vdt.replace(hour=0, minute=0, second=0, microsecond=0)
+        d1 = vdt.replace(hour=23, minute=59, second=59, microsecond=0)
+
+        with get_db() as db:
+            resumen = _triple_resumen(db, d0, d1, admin_filtro=admin_filtro, agencia_filtro=agencia_filtro, por='sorteo')
+            r = db.execute("SELECT digito,animal FROM resultado_mas1 WHERE fecha=%s AND moneda='peru'", (viernes,)).fetchone()
+            disp, vendido_mes, presupuesto_mes, pagados_mes = _disponible_pote_triple(viernes, 'peru', db)
+
+        agencias_list = [a for a in resumen.values() if a['venta_mas1'] > 0 or a['tickets'] > 0]
+        agencias_list.sort(key=lambda x: -x['venta_mas1'])
+        total_vendido = round(sum(a['venta_mas1'] for a in agencias_list), 2)
+        total_premio = round(sum(a['premio_mas1'] for a in agencias_list), 2)
+
+        resultado_info = None
+        if r:
+            resultado_info = {'digito': r['digito'], 'animal': r['animal'], 'nombre': ANIMALES.get(r['animal'], '?')}
+
+        resp = {'status': 'ok', 'viernes': viernes, 'resultado': resultado_info,
+                'vendido_total': total_vendido, 'premio_comprometido': total_premio,
+                'balance': round(total_vendido - total_premio, 2),
+                'agencias': agencias_list,
+                'pote_mensual': {'mes': _mes_de(viernes), 'vendido_mes': vendido_mes,
+                                 'presupuesto_67': presupuesto_mes, 'pagado_mes': pagados_mes, 'disponible': disp}}
+
+        if es_super and admin_filtro is None and agencia_filtro is None:
+            origenes = {}
+            for a in agencias_list:
+                oid = a['admin_id'] or 0
+                if oid not in origenes:
+                    origenes[oid] = {'admin_id': oid, 'admin_nombre': a['admin_nombre'], 'venta_mas1': 0.0, 'premio_mas1': 0.0}
+                origenes[oid]['venta_mas1'] += a['venta_mas1']
+                origenes[oid]['premio_mas1'] += a['premio_mas1']
+            for o in origenes.values():
+                o['venta_mas1'] = round(o['venta_mas1'], 2); o['premio_mas1'] = round(o['premio_mas1'], 2)
+            resp['origenes'] = sorted(origenes.values(), key=lambda x: -x['venta_mas1'])
+
+        return jsonify(resp)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/corte-administrador')
+@admin_required
+def corte_administrador():
+    """Corte para cobrar: Triple+Terminal del período elegido + Más1 del ciclo
+    semanal vigente (o el que se indique), desglosado por agencia."""
+    try:
+        periodo = request.args.get('periodo', 'hoy')
+        fi = request.args.get('fecha_inicio'); ff = request.args.get('fecha_fin')
+        admin_id = request.args.get('admin_id')
+        es_super = bool(session.get('es_superadmin'))
+        if not es_super:
+            admin_id = session.get('user_id')
+        else:
+            admin_id = int(admin_id) if admin_id else session.get('user_id')
+
+        d0, d1 = _rango_periodo(periodo, fi, ff)
+
+        viernes_param = request.args.get('viernes')
+        if viernes_param:
+            try:
+                viernes = datetime.strptime(viernes_param, "%Y-%m-%d").strftime("%d/%m/%Y")
+            except Exception:
+                viernes = _viernes_mas1()
+        else:
+            viernes = _viernes_mas1()
+        vdt = datetime.strptime(viernes, "%d/%m/%Y")
+
+        with get_db() as db:
+            resumen = _triple_resumen(db, d0, d1, admin_filtro=admin_id, por='compra')
+            resumen_mas1 = _triple_resumen(
+                db, vdt.replace(hour=0, minute=0, second=0), vdt.replace(hour=23, minute=59, second=59),
+                admin_filtro=admin_id, por='sorteo')
+            admin_row = db.execute("SELECT nombre_agencia FROM agencias WHERE id=%s", (admin_id,)).fetchone()
+
+        agencias_list = list(resumen.values())
+        agencias_list.sort(key=lambda x: -x['total'])
+        triple_total = round(sum(a['venta_triple'] for a in agencias_list), 2)
+        terminal_total = round(sum(a['venta_terminal'] for a in agencias_list), 2)
+        mas1_ciclo = round(sum(a['venta_mas1'] for a in resumen_mas1.values()), 2)
+
+        # Desglose por agencia: Triple + Terminal del período elegido, y el
+        # Más1 de ESTE ciclo (viernes) por separado, tal como lo pide el corte.
+        agencias_out = []
+        for a in agencias_list:
+            mas1_ag = resumen_mas1.get(a['agencia_id'], {}).get('venta_mas1', 0.0)
+            subtotal_tt = a['total_triple_terminal']
+            agencias_out.append({
+                'nombre': a['nombre'], 'agencia_id': a['agencia_id'],
+                'venta_triple': a['venta_triple'], 'venta_terminal': a['venta_terminal'],
+                'subtotal_triple_terminal': subtotal_tt,
+                'venta_mas1_ciclo': round(mas1_ag, 2),
+                'total_corte': round(subtotal_tt + mas1_ag, 2)
+            })
+        # Agencias que solo vendieron Más1 en el ciclo pero nada de Triple/Terminal
+        # en el período (para que no falten del desglose del corte).
+        _ids_ya = {a['agencia_id'] for a in agencias_out}
+        for aid_m1, dm1 in resumen_mas1.items():
+            if aid_m1 in _ids_ya or dm1['venta_mas1'] <= 0:
+                continue
+            agencias_out.append({
+                'nombre': dm1['nombre'], 'agencia_id': aid_m1,
+                'venta_triple': 0.0, 'venta_terminal': 0.0, 'subtotal_triple_terminal': 0.0,
+                'venta_mas1_ciclo': round(dm1['venta_mas1'], 2),
+                'total_corte': round(dm1['venta_mas1'], 2)
+            })
+        agencias_out.sort(key=lambda x: -x['total_corte'])
+
+        return jsonify({
+            'status': 'ok', 'admin_id': admin_id,
+            'admin_nombre': admin_row['nombre_agencia'] if admin_row else '?',
+            'periodo': periodo, 'fecha_inicio': d0.strftime("%d/%m/%Y"), 'fecha_fin': d1.strftime("%d/%m/%Y"),
+            'viernes_ciclo': viernes,
+            'triple': triple_total, 'terminal': terminal_total,
+            'subtotal_triple_terminal': round(triple_total + terminal_total, 2),
+            'mas1_ciclo_actual': mas1_ciclo,
+            'total_vendido': round(triple_total + terminal_total + mas1_ciclo, 2),
+            'agencias': agencias_out
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/exportar-csv-triple-global', methods=['POST'])
+@superadmin_required
+def exportar_csv_triple_global():
+    """CSV global de Triple/Terminal/Más1 para el superadmin: incluye TODAS
+    las agencias de TODOS los administradores minoristas (a diferencia de
+    /admin/exportar-csv, que para Zoolo/animalitos respeta el alcance propio)."""
+    try:
+        data = request.get_json() or {}
+        fi = data.get('fecha_inicio'); ff = data.get('fecha_fin')
+        dti = datetime.strptime(fi, "%Y-%m-%d")
+        dtf = datetime.strptime(ff, "%Y-%m-%d").replace(hour=23, minute=59)
+        with get_db() as db:
+            resumen = _triple_resumen(db, dti, dtf, por='compra')  # sin filtro = global
+        out = io.StringIO()
+        w = csv.writer(out)
+        w.writerow(['REPORTE GLOBAL TRIPLE / TERMINAL / MAS 1 - TODOS LOS ADMINISTRADORES'])
+        w.writerow([f'Periodo: {fi} al {ff}'])
+        w.writerow([])
+        w.writerow(['Administrador', 'Agencia', 'Triple S/', 'Terminal S/', 'Mas1 S/', 'Total S/', 'Premios S/', 'Balance S/'])
+        filas = sorted(resumen.values(), key=lambda x: (x['admin_nombre'], -x['total']))
+        tot_tri = tot_ter = tot_m1 = tot_prem = tot_bal = 0.0
+        for a in filas:
+            w.writerow([a['admin_nombre'], a['nombre'], a['venta_triple'], a['venta_terminal'],
+                       a['venta_mas1'], a['total'], a['premio_total'], a['balance']])
+            tot_tri += a['venta_triple']; tot_ter += a['venta_terminal']; tot_m1 += a['venta_mas1']
+            tot_prem += a['premio_total']; tot_bal += a['balance']
+        w.writerow([])
+        w.writerow(['TOTAL GLOBAL', '', round(tot_tri, 2), round(tot_ter, 2), round(tot_m1, 2),
+                   round(tot_tri + tot_ter + tot_m1, 2), round(tot_prem, 2), round(tot_bal, 2)])
+        out.seek(0)
+        return Response(out.getvalue(), mimetype='text/csv',
+                        headers={'Content-Disposition': f'attachment; filename=triple_global_{fi}_{ff}.csv'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/scheduler-estado')
+@superadmin_required
+def scheduler_estado():
+    """Diagnóstico del auto-sorteo: distingue CONFIGURADO=ON de SCHEDULER
+    realmente vivo (heartbeat reciente), y lista sorteos pendientes."""
+    try:
+        vivo = _scheduler_esta_vivo()
+        hb_utc = get_config('scheduler_heartbeat', '')
+        hb_peru = get_config('scheduler_heartbeat_peru', '')
+        auto_z = get_config('auto_sorteo', 'off')
+        auto_t = get_config('auto_sorteo_triple', 'off')
+
+        now_peru = ahora_peru().replace(tzinfo=None)
+        now_ven = ahora_venezuela().replace(tzinfo=None)
+        mins_actual = now_peru.hour * 60 + now_peru.minute
+        mins_actual_plus = now_ven.hour * 60 + now_ven.minute  # Plus corre en huso Venezuela, no Perú
+
+        def _hora_mas_2min(h):
+            """'09:00 AM' -> '09:02 AM': el scheduler dispara 2 min después de la hora nominal."""
+            try:
+                dt = datetime.strptime(h.strip(), "%I:%M %p") + timedelta(minutes=2)
+                return dt.strftime("%I:%M %p")
+            except Exception:
+                return h
+
+        def _proxima_hora(lista_horarios, mins_ref):
+            # Compara contra hora_nominal+2 (la hora REAL de disparo), no la nominal:
+            # a las 09:01 el Triple de las 09:00 (dispara 09:02) sigue siendo el próximo.
+            candidatos = sorted(lista_horarios, key=lambda h: hora_a_min(h))
+            for h in candidatos:
+                if hora_a_min(h) + 2 > mins_ref:
+                    return _hora_mas_2min(h)
+            return (_hora_mas_2min(candidatos[0]) + " (mañana)") if candidatos else None
+
+        proximo_peru = _proxima_hora(HORARIOS_PERU, mins_actual)
+        proximo_plus = _proxima_hora(HORARIOS_PLUS, mins_actual_plus)
+        proximo_triple = _proxima_hora(HORARIOS_TRIPLE, mins_actual)
+
+        dias_para_viernes = (4 - now_peru.weekday()) % 7
+        if dias_para_viernes == 0 and mins_actual >= (17 * 60 + 2):
+            dias_para_viernes = 7
+        proximo_mas1 = (now_peru + timedelta(days=dias_para_viernes)).strftime("%d/%m/%Y") + " 05:02 PM"
+
+        pendientes = []
+        hoy_str = now_peru.strftime("%d/%m/%Y")
+        with get_db() as db:
+            for h in HORARIOS_PERU:
+                if hora_a_min(h) + 2 <= mins_actual:
+                    ex = db.execute("SELECT id FROM resultados WHERE fecha=%s AND hora=%s AND loteria='peru'", (hoy_str, h)).fetchone()
+                    if not ex:
+                        pendientes.append(f"Zoolo Perú {h}")
+            for h in HORARIOS_PLUS:
+                if hora_a_min(h) + 2 <= mins_actual_plus:
+                    ex = db.execute("SELECT id FROM resultados WHERE fecha=%s AND hora=%s AND loteria='plus'", (hoy_str, h)).fetchone()
+                    if not ex:
+                        pendientes.append(f"Zoolo Plus {h}")
+            for h in HORARIOS_TRIPLE:
+                if hora_a_min(h) + 2 <= mins_actual:
+                    ex = db.execute("SELECT id FROM resultados_triple WHERE fecha=%s AND hora=%s AND moneda='peru'", (hoy_str, h)).fetchone()
+                    if not ex:
+                        pendientes.append(f"Triple {h}")
+            if now_peru.weekday() == 4 and mins_actual >= (17 * 60 + 2):
+                ex = db.execute("SELECT id FROM resultado_mas1 WHERE fecha=%s AND moneda='peru'", (hoy_str,)).fetchone()
+                if not ex:
+                    pendientes.append("Más 1 viernes 05:02 PM")
+
+        return jsonify({
+            'status': 'ok',
+            'scheduler_activo': vivo,
+            'es_lider_este_proceso': _ES_SCHEDULER_LIDER,
+            'ultimo_heartbeat_utc': hb_utc,
+            'ultimo_heartbeat_peru': hb_peru,
+            'auto_zoolo': auto_z,
+            'auto_triple': auto_t,
+            'proximo_peru': proximo_peru,
+            'proximo_plus': proximo_plus,
+            'proximo_triple': proximo_triple,
+            'proximo_mas1': proximo_mas1,
+            'pendientes': pendientes
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/recuperar-sorteos', methods=['POST'])
+@superadmin_required
+def recuperar_sorteos_manual():
+    """Botón de diagnóstico: NO inventa resultados manuales, solo ejecuta
+    las mismas funciones automáticas de recuperación bajo demanda."""
+    try:
+        auto_z = get_config('auto_sorteo', 'off')
+        auto_t = get_config('auto_sorteo_triple', 'off')
+        ejecutados = []
+        if auto_z == 'on':
+            recuperar_sorteos_perdidos()
+            ejecutados.append('zoolo')
+        if auto_t == 'on':
+            recuperar_sorteos_triple_perdidos()
+            ejecutados.append('triple')
+        logger.info(f"[RECUPERACION] Disparada manualmente por superadmin: {ejecutados}")
+        log_audit('RECUPERAR_SORTEOS', f"Recuperación manual: {ejecutados}")
+        if not ejecutados:
+            return jsonify({'status': 'ok', 'mensaje': 'Los auto-sorteos están apagados; no hay nada que recuperar.', 'sistemas': []})
+        return jsonify({'status': 'ok', 'mensaje': 'Recuperación ejecutada (misma lógica automática).', 'sistemas': ejecutados})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/admin/resultados-triple-hoy')
 @admin_required
 def resultados_triple_hoy():
@@ -2896,19 +3703,47 @@ def riesgo_triple():
         moneda = 'peru'
         with get_db() as db:
             disp, vendido, presupuesto, pagados = _disponible_pote_triple(fecha, moneda, db)
-            ex, tm = _mapas_apuestas_triple(fecha, hora, moneda, db)
+            ex_o, tm_o = _mapas_apuestas_triple_origen(fecha, hora, moneda, db)
+            # Mapas simples (sin origen) para calcular la RESPONSABILIDAD TOTAL de
+            # cada número candidato: exacto×700 + vecino_inf×20 + vecino_sup×20 + terminal×65.
+            # Esta es la cifra crítica para proteger el 33%, no el pago directo de una sola fila.
+            _ex_simple = {k: v['total'] for k, v in ex_o.items()}
+            _tm_simple = {k: v['total'] for k, v in tm_o.items()}
             filas = []
-            for n3, monto in ex.items():
-                filas.append({'tipo': 'triple', 'sel': n3, 'apostado': round(monto, 2), 'pagaria': round(monto * PAGO_TRIPLE_EXACTO, 2)})
-            for t2, monto in tm.items():
-                filas.append({'tipo': 'terminal', 'sel': t2, 'apostado': round(monto, 2), 'pagaria': round(monto * PAGO_TERMINAL, 2)})
-            filas.sort(key=lambda x: -x['pagaria'])
+            for n3, info in ex_o.items():
+                filas.append({'tipo': 'triple', 'sel': n3, 'apostado': round(info['total'], 2),
+                              'pagaria': round(info['total'] * PAGO_TRIPLE_EXACTO, 2),
+                              'responsabilidad_total': _pago_triple_con_mapas(int(n3), _ex_simple, _tm_simple),
+                              'origenes': [{'admin_id': o['admin_id'], 'admin_nombre': o['admin_nombre'],
+                                           'agencia_id': o['agencia_id'], 'agencia_nombre': o['agencia_nombre'],
+                                           'monto': round(o['monto'], 2)} for o in info['origenes'].values()]})
+            for t2, info in tm_o.items():
+                pago_directo_term = round(info['total'] * PAGO_TERMINAL, 2)
+                filas.append({'tipo': 'terminal', 'sel': t2, 'apostado': round(info['total'], 2),
+                              'pagaria': pago_directo_term,
+                              'responsabilidad_total': pago_directo_term,
+                              'origenes': [{'admin_id': o['admin_id'], 'admin_nombre': o['admin_nombre'],
+                                           'agencia_id': o['agencia_id'], 'agencia_nombre': o['agencia_nombre'],
+                                           'monto': round(o['monto'], 2)} for o in info['origenes'].values()]})
+            filas.sort(key=lambda x: -x['responsabilidad_total'])
             vie = _viernes_mas1()
-            m1map = _mapa_apuestas_mas1(vie, moneda, db)
+            m1map_o = _mapa_apuestas_mas1_origen(vie, moneda, db)
+            _m1_simple = {k: v['total'] for k, v in m1map_o.items()}
             m1 = []
-            for sel, monto in m1map.items():
-                m1.append({'sel': sel, 'apostado': round(monto, 2), 'pagaria_completo': round(monto * PAGO_MAS1_COMPLETO, 2)})
-            m1.sort(key=lambda x: -x['pagaria_completo'])
+            for sel, info in m1map_o.items():
+                partes = sel.split('-')
+                dg_sel = partes[0] if partes else sel
+                an_sel = partes[1] if len(partes) > 1 else ''
+                # Responsabilidad total: exacto dígito+animal×250 + MISMO ANIMAL con otro
+                # dígito×35 (no solo el exacto, tal como puede pagar el motor).
+                resp_total = _pago_mas1_con_mapa(dg_sel, an_sel, _m1_simple) if an_sel else round(info['total'] * PAGO_MAS1_COMPLETO, 2)
+                m1.append({'sel': sel, 'apostado': round(info['total'], 2),
+                          'pagaria_completo': round(info['total'] * PAGO_MAS1_COMPLETO, 2),
+                          'responsabilidad_total': resp_total,
+                          'origenes': [{'admin_id': o['admin_id'], 'admin_nombre': o['admin_nombre'],
+                                       'agencia_id': o['agencia_id'], 'agencia_nombre': o['agencia_nombre'],
+                                       'monto': round(o['monto'], 2)} for o in info['origenes'].values()]})
+            m1.sort(key=lambda x: -x['responsabilidad_total'])
         return jsonify({'status': 'ok', 'fecha': fecha, 'hora': hora, 'viernes': vie,
                         'pote': {'vendido_mes': vendido, 'presupuesto_67': presupuesto, 'pagado_mes': pagados, 'disponible': disp},
                         'triple_terminal': filas[:60], 'mas1': m1[:60]})
@@ -2916,7 +3751,7 @@ def riesgo_triple():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/admin/forzar-autosorteo', methods=['POST'])
-@admin_required
+@superadmin_required
 def forzar_autosorteo():
     try:
         data = request.get_json() or {}
@@ -3680,7 +4515,15 @@ def reporte_agencias():
         with get_db() as db:
             ags = _filtrar_ags(db.execute("SELECT * FROM agencias WHERE es_admin=0").fetchall())
             tickets = db.execute("SELECT * FROM tickets WHERE anulado=0 AND SUBSTR(fecha, 1, 10) = %s",(hoy,)).fetchall()
+            d0_tri, d1_tri = _rango_periodo('hoy')
+            _own_ids_tri = [ag['id'] for ag in ags]
+            _tri_map = {}
+            for _aid_tri in _own_ids_tri:
+                _r = _triple_resumen(db, d0_tri, d1_tri, agencia_filtro=_aid_tri, por='compra')
+                if _aid_tri in _r:
+                    _tri_map[_aid_tri] = _r[_aid_tri]
             data=[]; tv_p=tp_p=tc_p=0.0; tv_l=tp_l=tc_l=0.0
+            tri_glob = {'venta_triple':0.0,'venta_terminal':0.0,'venta_mas1':0.0,'premio_total':0.0,'balance':0.0}
             for ag in ags:
                 mts=[t for t in tickets if t['agencia_id']==ag['id']]
                 ventas_p = sum((t['total_peru'] if 'total_peru' in t.keys() and t['total_peru'] else 0) for t in mts)
@@ -3693,20 +4536,31 @@ def reporte_agencias():
                     else:
                         pend_p+=prem['peru']; pend_l+=prem['plus']
                 com_p=ventas_p*ag['comision']; com_l=ventas_l*ag['comision']
+                _tri = _tri_map.get(ag['id'])
+                _tri_out = _tri if _tri else {'venta_triple':0,'venta_terminal':0,'venta_mas1':0,'total':0,
+                                               'premio_triple':0,'premio_aprox':0,'premio_terminal':0,'premio_mas1':0,
+                                               'premio_total':0,'balance':0,'tickets':0}
                 data.append({
                     'nombre':ag['nombre_agencia'],
                     'usuario':ag['usuario'],
                     'tickets':len(mts),
                     'peru':{'ventas':round(ventas_p,2),'premios_pagados':round(pp_p,2),'premios_pendientes':round(pend_p,2),'premios_total':round(pp_p+pend_p,2),'comision':round(com_p,2),'balance':round(ventas_p-(pp_p+pend_p)-com_p,2)},
-                    'plus':{'ventas':round(ventas_l,2),'premios_pagados':round(pp_l,2),'premios_pendientes':round(pend_l,2),'premios_total':round(pp_l+pend_l,2),'comision':round(com_l,2),'balance':round(ventas_l-(pp_l+pend_l)-com_l,2)}
+                    'plus':{'ventas':round(ventas_l,2),'premios_pagados':round(pp_l,2),'premios_pendientes':round(pend_l,2),'premios_total':round(pp_l+pend_l,2),'comision':round(com_l,2),'balance':round(ventas_l-(pp_l+pend_l)-com_l,2)},
+                    'triple':{'venta_triple':_tri_out['venta_triple'],'venta_terminal':_tri_out['venta_terminal'],
+                             'venta_mas1':_tri_out['venta_mas1'],'total':_tri_out['total'],
+                             'premio_total':_tri_out['premio_total'],'balance':_tri_out['balance'],'tickets':_tri_out['tickets']}
                 })
                 tv_p+=ventas_p; tp_p+=(pp_p+pend_p); tc_p+=com_p
                 tv_l+=ventas_l; tp_l+=(pp_l+pend_l); tc_l+=com_l
+                tri_glob['venta_triple']+=_tri_out['venta_triple']; tri_glob['venta_terminal']+=_tri_out['venta_terminal']
+                tri_glob['venta_mas1']+=_tri_out['venta_mas1']; tri_glob['premio_total']+=_tri_out['premio_total']
+                tri_glob['balance']+=_tri_out['balance']
         return jsonify({
             'agencias':data,
             'global':{
                 'peru':{'ventas':round(tv_p,2),'pagos':round(tp_p,2),'comisiones':round(tc_p,2),'balance':round(tv_p-tp_p-tc_p,2)},
-                'plus':{'ventas':round(tv_l,2),'pagos':round(tp_l,2),'comisiones':round(tc_l,2),'balance':round(tv_l-tp_l-tc_l,2)}
+                'plus':{'ventas':round(tv_l,2),'pagos':round(tp_l,2),'comisiones':round(tc_l,2),'balance':round(tv_l-tp_l-tc_l,2)},
+                'triple':{k:round(v,2) for k,v in tri_glob.items()}
             }
         })
     except Exception as e:
@@ -3817,6 +4671,7 @@ def admin_tickets_detalle():
                     'agencia': t['nombre_agencia'],
                     'total_peru': t['total_peru'] if 'total_peru' in t.keys() else 0,
                     'total_plus': t['total_plus'] if 'total_plus' in t.keys() else 0,
+                    'total_triple': t['total_triple'] if 'total_triple' in t.keys() else 0,
                     'pagado': bool(t['pagado']), 'anulado': bool(t['anulado']),
                     'jugadas': jdet, 'tripletas': tdet, 'triples': _detalle_triple_ticket(t['id'], db)
                 })
@@ -3856,25 +4711,51 @@ def exportar_csv():
                     prem=calcular_premio_ticket_split(t['id'],db)
                     stats[aid]['premios_peru']+=prem['peru']
                     stats[aid]['premios_plus']+=prem['plus']
+            _tri_csv = _triple_resumen(db, dti, dtf, agencia_filtro=None, por='compra')
         out=io.StringIO()
         w=csv.writer(out)
         w.writerow(['REPORTE ZOOLO CASINO'])
         w.writerow([f'Periodo: {fi} al {ff}'])
         w.writerow([])
-        w.writerow(['Agencia','Usuario','Tickets','Ventas S/ (PERU)','Premios S/ (PERU)','Comision S/','Balance S/','Ventas Bs (PLUS)','Premios Bs (PLUS)','Comision Bs','Balance Bs'])
-        tv_p=tv_l=0
-        for s in sorted(stats.values(),key=lambda x:x['ventas_peru']+x['ventas_plus'],reverse=True):
-            if s['tickets']==0: continue
+        w.writerow(['Agencia','Usuario','Tickets','Ventas S/ (PERU)','Premios S/ (PERU)','Comision S/','Balance S/','Ventas Bs (PLUS)','Premios Bs (PLUS)','Comision Bs','Balance Bs','Venta Triple S/','Venta Terminal S/','Venta Mas1 S/','Premios Triple/Term/Mas1 S/','Balance Triple/Term/Mas1 S/'])
+        tv_p=tv_l=0; tv_tri=tv_ter=tv_m1=tp_tri_glob=tb_tri_glob=0.0
+        for aid,s in sorted(stats.items(),key=lambda kv:kv[1]['ventas_peru']+kv[1]['ventas_plus'],reverse=True):
+            if s['tickets']==0 and aid not in _tri_csv: continue
             com_p=s['ventas_peru']*s['comision_pct']
             com_l=s['ventas_plus']*s['comision_pct']
+            _t=_tri_csv.get(aid, {'venta_triple':0,'venta_terminal':0,'venta_mas1':0,'premio_total':0,'balance':0})
             w.writerow([
                 s['nombre'], s['usuario'], s['tickets'],
                 round(s['ventas_peru'],2), round(s['premios_peru'],2), round(com_p,2), round(s['ventas_peru']-s['premios_peru']-com_p,2),
-                round(s['ventas_plus'],2), round(s['premios_plus'],2), round(com_l,2), round(s['ventas_plus']-s['premios_plus']-com_l,2)
+                round(s['ventas_plus'],2), round(s['premios_plus'],2), round(com_l,2), round(s['ventas_plus']-s['premios_plus']-com_l,2),
+                round(_t['venta_triple'],2), round(_t['venta_terminal'],2), round(_t['venta_mas1'],2),
+                round(_t['premio_total'],2), round(_t['balance'],2)
             ])
             tv_p+=s['ventas_peru']; tv_l+=s['ventas_plus']
+            tv_tri+=_t['venta_triple']; tv_ter+=_t['venta_terminal']; tv_m1+=_t['venta_mas1']
+            tp_tri_glob+=_t['premio_total']; tb_tri_glob+=_t['balance']
         w.writerow([])
-        w.writerow(['TOTAL','',sum(s['tickets'] for s in stats.values()),round(tv_p,2),'','','',round(tv_l,2),'','',''])
+        w.writerow(['TOTAL','',sum(s['tickets'] for s in stats.values()),round(tv_p,2),'','','',round(tv_l,2),'','','',
+                    round(tv_tri,2),round(tv_ter,2),round(tv_m1,2),round(tp_tri_glob,2),round(tb_tri_glob,2)])
+
+        # ── Sección GLOBAL Triple/Terminal/Mas1 (solo superadmin) ─────────────
+        # No limitada a las agencias propias: incluye TODOS los administradores
+        # minoristas del sistema, identificando el origen de cada venta.
+        if session.get('es_superadmin'):
+            with get_db() as db2:
+                _tri_glob_csv = _triple_resumen(db2, dti, dtf, por='compra')
+            w.writerow([])
+            w.writerow(['TRIPLE / TERMINAL / MAS 1 - GLOBAL (todas las agencias, todos los administradores)'])
+            w.writerow(['Administrador','Agencia','Venta Triple S/','Venta Terminal S/','Venta Mas1 S/','Total S/','Premios S/','Balance S/'])
+            _tg_tri=_tg_ter=_tg_m1=_tg_tot=_tg_prem=_tg_bal=0.0
+            for a in sorted(_tri_glob_csv.values(), key=lambda x:-x['total']):
+                w.writerow([a['admin_nombre'], a['nombre'], a['venta_triple'], a['venta_terminal'],
+                           a['venta_mas1'], a['total'], a['premio_total'], a['balance']])
+                _tg_tri+=a['venta_triple']; _tg_ter+=a['venta_terminal']; _tg_m1+=a['venta_mas1']
+                _tg_tot+=a['total']; _tg_prem+=a['premio_total']; _tg_bal+=a['balance']
+            w.writerow(['TOTAL GLOBAL','',round(_tg_tri,2),round(_tg_ter,2),round(_tg_m1,2),
+                       round(_tg_tot,2),round(_tg_prem,2),round(_tg_bal,2)])
+
         out.seek(0)
         return Response(
             out.getvalue(),
@@ -3898,6 +4779,18 @@ def estadisticas_rango():
         with get_db() as db:
             all_t=db.execute("SELECT * FROM tickets WHERE anulado=0 ORDER BY id DESC LIMIT 10000").fetchall()
             _own=set(_ids_agencias_admin(db))
+            # Mismo alcance que _own (agencias propias efectivas), para no mezclar
+            # con la vista GLOBAL que sí ofrecen las rutas dedicadas /admin/triple/*.
+            _admin_filtro_tri = _efectivo_admin_id()
+            _tri_rango = _triple_resumen(db, dti, dtf, admin_filtro=_admin_filtro_tri, por='compra')
+            _tri_totales = {
+                'venta_triple': round(sum(a['venta_triple'] for a in _tri_rango.values()),2),
+                'venta_terminal': round(sum(a['venta_terminal'] for a in _tri_rango.values()),2),
+                'venta_mas1': round(sum(a['venta_mas1'] for a in _tri_rango.values()),2),
+                'total': round(sum(a['total'] for a in _tri_rango.values()),2),
+                'premio_total': round(sum(a['premio_total'] for a in _tri_rango.values()),2),
+                'balance': round(sum(a['balance'] for a in _tri_rango.values()),2),
+            }
             dias={}; total_v_p=total_v_l=total_t=0.0
             for t in all_t:
                 dt=parse_fecha(t['fecha'])
@@ -3951,7 +4844,8 @@ def estadisticas_rango():
             'totales':{
                 'tickets':total_t,
                 'peru':{'ventas':round(total_v_p,2),'tripletas':round(total_trip_p,2),'premios':round(total_p_p,2),'comisiones':round(tc_p,2),'balance':round(total_v_p-total_p_p-tc_p,2)},
-                'plus':{'ventas':round(total_v_l,2),'tripletas':round(total_trip_l,2),'premios':round(total_p_l,2),'comisiones':round(tc_l,2),'balance':round(total_v_l-total_p_l-tc_l,2)}
+                'plus':{'ventas':round(total_v_l,2),'tripletas':round(total_trip_l,2),'premios':round(total_p_l,2),'comisiones':round(tc_l,2),'balance':round(total_v_l-total_p_l-tc_l,2)},
+                'triple':_tri_totales
             }
         })
     except Exception as e:
@@ -3990,16 +4884,26 @@ def reporte_agencias_rango():
                 p=calcular_premio_ticket_split(t['id'],db)
                 stats[aid]['premios_peru']+=p['peru']
                 stats[aid]['premios_plus']+=p['plus']
+            _tri_ar = _triple_resumen(db, dti, dtf, por='compra')
         out=[]
-        for s in stats.values():
-            if s['tickets']==0: continue
+        _tri_total_ar = {'venta_triple':0.0,'venta_terminal':0.0,'venta_mas1':0.0,'total':0.0,'premio_total':0.0,'balance':0.0}
+        for aid_s,s in stats.items():
+            _tri_s = _tri_ar.get(aid_s)
+            if s['tickets']==0 and not _tri_s: continue
             com_p=s['ventas_peru']*s['comision_pct']
             com_l=s['ventas_plus']*s['comision_pct']
+            _tri_out_ar = _tri_s if _tri_s else {'venta_triple':0,'venta_terminal':0,'venta_mas1':0,'total':0,'premio_total':0,'balance':0,'tickets':0}
             out.append({
                 'nombre':s['nombre'], 'usuario':s['usuario'], 'tickets':s['tickets'],
                 'peru':{'ventas':round(s['ventas_peru'],2),'premios_teoricos':round(s['premios_peru'],2),'comision':round(com_p,2),'balance':round(s['ventas_peru']-s['premios_peru']-com_p,2)},
-                'plus':{'ventas':round(s['ventas_plus'],2),'premios_teoricos':round(s['premios_plus'],2),'comision':round(com_l,2),'balance':round(s['ventas_plus']-s['premios_plus']-com_l,2)}
+                'plus':{'ventas':round(s['ventas_plus'],2),'premios_teoricos':round(s['premios_plus'],2),'comision':round(com_l,2),'balance':round(s['ventas_plus']-s['premios_plus']-com_l,2)},
+                'triple':{'venta_triple':_tri_out_ar['venta_triple'],'venta_terminal':_tri_out_ar['venta_terminal'],
+                         'venta_mas1':_tri_out_ar['venta_mas1'],'total':_tri_out_ar['total'],
+                         'premio_total':_tri_out_ar['premio_total'],'balance':_tri_out_ar['balance']}
             })
+            for k in ('venta_triple','venta_terminal','venta_mas1','total','premio_total','balance'):
+                _tri_total_ar[k]+=_tri_out_ar[k]
+        for k in _tri_total_ar: _tri_total_ar[k]=round(_tri_total_ar[k],2)
         out.sort(key=lambda x:x['peru']['ventas']+x['plus']['ventas'],reverse=True)
         tv_p=sum(x['peru']['ventas'] for x in out)
         tv_l=sum(x['plus']['ventas'] for x in out)
@@ -4014,6 +4918,7 @@ def reporte_agencias_rango():
         return jsonify({
             'agencias':out,
             'total':total,
+            'triple_total':_tri_total_ar,
             'periodo':{'inicio':fi,'fin':ff}
         })
     except Exception as e:
@@ -4519,13 +5424,14 @@ function borrarTodo(){carrito=[];animalesSel=[];espSel=null;horasSel=[];horasSel
 async function vender(){if(!carrito.length){toast('Ticket vacio','err');return;}let btn=document.getElementById('btn-wa');btn.disabled=true;btn.textContent='PROCESANDO...';try{let r=await fetch('/api/procesar-venta',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({jugadas:carrito.map(c=>({hora:c.hora,seleccion:c.seleccion,monto:c.monto,tipo:c.tipo,loteria:c.loteria||'peru'}))})});let d=await r.json();if(d.error){toast(d.error,'err');}else{window.open(d.url_whatsapp,'_blank');toast('Ticket #'+d.ticket_id+' generado!','ok');carrito=[];animalesSel=[];if(espSel){document.getElementById('esp-'+espSel).classList.remove('sel');espSel=null;}horasSel=[];horasSelPlus=[];document.getElementById('manual-input').value='';renderCarrito();renderAnimales();renderHoras();}}catch(e){toast('Error de conexion','err');}finally{btn.disabled=false;btn.textContent='ENVIAR POR WHATSAPP';}}
 function openResultados(){if(!document.getElementById('res-fecha').value)document.getElementById('res-fecha').value=new Date().toISOString().split('T')[0];openMod('mod-resultados');cargarResultados();}
 function cargarResultados(){let f=document.getElementById('res-fecha').value;if(!f)return;let c=document.getElementById('res-lista');c.innerHTML='<p style="color:var(--text2);text-align:center;padding:10px;font-size:.75rem">CARGANDO...</p>';Promise.all([fetch('/api/resultados-fecha',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:f,loteria:'peru'})}).then(r=>r.json()),fetch('/api/resultados-fecha',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:f,loteria:'plus'})}).then(r=>r.json())]).then(([dp,dpl])=>{let html='<div style="color:#0ea5e9;font-family:\'Oswald\',sans-serif;font-size:.72rem;letter-spacing:2px;padding:4px 0 6px;border-bottom:1px solid #e2e8f0;margin-bottom:4px">ZOOLO PERU (11 SORTEOS)</div>';HPERU.forEach(h=>{let res=dp.resultados[h];html+='<div class="ri '+(res?'ok':'')+'"><span class="ri-hora">'+h.replace(':00 AM',' AM').replace(':00 PM',' PM')+'</span>'+(res?'<span class="ri-animal">'+res.animal+' - '+res.nombre+'</span>':'<span style="color:#4a6090;font-size:.78rem">PENDIENTE</span>')+'</div>';});html+='<div style="color:#a855f7;font-family:\'Oswald\',sans-serif;font-size:.72rem;letter-spacing:2px;padding:8px 0 6px;border-bottom:1px solid #e2e8f0;margin-top:10px;margin-bottom:4px">ZOOLO PLUS (12 SORTEOS)</div>';HPLUS.forEach(h=>{let res=dpl.resultados[h];html+='<div class="ri '+(res?'ok':'')+'"><span class="ri-hora">'+h.replace(':00 AM',' AM').replace(':00 PM',' PM')+'</span>'+(res?'<span class="ri-animal">'+res.animal+' - '+res.nombre+'</span>':'<span style="color:#4a6090;font-size:.78rem">PENDIENTE</span>')+'</div>';});c.innerHTML=html;}).catch(()=>{c.innerHTML='<p style="color:var(--red);text-align:center;padding:12px">Error de conexion</p>';});}
-function consultarTickets(){let ini=document.getElementById('mt-ini').value,fin=document.getElementById('mt-fin').value,est=document.getElementById('mt-estado').value;if(!ini||!fin){toast('Seleccione fechas','err');return;}let lista=document.getElementById('mt-lista');lista.innerHTML='<p style="color:#6090c0;text-align:center;padding:15px;font-size:.75rem">CARGANDO...</p>';fetch('/api/mis-tickets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin,estado:est})}).then(r=>r.json()).then(d=>{if(d.error){lista.innerHTML='<p style="color:#f87171;text-align:center">'+d.error+'</p>';return;}let res=document.getElementById('mt-resumen');res.style.display='block';res.textContent=d.totales.cantidad+' TICKET(S) - PERU: S/ '+d.totales.ventas_peru.toFixed(2)+' | PLUS: Bs '+d.totales.ventas_plus.toFixed(2);if(!d.tickets.length){lista.innerHTML='<p style="color:#4a6090;text-align:center;padding:20px;font-size:.75rem">SIN RESULTADOS</p>';return;}let html='';d.tickets.forEach(t=>{let bc=t.pagado?'p':(t.premio_calculado>0?'g':'n'),bt=t.pagado?'PAGADO':(t.premio_calculado>0?'GANADOR':'PENDIENTE'),tc=t.pagado?'gano':(t.premio_calculado>0?'pte':'');let totStr=[];if(t.total_peru>0)totStr.push('S/'+t.total_peru.toFixed(2));if(t.total_plus>0)totStr.push('Bs'+t.total_plus.toFixed(2));let premStr='';if(t.premio_peru>0)premStr+='PREMIO PERU: S/'+t.premio_peru.toFixed(2)+' ';if(t.premio_plus>0)premStr+='PREMIO PLUS: Bs'+t.premio_plus.toFixed(2);html+='<div class="tcard '+tc+'"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:6px;margin-bottom:6px"><div><div class="ts">#'+t.serial+'</div><div style="color:#4a6090;font-size:.7rem">'+t.fecha+'</div></div><div style="text-align:right"><span class="badge '+bc+'">'+bt+'</span><div style="color:#fbbf24;font-family:\'Oswald\',sans-serif;font-size:.9rem;margin-top:3px;font-weight:700">'+totStr.join(' / ')+'</div>'+(premStr?'<div style="color:#4ade80;font-size:.78rem;font-weight:700;font-family:\'Oswald\',sans-serif">'+premStr+'</div>':'')+'</div></div></div>';});lista.innerHTML=html;}).catch(()=>{lista.innerHTML='<p style="color:#f87171;text-align:center">Error de conexion</p>';});}
-function cajaHist(){let ini=document.getElementById('ar-ini').value,fin=document.getElementById('ar-fin').value;if(!ini||!fin){toast('Seleccione fechas','err');return;}let c=document.getElementById('ar-res');c.innerHTML='<p style="color:var(--text2);text-align:center;padding:10px;font-size:.75rem">CARGANDO...</p>';fetch('/api/caja-historico',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json()).then(d=>{if(d.error){c.innerHTML='<p style="color:var(--red)">'+d.error+'</p>';return;}let html='<div class="sbox">';d.resumen_por_dia.forEach(dia=>{let colP=dia.peru.balance>=0?'var(--green)':'var(--red)';let colL=dia.plus.balance>=0?'var(--green)':'var(--red)';html+='<div class="srow"><span class="sl">'+dia.fecha+' ('+dia.tickets+' tk)</span><span></span></div>';if(dia.peru.ventas>0)html+='<div class="srow" style="padding-left:10px"><span style="font-size:.68rem;color:#0284c7">PERU V:'+dia.peru.ventas+'</span><span class="sv" style="color:'+colP+'">S/'+dia.peru.balance.toFixed(2)+'</span></div>';if(dia.plus.ventas>0)html+='<div class="srow" style="padding-left:10px"><span style="font-size:.68rem;color:#7c3aed">PLUS V:'+dia.plus.ventas+'</span><span class="sv" style="color:'+colL+'">Bs'+dia.plus.balance.toFixed(2)+'</span></div>';});html+='</div><div class="sbox"><div style="color:#0284c7;font-size:.68rem;letter-spacing:1px;margin-bottom:4px">TOTAL PERU</div><div class="srow"><span class="sl">Ventas</span><span class="sv">S/'+d.totales.peru.ventas.toFixed(2)+'</span></div><div class="srow"><span class="sl">Premios</span><span class="sv" style="color:var(--red)">S/'+d.totales.peru.premios.toFixed(2)+'</span></div><div class="srow"><span class="sl">Comision</span><span class="sv">S/'+d.totales.peru.comision.toFixed(2)+'</span></div><div class="srow"><span class="sl">Balance</span><span class="sv" style="color:'+(d.totales.peru.balance>=0?'var(--green)':'var(--red)')+'">S/'+d.totales.peru.balance.toFixed(2)+'</span></div></div><div class="sbox"><div style="color:#7c3aed;font-size:.68rem;letter-spacing:1px;margin-bottom:4px">TOTAL PLUS</div><div class="srow"><span class="sl">Ventas</span><span class="sv">Bs'+d.totales.plus.ventas.toFixed(2)+'</span></div><div class="srow"><span class="sl">Premios</span><span class="sv" style="color:var(--red)">Bs'+d.totales.plus.premios.toFixed(2)+'</span></div><div class="srow"><span class="sl">Comision</span><span class="sv">Bs'+d.totales.plus.comision.toFixed(2)+'</span></div><div class="srow"><span class="sl">Balance</span><span class="sv" style="color:'+(d.totales.plus.balance>=0?'var(--green)':'var(--red)')+'">Bs'+d.totales.plus.balance.toFixed(2)+'</span></div></div>';c.innerHTML=html;});}
-function cajaHistTickets(){let ini=document.getElementById('ar-ini').value,fin=document.getElementById('ar-fin').value;if(!ini||!fin){toast('Seleccione fechas','err');return;}let c=document.getElementById('ar-res');c.innerHTML='<p style="color:var(--text2);text-align:center;padding:10px;font-size:.75rem">CARGANDO...</p>';fetch('/api/tickets-detalle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json()).then(d=>{if(d.error){c.innerHTML='<p style="color:var(--red)">'+d.error+'</p>';return;}if(!d.tickets.length){c.innerHTML='<p style="color:var(--text2);text-align:center;padding:20px">Sin tickets en ese rango</p>';return;}let html='';d.tickets.forEach(function(t){let estado=t.anulado?'<span class="badge n" style="background:#7c2d12">ANULADO</span>':(t.pagado?'<span class="badge p">PAGADO</span>':'<span class="badge g">PENDIENTE</span>');let totales=[];if(t.total_peru>0)totales.push('S/'+t.total_peru.toFixed(2));if(t.total_plus>0)totales.push('Bs'+t.total_plus.toFixed(2));html+='<div class="tcard"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><div class="ts">#'+t.serial+' <span style="color:#4a6090;font-size:.68rem;font-weight:400">'+t.fecha+'</span></div><div>'+estado+' <span style="color:var(--gold);font-weight:700">'+totales.join(' / ')+'</span></div></div>';t.jugadas.forEach(function(j){let simbJ=j.loteria==='plus'?'Bs':'S/';html+='<div class="jrow"><span>'+j.hora+' — '+(j.tipo==='animal'?(j.seleccion+' '+j.nombre):j.seleccion)+'</span><span>'+simbJ+j.monto+'</span></div>';});t.tripletas.forEach(function(tr){let simbT=tr.loteria==='plus'?'Bs':'S/';html+='<div class="trip-row"><span>TRIPLETA '+tr.animales+'</span><span>'+simbT+tr.monto+'</span></div>';});html+='</div>';});c.innerHTML=html;});}
+function consultarTickets(){let ini=document.getElementById('mt-ini').value,fin=document.getElementById('mt-fin').value,est=document.getElementById('mt-estado').value;if(!ini||!fin){toast('Seleccione fechas','err');return;}let lista=document.getElementById('mt-lista');lista.innerHTML='<p style="color:#6090c0;text-align:center;padding:15px;font-size:.75rem">CARGANDO...</p>';fetch('/api/mis-tickets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin,estado:est})}).then(r=>r.json()).then(d=>{if(d.error){lista.innerHTML='<p style="color:#f87171;text-align:center">'+d.error+'</p>';return;}let res=document.getElementById('mt-resumen');res.style.display='block';res.textContent=d.totales.cantidad+' TICKET(S) - PERU: S/ '+d.totales.ventas_peru.toFixed(2)+' | PLUS: Bs '+d.totales.ventas_plus.toFixed(2)+' | TRIPLE/TERMINAL/MAS1: S/ '+d.totales.ventas_triple.toFixed(2);if(!d.tickets.length){lista.innerHTML='<p style="color:#4a6090;text-align:center;padding:20px;font-size:.75rem">SIN RESULTADOS</p>';return;}let html='';d.tickets.forEach(t=>{let bc=t.pagado?'p':(t.premio_calculado>0?'g':'n'),bt=t.pagado?'PAGADO':(t.premio_calculado>0?'GANADOR':'PENDIENTE'),tc=t.pagado?'gano':(t.premio_calculado>0?'pte':'');let totStr=[];if(t.total_peru>0)totStr.push('S/'+t.total_peru.toFixed(2));if(t.total_plus>0)totStr.push('Bs'+t.total_plus.toFixed(2));if(t.total_triple>0)totStr.push('T:S/'+t.total_triple.toFixed(2));let premStr='';if(t.premio_peru>0)premStr+='PREMIO ZOOLO PERU: S/'+t.premio_peru.toFixed(2)+' ';if(t.premio_plus>0)premStr+='PREMIO ZOOLO PLUS: Bs'+t.premio_plus.toFixed(2)+' ';if(t.premio_triple>0)premStr+='PREMIO TRIPLE/TERMINAL/MAS1: S/'+t.premio_triple.toFixed(2)+' ';html+='<div class="tcard '+tc+'"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:6px;margin-bottom:6px"><div><div class="ts">#'+t.serial+'</div><div style="color:#4a6090;font-size:.7rem">'+t.fecha+'</div></div><div style="text-align:right"><span class="badge '+bc+'">'+bt+'</span><div style="color:#fbbf24;font-family:\'Oswald\',sans-serif;font-size:.9rem;margin-top:3px;font-weight:700">'+totStr.join(' / ')+'</div>'+(premStr?'<div style="color:#4ade80;font-size:.78rem;font-weight:700;font-family:\'Oswald\',sans-serif">'+premStr+'</div>':'')+'</div></div></div>';});lista.innerHTML=html;}).catch(()=>{lista.innerHTML='<p style="color:#f87171;text-align:center">Error de conexion</p>';});}
+function cajaHist(){let ini=document.getElementById('ar-ini').value,fin=document.getElementById('ar-fin').value;if(!ini||!fin){toast('Seleccione fechas','err');return;}let c=document.getElementById('ar-res');c.innerHTML='<p style="color:var(--text2);text-align:center;padding:10px;font-size:.75rem">CARGANDO...</p>';fetch('/api/caja-historico',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json()).then(d=>{if(d.error){c.innerHTML='<p style="color:var(--red)">'+d.error+'</p>';return;}let html='<div class="sbox">';d.resumen_por_dia.forEach(dia=>{let colP=dia.peru.balance>=0?'var(--green)':'var(--red)';let colL=dia.plus.balance>=0?'var(--green)':'var(--red)';html+='<div class="srow"><span class="sl">'+dia.fecha+' ('+dia.tickets+' tk)</span><span></span></div>';if(dia.peru.ventas>0)html+='<div class="srow" style="padding-left:10px"><span style="font-size:.68rem;color:#0284c7">PERU V:'+dia.peru.ventas+'</span><span class="sv" style="color:'+colP+'">S/'+dia.peru.balance.toFixed(2)+'</span></div>';if(dia.plus.ventas>0)html+='<div class="srow" style="padding-left:10px"><span style="font-size:.68rem;color:#7c3aed">PLUS V:'+dia.plus.ventas+'</span><span class="sv" style="color:'+colL+'">Bs'+dia.plus.balance.toFixed(2)+'</span></div>';if(dia.triple_games&&dia.triple_games.ventas>0)html+='<div class="srow" style="padding-left:10px"><span style="font-size:.68rem;color:#c084fc">TRIPLE/TERM/MAS1 V:'+dia.triple_games.ventas+'</span></div>';});html+='</div><div class="sbox"><div style="color:#0284c7;font-size:.68rem;letter-spacing:1px;margin-bottom:4px">TOTAL PERU</div><div class="srow"><span class="sl">Ventas</span><span class="sv">S/'+d.totales.peru.ventas.toFixed(2)+'</span></div><div class="srow"><span class="sl">Premios</span><span class="sv" style="color:var(--red)">S/'+d.totales.peru.premios.toFixed(2)+'</span></div><div class="srow"><span class="sl">Comision</span><span class="sv">S/'+d.totales.peru.comision.toFixed(2)+'</span></div><div class="srow"><span class="sl">Balance</span><span class="sv" style="color:'+(d.totales.peru.balance>=0?'var(--green)':'var(--red)')+'">S/'+d.totales.peru.balance.toFixed(2)+'</span></div></div><div class="sbox"><div style="color:#7c3aed;font-size:.68rem;letter-spacing:1px;margin-bottom:4px">TOTAL PLUS</div><div class="srow"><span class="sl">Ventas</span><span class="sv">Bs'+d.totales.plus.ventas.toFixed(2)+'</span></div><div class="srow"><span class="sl">Premios</span><span class="sv" style="color:var(--red)">Bs'+d.totales.plus.premios.toFixed(2)+'</span></div><div class="srow"><span class="sl">Comision</span><span class="sv">Bs'+d.totales.plus.comision.toFixed(2)+'</span></div><div class="srow"><span class="sl">Balance</span><span class="sv" style="color:'+(d.totales.plus.balance>=0?'var(--green)':'var(--red)')+'">Bs'+d.totales.plus.balance.toFixed(2)+'</span></div></div><div class="sbox"><div style="color:#c084fc;font-size:.68rem;letter-spacing:1px;margin-bottom:4px">TOTAL TRIPLE/TERMINAL/MAS1</div><div class="srow"><span class="sl">Ventas</span><span class="sv">S/'+d.totales.triple_games.ventas.toFixed(2)+'</span></div><div class="srow"><span class="sl">Premios</span><span class="sv" style="color:var(--red)">S/'+d.totales.triple_games.premios.toFixed(2)+'</span></div><div class="srow"><span class="sl">Balance</span><span class="sv" style="color:'+(d.totales.triple_games.balance>=0?'var(--green)':'var(--red)')+'">S/'+d.totales.triple_games.balance.toFixed(2)+'</span></div></div>';c.innerHTML=html;});}
+function cajaHistTickets(){let ini=document.getElementById('ar-ini').value,fin=document.getElementById('ar-fin').value;if(!ini||!fin){toast('Seleccione fechas','err');return;}let c=document.getElementById('ar-res');c.innerHTML='<p style="color:var(--text2);text-align:center;padding:10px;font-size:.75rem">CARGANDO...</p>';fetch('/api/tickets-detalle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json()).then(d=>{if(d.error){c.innerHTML='<p style="color:var(--red)">'+d.error+'</p>';return;}if(!d.tickets.length){c.innerHTML='<p style="color:var(--text2);text-align:center;padding:20px">Sin tickets en ese rango</p>';return;}let html='';d.tickets.forEach(function(t){let estado=t.anulado?'<span class="badge n" style="background:#7c2d12">ANULADO</span>':(t.pagado?'<span class="badge p">PAGADO</span>':'<span class="badge g">PENDIENTE</span>');let totales=[];if(t.total_peru>0)totales.push('S/'+t.total_peru.toFixed(2));if(t.total_plus>0)totales.push('Bs'+t.total_plus.toFixed(2));if(t.total_triple>0)totales.push('Triple S/'+t.total_triple.toFixed(2));html+='<div class="tcard"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><div class="ts">#'+t.serial+' <span style="color:#4a6090;font-size:.68rem;font-weight:400">'+t.fecha+'</span></div><div>'+estado+' <span style="color:var(--gold);font-weight:700">'+totales.join(' / ')+'</span></div></div>';t.jugadas.forEach(function(j){let simbJ=j.loteria==='plus'?'Bs':'S/';html+='<div class="jrow"><span>'+j.hora+' — '+(j.tipo==='animal'?(j.seleccion+' '+j.nombre):j.seleccion)+'</span><span>'+simbJ+j.monto+'</span></div>';});t.tripletas.forEach(function(tr){let simbT=tr.loteria==='plus'?'Bs':'S/';html+='<div class="trip-row"><span>TRIPLETA '+tr.animales+'</span><span>'+simbT+tr.monto+'</span></div>';});(t.triples||[]).forEach(function(tg){let res=tg.resultado?(' → '+tg.resultado):'';let ganoTag=tg.gano?' <span class="tag ok" style="font-size:.55rem">GANÓ S/'+tg.premio.toFixed(2)+'</span>':'';html+='<div class="jrow" style="border-left-color:#7c3aed;background:#faf5ff"><span style="color:#7c3aed">'+tg.hora+' — '+tg.etiqueta+res+ganoTag+'</span><span>S/'+tg.monto+'</span></div>';});html+='</div>';});c.innerHTML=html;});}
 function bloqueCaja(titulo,simbolo,d){let bc=d.balance>=0?'g':'r';return '<div style="color:var(--text2);font-size:.68rem;letter-spacing:2px;font-family:\'Oswald\',sans-serif;margin:10px 0 4px">'+titulo+'</div><div class="caja-grid"><div class="cg"><div class="cgl">VENTAS</div><div class="cgv">'+simbolo+d.ventas.toFixed(2)+'</div></div><div class="cg"><div class="cgl">PREMIOS PAGADOS</div><div class="cgv r">'+simbolo+d.premios.toFixed(2)+'</div></div><div class="cg"><div class="cgl">COMISION</div><div class="cgv">'+simbolo+d.comision.toFixed(2)+'</div></div><div class="cg"><div class="cgl">BALANCE</div><div class="cgv '+bc+'">'+simbolo+d.balance.toFixed(2)+'</div></div></div>';}
-function openCaja(){openMod('mod-caja');fetch('/api/caja').then(r=>r.json()).then(d=>{if(d.error)return;let html=bloqueCaja('ZOOLO PERU (S/)','S/',d.peru)+bloqueCaja('ZOOLO PLUS (Bs)','Bs',d.plus)+'<div class="sbox"><div class="srow"><span class="sl">Tickets vendidos</span><span class="sv">'+d.total_tickets+'</span></div><div class="srow"><span class="sl">Con premio pendiente</span><span class="sv" style="color:#c08020">'+d.tickets_pendientes+'</span></div></div>';document.getElementById('caja-body').innerHTML=html;});}
+function bloqueCajaTriple(d){if(!d)return'';let bc=d.balance>=0?'g':'r';return '<div style="color:#c084fc;font-size:.68rem;letter-spacing:2px;font-family:\'Oswald\',sans-serif;margin:10px 0 4px">🎲 TRIPLE / TERMINAL / MAS 1 (S/) — pote independiente 67/33</div><div class="caja-grid" style="grid-template-columns:repeat(3,1fr)"><div class="cg"><div class="cgl">VENTAS</div><div class="cgv">S/'+d.ventas.toFixed(2)+'</div></div><div class="cg"><div class="cgl">PREMIOS PAGADOS</div><div class="cgv r">S/'+d.premios.toFixed(2)+'</div></div><div class="cg"><div class="cgl">BALANCE</div><div class="cgv '+bc+'">S/'+d.balance.toFixed(2)+'</div></div></div>';}
+function openCaja(){openMod('mod-caja');fetch('/api/caja').then(r=>r.json()).then(d=>{if(d.error)return;let html=bloqueCaja('ZOOLO PERU (S/)','S/',d.peru)+bloqueCaja('ZOOLO PLUS (Bs)','Bs',d.plus)+bloqueCajaTriple(d.triple_games)+'<div class="sbox"><div class="srow"><span class="sl">Tickets vendidos</span><span class="sv">'+d.total_tickets+'</span></div><div class="srow"><span class="sl">Con premio pendiente</span><span class="sv" style="color:#c08020">'+d.tickets_pendientes+'</span></div></div>';document.getElementById('caja-body').innerHTML=html;});}
 function openPagar(){openMod('mod-pagar');document.getElementById('pag-serial').value='';document.getElementById('pag-res').innerHTML='';}
-function verificarTicket(){let s=document.getElementById('pag-serial').value.trim();if(!s)return;let c=document.getElementById('pag-res');fetch('/api/verificar-ticket',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({serial:s})}).then(r=>r.json()).then(d=>{if(d.error){c.innerHTML='<div style="background:var(--red-bg);color:var(--red);padding:10px;border-radius:3px;text-align:center;margin-top:8px;border:1px solid var(--red-border)">X '+d.error+'</div>';return;}let col=d.total_ganado>0?'var(--green)':'var(--text2)';let premLineas=[];if(d.total_ganado_peru>0)premLineas.push('<div style="display:flex;justify-content:space-between"><span style="color:var(--text2);font-size:.75rem">PREMIO PERU</span><span style="color:var(--green);font-family:\'Oswald\',sans-serif;font-weight:700">S/'+d.total_ganado_peru.toFixed(2)+'</span></div>');if(d.total_ganado_plus>0)premLineas.push('<div style="display:flex;justify-content:space-between"><span style="color:var(--text2);font-size:.75rem">PREMIO PLUS</span><span style="color:var(--green);font-family:\'Oswald\',sans-serif;font-weight:700">Bs'+d.total_ganado_plus.toFixed(2)+'</span></div>');c.innerHTML='<div style="border:1px solid '+col+';border-radius:4px;padding:14px;margin-top:10px"><div style="color:var(--teal);font-family:\'Oswald\',sans-serif;letter-spacing:2px;margin-bottom:10px">TICKET #'+s+'</div>'+(premLineas.length?premLineas.join(''):'<div style="color:var(--text2);text-align:center;font-size:.8rem;padding:6px">SIN PREMIO</div>')+(d.total_ganado>0?'<button onclick="pagarTicket('+d.ticket_id+')" style="width:100%;padding:11px;margin-top:12px;background:linear-gradient(135deg,#0a3020,#062018);color:var(--green);border:1px solid #0d5a2a;border-radius:3px;font-weight:700;cursor:pointer;font-family:\'Oswald\',sans-serif;letter-spacing:2px;font-size:.85rem">CONFIRMAR PAGO</button>':'')+'</div>';});}
+function verificarTicket(){let s=document.getElementById('pag-serial').value.trim();if(!s)return;let c=document.getElementById('pag-res');fetch('/api/verificar-ticket',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({serial:s})}).then(r=>r.json()).then(d=>{if(d.error){c.innerHTML='<div style="background:var(--red-bg);color:var(--red);padding:10px;border-radius:3px;text-align:center;margin-top:8px;border:1px solid var(--red-border)">X '+d.error+'</div>';return;}let col=d.total_ganado>0?'var(--green)':'var(--text2)';let premLineas=[];if(d.total_ganado_peru>0)premLineas.push('<div style="display:flex;justify-content:space-between"><span style="color:var(--text2);font-size:.75rem">PREMIO ZOOLO PERU</span><span style="color:var(--green);font-family:\'Oswald\',sans-serif;font-weight:700">S/'+d.total_ganado_peru.toFixed(2)+'</span></div>');if(d.total_ganado_plus>0)premLineas.push('<div style="display:flex;justify-content:space-between"><span style="color:var(--text2);font-size:.75rem">PREMIO ZOOLO PLUS</span><span style="color:var(--green);font-family:\'Oswald\',sans-serif;font-weight:700">Bs'+d.total_ganado_plus.toFixed(2)+'</span></div>');if(d.total_ganado_triple>0)premLineas.push('<div style="display:flex;justify-content:space-between"><span style="color:var(--text2);font-size:.75rem">PREMIO TRIPLE/TERMINAL/MAS1</span><span style="color:var(--green);font-family:\'Oswald\',sans-serif;font-weight:700">S/'+d.total_ganado_triple.toFixed(2)+'</span></div>');c.innerHTML='<div style="border:1px solid '+col+';border-radius:4px;padding:14px;margin-top:10px"><div style="color:var(--teal);font-family:\'Oswald\',sans-serif;letter-spacing:2px;margin-bottom:10px">TICKET #'+s+'</div>'+(premLineas.length?premLineas.join(''):'<div style="color:var(--text2);text-align:center;font-size:.8rem;padding:6px">SIN PREMIO</div>')+(d.total_ganado>0?'<button onclick="pagarTicket('+d.ticket_id+')" style="width:100%;padding:11px;margin-top:12px;background:linear-gradient(135deg,#0a3020,#062018);color:var(--green);border:1px solid #0d5a2a;border-radius:3px;font-weight:700;cursor:pointer;font-family:\'Oswald\',sans-serif;letter-spacing:2px;font-size:.85rem">CONFIRMAR PAGO</button>':'')+'</div>';});}
 function pagarTicket(tid){if(!confirm('¿Confirmar pago de este ticket?'))return;fetch('/api/pagar-ticket',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ticket_id:tid})}).then(r=>r.json()).then(d=>{if(d.status==='ok'){toast('Ticket pagado','ok');closeMod('mod-pagar');}else toast(d.error||'Error','err');});}
 function openAnular(){openMod('mod-anular');document.getElementById('an-serial').value='';document.getElementById('an-res').innerHTML='';}
 function anularTicket(){let s=document.getElementById('an-serial').value.trim();if(!s)return;fetch('/api/anular-ticket',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({serial:s})}).then(r=>r.json()).then(d=>{let c=document.getElementById('an-res');if(d.status==='ok')c.innerHTML='<div style="background:#062012;color:var(--green);padding:10px;border-radius:3px;text-align:center;margin-top:8px;border:1px solid #0d5a2a">'+d.mensaje+'</div>';else c.innerHTML='<div style="background:var(--red-bg);color:var(--red);padding:10px;border-radius:3px;text-align:center;margin-top:8px;border:1px solid var(--red-border)">'+d.error+'</div>';});}
@@ -4632,8 +5538,8 @@ body.solo-lectura .tc button,body.solo-lectura .tc input,body.solo-lectura .tc s
   <div class="tab" onclick="showTab('reportes')">💼 REPORTES</div>
   <div class="tab" onclick="showTab('tripletas')">🎯 TRIPLETAS</div>
   <div class="tab" onclick="showTab('auditoria')">📋 AUDITORÍA</div>
-  {% if es_superadmin %}<div class="tab" onclick="showTab('admins')">👑 ADMINS</div>{% endif %}
-  {% if es_superadmin %}<div class="tab" onclick="showTab('triple')">🎲 TRIPLE</div>{% endif %}
+  <div class="tab"{% if not es_superadmin %} style="display:none"{% endif %} onclick="showTab('admins')">👑 ADMINS</div>
+  <div class="tab" onclick="showTab('triple')">🎲 TRIPLE</div>
 </div>
 
 <!-- TAB RESULTADOS -->
@@ -4861,9 +5767,10 @@ body.solo-lectura .tc button,body.solo-lectura .tc input,body.solo-lectura .tc s
 </div>
 {% endif %}
 
-{% if es_superadmin %}
-<!-- TAB TRIPLE / TERMINAL / MÁS 1 (solo super-admin) -->
+<!-- TAB TRIPLE / TERMINAL / MÁS 1 (contabilidad visible para todo administrador;
+     resultados/riesgo/scheduler exclusivos del super-admin, marcados abajo) -->
 <div id="tc-triple" class="tc">
+  {% if es_superadmin %}
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
       <div class="card-title" style="border:none;padding:0;margin:0">🎲 TRIPLE · TERMINAL · MÁS 1 — pote mensual 67/33</div>
@@ -4914,8 +5821,70 @@ body.solo-lectura .tc button,body.solo-lectura .tc input,body.solo-lectura .tc s
     <div id="tri-pote" style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:10px 0"></div>
     <div id="tri-riesgo"></div>
   </div>
+
+  <div class="card">
+    <div class="card-title">🔧 ESTADO AUTO-SORTEOS</div>
+    <button class="btn" style="padding:4px 10px;font-size:.65rem;margin-bottom:10px" onclick="cargarSchedulerEstado()">🔄 Actualizar</button>
+    <div id="sched-estado"><div style="color:var(--text2);padding:8px">Cargando...</div></div>
+  </div>
+  {% endif %}
+
+  <div class="card">
+    <div class="card-title">📊 CONTABILIDAD Y REPORTES — Triple / Terminal / Más 1</div>
+    <div class="frow">
+      <div class="fg"><label>PERÍODO</label>
+        <select id="ctb-periodo" onchange="ctbToggleRango()">
+          <option value="hoy">Hoy</option>
+          <option value="semana">Semana</option>
+          <option value="mes" selected>Mes</option>
+          <option value="rango">Rango personalizado</option>
+        </select>
+      </div>
+      <div class="fg" id="ctb-fi-box" style="display:none"><label>DESDE</label><input type="date" id="ctb-fi"></div>
+      <div class="fg" id="ctb-ff-box" style="display:none"><label>HASTA</label><input type="date" id="ctb-ff"></div>
+      {% if es_superadmin %}<div class="fg"><label>ADMINISTRADOR</label><select id="ctb-admin"><option value="">-- Todos (global) --</option></select></div>{% endif %}
+      <div class="fg" style="align-self:flex-end"><button class="btn" onclick="cargarContabilidadTriple()">📊 VER</button></div>
+      {% if es_superadmin %}<div class="fg" style="align-self:flex-end"><button class="btn gold" onclick="exportarCSVTripleGlobal()">📥 CSV GLOBAL</button></div>{% endif %}
+    </div>
+    <div id="ctb-resultado"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">✂️ CORTE TRIPLE / TERMINAL</div>
+    <div class="frow">
+      <div class="fg"><label>PERÍODO</label>
+        <select id="cte-periodo" onchange="cteToggleRango()">
+          <option value="hoy" selected>Hoy</option>
+          <option value="semana">Semana</option>
+          <option value="mes">Mes</option>
+          <option value="rango">Rango personalizado</option>
+        </select>
+      </div>
+      <div class="fg" id="cte-fi-box" style="display:none"><label>DESDE</label><input type="date" id="cte-fi"></div>
+      <div class="fg" id="cte-ff-box" style="display:none"><label>HASTA</label><input type="date" id="cte-ff"></div>
+      {% if es_superadmin %}<div class="fg"><label>ADMINISTRADOR</label><select id="cte-admin"><option value="">-- Yo mismo --</option></select></div>{% endif %}
+      <div class="fg" style="align-self:flex-end"><button class="btn" onclick="cargarCorteTripleTerminal()">✂️ VER CORTE</button></div>
+    </div>
+    <div id="cte-resultado"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">⭐ MÁS 1 — CORTE SEMANAL</div>
+    <div class="frow">
+      <div class="fg"><label>CICLO</label>
+        <select id="m1c-ciclo" onchange="m1cToggleFecha()">
+          <option value="actual" selected>Ciclo actual</option>
+          <option value="anterior">Ciclo anterior</option>
+          <option value="fecha">Elegir viernes histórico</option>
+        </select>
+      </div>
+      <div class="fg" id="m1c-fecha-box" style="display:none"><label>VIERNES</label><input type="date" id="m1c-fecha"></div>
+      {% if es_superadmin %}<div class="fg"><label>ADMINISTRADOR</label><select id="m1c-admin"><option value="">-- Todos (global) --</option></select></div>{% endif %}
+      <div class="fg" style="align-self:flex-end"><button class="btn" onclick="cargarMas1Corte()">⭐ VER CICLO</button></div>
+    </div>
+    <div id="m1c-resultado"></div>
+  </div>
 </div>
-{% endif %}
 
 <script>
 const ANIMALES = {{ animales | tojson }};
@@ -5081,9 +6050,9 @@ function cargarTopes(){let hora=document.getElementById('tope-hora').value,lot=l
 function liberarTope(num,hora,lot){if(!ES_SUPER)return;fetch('/admin/topes/guardar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hora,numero:num,monto:0,loteria:lot})}).then(r=>r.json()).then(d=>{if(d.status==='ok')cargarTopes();});}
 function limpiarTopes(){if(!ES_SUPER){alert('Solo el administrador principal puede modificar topes');return;}let hora=document.getElementById('tope-hora').value,lot=lotTopes;if(!confirm('¿Eliminar TODOS los topes de '+hora+' ('+lot+')?'))return;fetch('/admin/topes/limpiar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hora,loteria:lot})}).then(r=>r.json()).then(d=>{if(d.status==='ok')cargarTopes();else alert(d.error);});}
 
-function cargarReporteHoy(){fetch(urlVC('/admin/reporte-agencias')).then(r=>r.json()).then(d=>{let html='<table class="tbl"><thead><tr><th>Agencia</th><th>Tickets</th><th colspan="4" style="text-align:center;color:#0284c7">ZOOLO PERU (S/)</th><th colspan="4" style="text-align:center;color:#a855f7">ZOOLO PLUS (Bs)</th></tr><tr><th></th><th></th><th>Ventas</th><th>Premios</th><th>Comisión</th><th>Balance</th><th>Ventas</th><th>Premios</th><th>Comisión</th><th>Balance</th></tr></thead><tbody>';d.agencias.forEach(a=>{let bcP=a.peru.balance>=0?'var(--green)':'var(--red)';let bcL=a.plus.balance>=0?'var(--green)':'var(--red)';html+='<tr><td><span style="color:var(--gold)">'+a.nombre+'</span><br><span style="color:var(--text2);font-size:.65rem">'+a.usuario+'</span></td><td>'+a.tickets+'</td><td>S/'+a.peru.ventas.toFixed(2)+'</td><td style="color:var(--red)">S/'+a.peru.premios_total.toFixed(2)+'</td><td>S/'+a.peru.comision.toFixed(2)+'</td><td style="color:'+bcP+';font-weight:700">S/'+a.peru.balance.toFixed(2)+'</td><td>Bs'+a.plus.ventas.toFixed(2)+'</td><td style="color:var(--red)">Bs'+a.plus.premios_total.toFixed(2)+'</td><td>Bs'+a.plus.comision.toFixed(2)+'</td><td style="color:'+bcL+';font-weight:700">Bs'+a.plus.balance.toFixed(2)+'</td></tr>';});html+='<tfoot><tr><td colspan="2" style="color:var(--gold)">GLOBAL</td><td>S/'+d.global.peru.ventas.toFixed(2)+'</td><td style="color:var(--red)">S/'+d.global.peru.pagos.toFixed(2)+'</td><td>S/'+d.global.peru.comisiones.toFixed(2)+'</td><td style="color:'+(d.global.peru.balance>=0?'var(--green)':'var(--red)')+';font-weight:700">S/'+d.global.peru.balance.toFixed(2)+'</td><td>Bs'+d.global.plus.ventas.toFixed(2)+'</td><td style="color:var(--red)">Bs'+d.global.plus.pagos.toFixed(2)+'</td><td>Bs'+d.global.plus.comisiones.toFixed(2)+'</td><td style="color:'+(d.global.plus.balance>=0?'var(--green)':'var(--red)')+';font-weight:700">Bs'+d.global.plus.balance.toFixed(2)+'</td></tr></tfoot></table>';document.getElementById('rep-hoy').innerHTML=html;document.getElementById('btn-csv').disabled=false;document.getElementById('btn-csv').style.opacity=1;});}
-function cargarEstadisticas(){let ini=document.getElementById('rep-ini').value,fin=document.getElementById('rep-fin').value;if(!ini||!fin){alert('Seleccione fechas');return;}fetch('/admin/estadisticas-rango',{method:'POST',headers:{'Content-Type':'application/json'},body:bodyVC({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json()).then(d=>{let tp=d.totales.peru,tl=d.totales.plus;let vAnimP=Math.round((tp.ventas-tp.tripletas)*100)/100;let vAnimL=Math.round((tl.ventas-tl.tripletas)*100)/100;let html='<div style="color:#0284c7;font-size:.68rem;letter-spacing:2px;font-family:\'Oswald\',sans-serif;margin-bottom:6px">ZOOLO PERU (S/)</div><div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:12px"><div class="stat-box"><div class="stat-label">VENTAS ANIMALES</div><div class="stat-val">S/'+vAnimP.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">TRIPLETAS</div><div class="stat-val" style="color:#c084fc">S/'+tp.tripletas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">TOTAL INGRESOS</div><div class="stat-val" style="color:var(--gold)">S/'+tp.ventas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PREMIOS</div><div class="stat-val r">S/'+tp.premios.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">COMISIONES</div><div class="stat-val">S/'+tp.comisiones.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">BALANCE</div><div class="stat-val" style="color:'+(tp.balance>=0?'var(--green)':'var(--red)')+'">S/'+tp.balance.toFixed(2)+'</div></div></div>';html+='<div style="color:#a855f7;font-size:.68rem;letter-spacing:2px;font-family:\'Oswald\',sans-serif;margin-bottom:6px">ZOOLO PLUS (Bs)</div><div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:12px"><div class="stat-box"><div class="stat-label">VENTAS ANIMALES</div><div class="stat-val">Bs'+vAnimL.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">TRIPLETAS</div><div class="stat-val" style="color:#c084fc">Bs'+tl.tripletas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">TOTAL INGRESOS</div><div class="stat-val" style="color:var(--gold)">Bs'+tl.ventas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PREMIOS</div><div class="stat-val r">Bs'+tl.premios.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">COMISIONES</div><div class="stat-val">Bs'+tl.comisiones.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">BALANCE</div><div class="stat-val" style="color:'+(tl.balance>=0?'var(--green)':'var(--red)')+'">Bs'+tl.balance.toFixed(2)+'</div></div></div>';html+='<table class="tbl"><thead><tr><th>Fecha</th><th>Tk</th><th colspan="4" style="text-align:center;color:#0284c7">PERU (S/)</th><th colspan="4" style="text-align:center;color:#a855f7">PLUS (Bs)</th></tr><tr><th></th><th></th><th>Ventas</th><th>Trip.</th><th>Premios</th><th>Balance</th><th>Ventas</th><th>Trip.</th><th>Premios</th><th>Balance</th></tr></thead><tbody>';d.resumen_por_dia.forEach(function(r){var bcP=r.peru.balance>=0?'var(--green)':'var(--red)';var bcL=r.plus.balance>=0?'var(--green)':'var(--red)';html+='<tr><td>'+r.fecha+'</td><td>'+r.tickets+'</td><td style="color:var(--gold)">S/'+r.peru.ventas.toFixed(2)+'</td><td style="color:#c084fc">S/'+r.peru.tripletas.toFixed(2)+'</td><td style="color:var(--red)">S/'+r.peru.premios.toFixed(2)+'</td><td style="color:'+bcP+';font-weight:700">S/'+r.peru.balance.toFixed(2)+'</td><td style="color:var(--gold)">Bs'+r.plus.ventas.toFixed(2)+'</td><td style="color:#c084fc">Bs'+r.plus.tripletas.toFixed(2)+'</td><td style="color:var(--red)">Bs'+r.plus.premios.toFixed(2)+'</td><td style="color:'+bcL+';font-weight:700">Bs'+r.plus.balance.toFixed(2)+'</td></tr>';});html+='</tbody></table>';document.getElementById('rep-periodo').innerHTML=html;});}
-function cargarReporteAgencias(){let ini=document.getElementById('rep-ini').value,fin=document.getElementById('rep-fin').value;if(!ini||!fin){alert('Seleccione fechas');return;}fetch('/admin/reporte-agencias-rango',{method:'POST',headers:{'Content-Type':'application/json'},body:bodyVC({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json()).then(d=>{let tp=d.total.peru,tl=d.total.plus;let html='<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:12px 0"><div class="stat-box"><div class="stat-label">VENTAS PERU</div><div class="stat-val">S/'+tp.ventas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">BALANCE PERU</div><div class="stat-val '+(tp.balance>=0?'g':'r')+'">S/'+tp.balance.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">VENTAS PLUS</div><div class="stat-val">Bs'+tl.ventas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">BALANCE PLUS</div><div class="stat-val '+(tl.balance>=0?'g':'r')+'">Bs'+tl.balance.toFixed(2)+'</div></div></div>';html+='<table class="tbl"><thead><tr><th>Agencia</th><th>Tk</th><th colspan="3" style="text-align:center;color:#0284c7">PERU (S/)</th><th colspan="3" style="text-align:center;color:#a855f7">PLUS (Bs)</th></tr><tr><th></th><th></th><th>Ventas</th><th>Premios</th><th>Balance</th><th>Ventas</th><th>Premios</th><th>Balance</th></tr></thead><tbody>';d.agencias.forEach(a=>{let bcP=a.peru.balance>=0?'var(--green)':'var(--red)';let bcL=a.plus.balance>=0?'var(--green)':'var(--red)';html+='<tr><td><span style="color:var(--gold)">'+a.nombre+'</span><br><span style="color:var(--text2);font-size:.65rem">'+a.usuario+'</span></td><td>'+a.tickets+'</td><td>S/'+a.peru.ventas.toFixed(2)+'</td><td style="color:var(--red)">S/'+a.peru.premios_teoricos.toFixed(2)+'</td><td style="color:'+bcP+';font-family:\'Oswald\',sans-serif">S/'+a.peru.balance.toFixed(2)+'</td><td>Bs'+a.plus.ventas.toFixed(2)+'</td><td style="color:var(--red)">Bs'+a.plus.premios_teoricos.toFixed(2)+'</td><td style="color:'+bcL+';font-family:\'Oswald\',sans-serif">Bs'+a.plus.balance.toFixed(2)+'</td></tr>';});html+='</tbody></table>';document.getElementById('rep-periodo').innerHTML=html;});}
+function cargarReporteHoy(){fetch(urlVC('/admin/reporte-agencias')).then(r=>r.json()).then(d=>{let html='<table class="tbl"><thead><tr><th>Agencia</th><th>Tickets</th><th colspan="4" style="text-align:center;color:#0284c7">ZOOLO PERU (S/)</th><th colspan="4" style="text-align:center;color:#a855f7">ZOOLO PLUS (Bs)</th></tr><tr><th></th><th></th><th>Ventas</th><th>Premios</th><th>Comisión</th><th>Balance</th><th>Ventas</th><th>Premios</th><th>Comisión</th><th>Balance</th></tr></thead><tbody>';d.agencias.forEach(a=>{let bcP=a.peru.balance>=0?'var(--green)':'var(--red)';let bcL=a.plus.balance>=0?'var(--green)':'var(--red)';html+='<tr><td><span style="color:var(--gold)">'+a.nombre+'</span><br><span style="color:var(--text2);font-size:.65rem">'+a.usuario+'</span></td><td>'+a.tickets+'</td><td>S/'+a.peru.ventas.toFixed(2)+'</td><td style="color:var(--red)">S/'+a.peru.premios_total.toFixed(2)+'</td><td>S/'+a.peru.comision.toFixed(2)+'</td><td style="color:'+bcP+';font-weight:700">S/'+a.peru.balance.toFixed(2)+'</td><td>Bs'+a.plus.ventas.toFixed(2)+'</td><td style="color:var(--red)">Bs'+a.plus.premios_total.toFixed(2)+'</td><td>Bs'+a.plus.comision.toFixed(2)+'</td><td style="color:'+bcL+';font-weight:700">Bs'+a.plus.balance.toFixed(2)+'</td></tr>';});html+='<tfoot><tr><td colspan="2" style="color:var(--gold)">GLOBAL</td><td>S/'+d.global.peru.ventas.toFixed(2)+'</td><td style="color:var(--red)">S/'+d.global.peru.pagos.toFixed(2)+'</td><td>S/'+d.global.peru.comisiones.toFixed(2)+'</td><td style="color:'+(d.global.peru.balance>=0?'var(--green)':'var(--red)')+';font-weight:700">S/'+d.global.peru.balance.toFixed(2)+'</td><td>Bs'+d.global.plus.ventas.toFixed(2)+'</td><td style="color:var(--red)">Bs'+d.global.plus.pagos.toFixed(2)+'</td><td>Bs'+d.global.plus.comisiones.toFixed(2)+'</td><td style="color:'+(d.global.plus.balance>=0?'var(--green)':'var(--red)')+';font-weight:700">Bs'+d.global.plus.balance.toFixed(2)+'</td></tr></tfoot></table>';html+='<div style="color:#c084fc;font-family:Oswald,sans-serif;font-size:.72rem;letter-spacing:1px;margin:14px 0 6px">🎲 TRIPLE / TERMINAL / MAS 1 (pote 67/33 — independiente del 70/30)</div>';html+='<table class="tbl"><thead><tr><th>Agencia</th><th>Triple</th><th>Terminal</th><th>Mas1</th><th>Total</th><th>Premios</th><th>Balance</th></tr></thead><tbody>';d.agencias.forEach(function(a){var tri=a.triple||{venta_triple:0,venta_terminal:0,venta_mas1:0,total:0,premio_total:0,balance:0};if(tri.total<=0&&tri.venta_mas1<=0)return;html+='<tr><td style="color:var(--gold)">'+a.nombre+'</td><td>S/'+tri.venta_triple.toFixed(2)+'</td><td>S/'+tri.venta_terminal.toFixed(2)+'</td><td style="color:#c084fc">S/'+tri.venta_mas1.toFixed(2)+'</td><td style="font-weight:700">S/'+tri.total.toFixed(2)+'</td><td style="color:var(--red)">S/'+tri.premio_total.toFixed(2)+'</td><td style="color:'+(tri.balance>=0?'var(--green)':'var(--red)')+'">S/'+tri.balance.toFixed(2)+'</td></tr>';});var tg=d.global.triple||{venta_triple:0,venta_terminal:0,venta_mas1:0,premio_total:0,balance:0};var tgTotal=(tg.venta_triple+tg.venta_terminal+tg.venta_mas1);html+='<tfoot><tr><td style="color:#c084fc">GLOBAL</td><td>S/'+tg.venta_triple.toFixed(2)+'</td><td>S/'+tg.venta_terminal.toFixed(2)+'</td><td style="color:#c084fc">S/'+tg.venta_mas1.toFixed(2)+'</td><td style="font-weight:700">S/'+tgTotal.toFixed(2)+'</td><td style="color:var(--red)">S/'+tg.premio_total.toFixed(2)+'</td><td style="color:'+(tg.balance>=0?'var(--green)':'var(--red)')+';font-weight:700">S/'+tg.balance.toFixed(2)+'</td></tr></tfoot></table>';document.getElementById('rep-hoy').innerHTML=html;document.getElementById('btn-csv').disabled=false;document.getElementById('btn-csv').style.opacity=1;});}
+function cargarEstadisticas(){let ini=document.getElementById('rep-ini').value,fin=document.getElementById('rep-fin').value;if(!ini||!fin){alert('Seleccione fechas');return;}fetch('/admin/estadisticas-rango',{method:'POST',headers:{'Content-Type':'application/json'},body:bodyVC({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json()).then(d=>{let tp=d.totales.peru,tl=d.totales.plus;let vAnimP=Math.round((tp.ventas-tp.tripletas)*100)/100;let vAnimL=Math.round((tl.ventas-tl.tripletas)*100)/100;let html='<div style="color:#0284c7;font-size:.68rem;letter-spacing:2px;font-family:\'Oswald\',sans-serif;margin-bottom:6px">ZOOLO PERU (S/)</div><div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:12px"><div class="stat-box"><div class="stat-label">VENTAS ANIMALES</div><div class="stat-val">S/'+vAnimP.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">TRIPLETAS</div><div class="stat-val" style="color:#c084fc">S/'+tp.tripletas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">TOTAL INGRESOS</div><div class="stat-val" style="color:var(--gold)">S/'+tp.ventas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PREMIOS</div><div class="stat-val r">S/'+tp.premios.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">COMISIONES</div><div class="stat-val">S/'+tp.comisiones.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">BALANCE</div><div class="stat-val" style="color:'+(tp.balance>=0?'var(--green)':'var(--red)')+'">S/'+tp.balance.toFixed(2)+'</div></div></div>';html+='<div style="color:#a855f7;font-size:.68rem;letter-spacing:2px;font-family:\'Oswald\',sans-serif;margin-bottom:6px">ZOOLO PLUS (Bs)</div><div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:12px"><div class="stat-box"><div class="stat-label">VENTAS ANIMALES</div><div class="stat-val">Bs'+vAnimL.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">TRIPLETAS</div><div class="stat-val" style="color:#c084fc">Bs'+tl.tripletas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">TOTAL INGRESOS</div><div class="stat-val" style="color:var(--gold)">Bs'+tl.ventas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PREMIOS</div><div class="stat-val r">Bs'+tl.premios.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">COMISIONES</div><div class="stat-val">Bs'+tl.comisiones.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">BALANCE</div><div class="stat-val" style="color:'+(tl.balance>=0?'var(--green)':'var(--red)')+'">Bs'+tl.balance.toFixed(2)+'</div></div></div>';html+='<table class="tbl"><thead><tr><th>Fecha</th><th>Tk</th><th colspan="4" style="text-align:center;color:#0284c7">PERU (S/)</th><th colspan="4" style="text-align:center;color:#a855f7">PLUS (Bs)</th></tr><tr><th></th><th></th><th>Ventas</th><th>Trip.</th><th>Premios</th><th>Balance</th><th>Ventas</th><th>Trip.</th><th>Premios</th><th>Balance</th></tr></thead><tbody>';d.resumen_por_dia.forEach(function(r){var bcP=r.peru.balance>=0?'var(--green)':'var(--red)';var bcL=r.plus.balance>=0?'var(--green)':'var(--red)';html+='<tr><td>'+r.fecha+'</td><td>'+r.tickets+'</td><td style="color:var(--gold)">S/'+r.peru.ventas.toFixed(2)+'</td><td style="color:#c084fc">S/'+r.peru.tripletas.toFixed(2)+'</td><td style="color:var(--red)">S/'+r.peru.premios.toFixed(2)+'</td><td style="color:'+bcP+';font-weight:700">S/'+r.peru.balance.toFixed(2)+'</td><td style="color:var(--gold)">Bs'+r.plus.ventas.toFixed(2)+'</td><td style="color:#c084fc">Bs'+r.plus.tripletas.toFixed(2)+'</td><td style="color:var(--red)">Bs'+r.plus.premios.toFixed(2)+'</td><td style="color:'+bcL+';font-weight:700">Bs'+r.plus.balance.toFixed(2)+'</td></tr>';});html+='</tbody></table>';var tt=d.totales.triple;if(tt){html+='<div style="color:#c084fc;font-size:.68rem;letter-spacing:2px;font-family:\'Oswald\',sans-serif;margin:16px 0 6px">🎲 TRIPLE / TERMINAL / MAS 1 (pote 67/33 — independiente del 70/30)</div><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px"><div class="stat-box"><div class="stat-label">VENTA TRIPLE</div><div class="stat-val">S/'+tt.venta_triple.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">VENTA TERMINAL</div><div class="stat-val">S/'+tt.venta_terminal.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">VENTA MAS 1</div><div class="stat-val" style="color:#c084fc">S/'+tt.venta_mas1.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">TOTAL</div><div class="stat-val" style="color:var(--gold)">S/'+tt.total.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PREMIOS</div><div class="stat-val r">S/'+tt.premio_total.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">BALANCE</div><div class="stat-val '+(tt.balance>=0?'g':'r')+'">S/'+tt.balance.toFixed(2)+'</div></div></div>';}document.getElementById('rep-periodo').innerHTML=html;});}
+function cargarReporteAgencias(){let ini=document.getElementById('rep-ini').value,fin=document.getElementById('rep-fin').value;if(!ini||!fin){alert('Seleccione fechas');return;}fetch('/admin/reporte-agencias-rango',{method:'POST',headers:{'Content-Type':'application/json'},body:bodyVC({fecha_inicio:ini,fecha_fin:fin})}).then(r=>r.json()).then(d=>{let tp=d.total.peru,tl=d.total.plus;let html='<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:12px 0"><div class="stat-box"><div class="stat-label">VENTAS PERU</div><div class="stat-val">S/'+tp.ventas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">BALANCE PERU</div><div class="stat-val '+(tp.balance>=0?'g':'r')+'">S/'+tp.balance.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">VENTAS PLUS</div><div class="stat-val">Bs'+tl.ventas.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">BALANCE PLUS</div><div class="stat-val '+(tl.balance>=0?'g':'r')+'">Bs'+tl.balance.toFixed(2)+'</div></div></div>';html+='<table class="tbl"><thead><tr><th>Agencia</th><th>Tk</th><th colspan="3" style="text-align:center;color:#0284c7">PERU (S/)</th><th colspan="3" style="text-align:center;color:#a855f7">PLUS (Bs)</th></tr><tr><th></th><th></th><th>Ventas</th><th>Premios</th><th>Balance</th><th>Ventas</th><th>Premios</th><th>Balance</th></tr></thead><tbody>';d.agencias.forEach(a=>{let bcP=a.peru.balance>=0?'var(--green)':'var(--red)';let bcL=a.plus.balance>=0?'var(--green)':'var(--red)';html+='<tr><td><span style="color:var(--gold)">'+a.nombre+'</span><br><span style="color:var(--text2);font-size:.65rem">'+a.usuario+'</span></td><td>'+a.tickets+'</td><td>S/'+a.peru.ventas.toFixed(2)+'</td><td style="color:var(--red)">S/'+a.peru.premios_teoricos.toFixed(2)+'</td><td style="color:'+bcP+';font-family:\'Oswald\',sans-serif">S/'+a.peru.balance.toFixed(2)+'</td><td>Bs'+a.plus.ventas.toFixed(2)+'</td><td style="color:var(--red)">Bs'+a.plus.premios_teoricos.toFixed(2)+'</td><td style="color:'+bcL+';font-family:\'Oswald\',sans-serif">Bs'+a.plus.balance.toFixed(2)+'</td></tr>';});html+='</tbody></table>';var tt2=d.triple_total;if(tt2){html+='<div style="color:#c084fc;font-size:.68rem;letter-spacing:2px;font-family:\'Oswald\',sans-serif;margin:16px 0 6px">🎲 TRIPLE / TERMINAL / MAS 1 (pote 67/33 — independiente del 70/30)</div><table class="tbl"><thead><tr><th>Agencia</th><th>Triple</th><th>Terminal</th><th>Mas1</th><th>Total</th><th>Premios</th><th>Balance</th></tr></thead><tbody>';d.agencias.forEach(function(a){var tri=a.triple;if(!tri||(tri.total<=0&&tri.venta_mas1<=0))return;html+='<tr><td style="color:var(--gold)">'+a.nombre+'</td><td>S/'+tri.venta_triple.toFixed(2)+'</td><td>S/'+tri.venta_terminal.toFixed(2)+'</td><td style="color:#c084fc">S/'+tri.venta_mas1.toFixed(2)+'</td><td style="font-weight:700">S/'+tri.total.toFixed(2)+'</td><td style="color:var(--red)">S/'+tri.premio_total.toFixed(2)+'</td><td style="color:'+(tri.balance>=0?'var(--green)':'var(--red)')+'">S/'+tri.balance.toFixed(2)+'</td></tr>';});var ttTotal=(tt2.venta_triple+tt2.venta_terminal+tt2.venta_mas1);html+='<tfoot><tr><td style="color:#c084fc">TOTAL</td><td>S/'+tt2.venta_triple.toFixed(2)+'</td><td>S/'+tt2.venta_terminal.toFixed(2)+'</td><td style="color:#c084fc">S/'+tt2.venta_mas1.toFixed(2)+'</td><td style="font-weight:700">S/'+ttTotal.toFixed(2)+'</td><td style="color:var(--red)">S/'+tt2.premio_total.toFixed(2)+'</td><td style="color:'+(tt2.balance>=0?'var(--green)':'var(--red)')+';font-weight:700">S/'+tt2.balance.toFixed(2)+'</td></tr></tfoot></table>';}document.getElementById('rep-periodo').innerHTML=html;});}
 
 function cargarTicketsDetalle(){
   let ini=document.getElementById('tkd-ini').value,fin=document.getElementById('tkd-fin').value;
@@ -5104,10 +6073,12 @@ function cargarTicketsDetalle(){
       let html='';
       tickets.forEach(function(t){
         let estado=t.anulado?'<span class="badge n" style="background:#7c2d12">ANULADO</span>':(t.pagado?'<span class="badge p">PAGADO</span>':'<span class="badge g">PENDIENTE</span>');
-        let totales=[];if(t.total_peru>0)totales.push('S/'+t.total_peru.toFixed(2));if(t.total_plus>0)totales.push('Bs'+t.total_plus.toFixed(2));
-        html+='<div class="tcard"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><div class="ts">#'+t.serial+' <span style="color:#c084fc;font-size:.68rem;font-weight:400">'+t.agencia+'</span> <span style="color:#4a6090;font-size:.68rem;font-weight:400">'+t.fecha+'</span></div><div>'+estado+' <span style="color:var(--gold);font-weight:700">'+totales.join(' / ')+'</span></div></div>';
+        let totalesLinea=[];if(t.total_peru>0)totalesLinea.push('<span style="color:#0284c7">Perú S/'+t.total_peru.toFixed(2)+'</span>');if(t.total_plus>0)totalesLinea.push('<span style="color:#a855f7">Plus Bs'+t.total_plus.toFixed(2)+'</span>');if(t.total_triple>0)totalesLinea.push('<span style="color:#c084fc">Triple/Term/Mas1 S/'+t.total_triple.toFixed(2)+'</span>');
+        html+='<div class="tcard"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><div class="ts">#'+t.serial+' <span style="color:#c084fc;font-size:.68rem;font-weight:400">'+t.agencia+'</span> <span style="color:#4a6090;font-size:.68rem;font-weight:400">'+t.fecha+'</span></div><div>'+estado+'</div></div>';
+        html+='<div style="font-size:.7rem;margin-bottom:6px;display:flex;gap:10px;flex-wrap:wrap">'+totalesLinea.join(' &middot; ')+'</div>';
         t.jugadas.forEach(function(j){let simbJ=j.loteria==='plus'?'Bs':'S/';html+='<div class="jrow"><span>'+j.hora+' — '+(j.tipo==='animal'?(j.seleccion+' '+j.nombre):j.seleccion)+'</span><span>'+simbJ+j.monto+'</span></div>';});
         t.tripletas.forEach(function(tr){let simbT=tr.loteria==='plus'?'Bs':'S/';html+='<div class="trip-row"><span>TRIPLETA '+tr.animales+'</span><span>'+simbT+tr.monto+'</span></div>';});
+        (t.triples||[]).forEach(function(tg){let etq=tg.etiqueta;let res=tg.resultado?(' → '+tg.resultado):'';let ganoTag=tg.gano?' <span class="tag ok" style="font-size:.55rem">GANÓ S/'+tg.premio.toFixed(2)+'</span>':'';html+='<div class="jrow" style="border-left-color:#7c3aed;background:#faf5ff"><span style="color:#7c3aed">'+tg.hora+' — '+etq+res+ganoTag+'</span><span>S/'+tg.monto+'</span></div>';});
         html+='</div>';
       });
       c.innerHTML=html;
@@ -5192,7 +6163,177 @@ function cargarTriplePanel(){
   var hoy=new Date().toISOString().split('T')[0];
   var tf=document.getElementById('tri-fecha'); if(tf&&!tf.value)tf.value=hoy;
   var mf=document.getElementById('m1-fecha'); if(mf&&!mf.value)mf.value=_proxViernesISO();
-  cargarEstadoAutoTriple();cargarTripleResultados();cargarTripleRiesgo();
+  if(ES_SUPER){
+    cargarEstadoAutoTriple();cargarTripleResultados();cargarTripleRiesgo();
+    cargarSchedulerEstado();
+  }
+  poblarSelectsAdminTriple();
+}
+function ctbToggleRango(){var v=document.getElementById('ctb-periodo').value;var show=(v==='rango');document.getElementById('ctb-fi-box').style.display=show?'block':'none';document.getElementById('ctb-ff-box').style.display=show?'block':'none';}
+function cteToggleRango(){var v=document.getElementById('cte-periodo').value;var show=(v==='rango');document.getElementById('cte-fi-box').style.display=show?'block':'none';document.getElementById('cte-ff-box').style.display=show?'block':'none';}
+function m1cToggleFecha(){var v=document.getElementById('m1c-ciclo').value;document.getElementById('m1c-fecha-box').style.display=(v==='fecha')?'block':'none';}
+
+function cargarContabilidadTriple(){
+  var periodo=document.getElementById('ctb-periodo').value;
+  var url='/admin/triple/reporte?periodo='+periodo;
+  if(periodo==='rango'){var fi=document.getElementById('ctb-fi').value,ff=document.getElementById('ctb-ff').value;if(!fi||!ff){alert('Seleccione fechas');return;}url+='&fecha_inicio='+fi+'&fecha_fin='+ff;}
+  var adminSel=document.getElementById('ctb-admin');
+  if(adminSel&&adminSel.value)url+='&admin_id='+adminSel.value;
+  var c=document.getElementById('ctb-resultado');
+  c.innerHTML='<div style="color:var(--text2);padding:10px">Cargando...</div>';
+  fetch(url).then(function(r){return r.json();}).then(function(d){
+    if(d.error){c.innerHTML='<div style="color:var(--red)">'+d.error+'</div>';return;}
+    var t=d.total;
+    var html='<div style="color:var(--text2);font-size:.68rem;margin-bottom:6px">'+d.fecha_inicio+' al '+d.fecha_fin+'</div>';
+    html+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px">';
+    html+='<div class="stat-box"><div class="stat-label">TRIPLE + TERMINAL</div><div class="stat-val">S/'+(t.venta_triple+t.venta_terminal).toFixed(2)+'</div></div>';
+    html+='<div class="stat-box"><div class="stat-label">MAS 1</div><div class="stat-val" style="color:#c084fc">S/'+t.venta_mas1.toFixed(2)+'</div></div>';
+    html+='<div class="stat-box"><div class="stat-label">BALANCE</div><div class="stat-val '+(t.balance>=0?'g':'r')+'">S/'+t.balance.toFixed(2)+'</div></div>';
+    html+='</div>';
+    if(d.origenes){
+      html+='<div style="color:var(--gold);font-family:Oswald,sans-serif;font-size:.7rem;letter-spacing:1px;margin:10px 0 6px">POR ADMINISTRADOR (origen)</div>';
+      html+='<table class="tbl"><thead><tr><th>Administrador</th><th>Triple</th><th>Terminal</th><th>Mas1</th><th>Total</th><th>Balance</th></tr></thead><tbody>';
+      d.origenes.forEach(function(o){
+        html+='<tr><td style="color:var(--gold)">'+o.admin_nombre+'</td><td>S/'+o.venta_triple.toFixed(2)+'</td><td>S/'+o.venta_terminal.toFixed(2)+'</td><td style="color:#c084fc">S/'+o.venta_mas1.toFixed(2)+'</td><td style="font-weight:700">S/'+o.total.toFixed(2)+'</td><td style="color:'+(o.balance>=0?'var(--green)':'var(--red)')+'">S/'+o.balance.toFixed(2)+'</td></tr>';
+      });
+      html+='</tbody></table>';
+    }
+    html+='<div style="color:var(--text2);font-family:Oswald,sans-serif;font-size:.68rem;letter-spacing:1px;margin:10px 0 6px">POR AGENCIA</div>';
+    if(!d.agencias.length)html+='<div style="color:var(--text2);padding:6px">Sin ventas en el período</div>';
+    else{
+      html+='<table class="tbl"><thead><tr><th>Agencia</th><th>Admin</th><th>Triple</th><th>Terminal</th><th>Mas1</th><th>Total</th><th>Premios</th><th>Balance</th></tr></thead><tbody>';
+      d.agencias.forEach(function(a){
+        html+='<tr><td style="color:var(--gold)">'+a.nombre+'</td><td style="color:var(--text2);font-size:.68rem">'+a.admin_nombre+'</td><td>S/'+a.venta_triple.toFixed(2)+'</td><td>S/'+a.venta_terminal.toFixed(2)+'</td><td style="color:#c084fc">S/'+a.venta_mas1.toFixed(2)+'</td><td style="font-weight:700">S/'+a.total.toFixed(2)+'</td><td style="color:var(--red)">S/'+a.premio_total.toFixed(2)+'</td><td style="color:'+(a.balance>=0?'var(--green)':'var(--red)')+'">S/'+a.balance.toFixed(2)+'</td></tr>';
+      });
+      html+='</tbody></table>';
+    }
+    c.innerHTML=html;
+  }).catch(function(){c.innerHTML='<div style="color:var(--red)">Error de conexión</div>';});
+}
+
+function exportarCSVTripleGlobal(){
+  var periodo=document.getElementById('ctb-periodo').value;
+  var d0,d1;
+  var hoyDt=new Date();
+  function fmtD(d){return d.toISOString().split('T')[0];}
+  if(periodo==='rango'){
+    d0=document.getElementById('ctb-fi').value;d1=document.getElementById('ctb-ff').value;
+    if(!d0||!d1){alert('Seleccione fechas');return;}
+  }else if(periodo==='semana'){
+    var diaSemana=(hoyDt.getDay()+6)%7; // 0=lunes ... 6=domingo (mismo criterio que _rango_periodo del backend)
+    var lunes=new Date(hoyDt); lunes.setDate(hoyDt.getDate()-diaSemana);
+    d0=fmtD(lunes); d1=fmtD(hoyDt);
+  }else if(periodo==='mes'){
+    var primero=new Date(hoyDt.getFullYear(),hoyDt.getMonth(),1);
+    d0=fmtD(primero); d1=fmtD(hoyDt);
+  }else{
+    d0=fmtD(hoyDt); d1=fmtD(hoyDt);
+  }
+  fetch('/admin/exportar-csv-triple-global',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha_inicio:d0,fecha_fin:d1})}).then(function(r){return r.blob();}).then(function(blob){var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='triple_global_'+d0+'_'+d1+'.csv';a.click();});
+}
+
+function cargarCorteTripleTerminal(){
+  var periodo=document.getElementById('cte-periodo').value;
+  var url='/admin/corte-administrador?periodo='+periodo;
+  if(periodo==='rango'){var fi=document.getElementById('cte-fi').value,ff=document.getElementById('cte-ff').value;if(!fi||!ff){alert('Seleccione fechas');return;}url+='&fecha_inicio='+fi+'&fecha_fin='+ff;}
+  var adminSel=document.getElementById('cte-admin');
+  if(adminSel&&adminSel.value)url+='&admin_id='+adminSel.value;
+  var c=document.getElementById('cte-resultado');
+  c.innerHTML='<div style="color:var(--text2);padding:10px">Cargando...</div>';
+  fetch(url).then(function(r){return r.json();}).then(function(d){
+    if(d.error){c.innerHTML='<div style="color:var(--red)">'+d.error+'</div>';return;}
+    var html='<div style="color:var(--gold);font-family:Oswald,sans-serif;margin-bottom:8px">'+d.admin_nombre+' — '+d.fecha_inicio+' al '+d.fecha_fin+'</div>';
+    html+='<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px">';
+    html+='<div class="stat-box"><div class="stat-label">TRIPLE</div><div class="stat-val">S/'+d.triple.toFixed(2)+'</div></div>';
+    html+='<div class="stat-box"><div class="stat-label">TERMINAL</div><div class="stat-val">S/'+d.terminal.toFixed(2)+'</div></div>';
+    html+='<div class="stat-box"><div class="stat-label">SUBTOTAL T+T</div><div class="stat-val t">S/'+d.subtotal_triple_terminal.toFixed(2)+'</div></div>';
+    html+='<div class="stat-box"><div class="stat-label">TOTAL VENDIDO</div><div class="stat-val" style="color:var(--gold)">S/'+d.total_vendido.toFixed(2)+'</div></div>';
+    html+='</div>';
+    html+='<div style="background:var(--card);border:1px solid #7c3aed;border-radius:4px;padding:8px;margin-bottom:10px;color:#c084fc">MAS 1 ciclo actual (vie '+d.viernes_ciclo+'): <b>S/'+d.mas1_ciclo_actual.toFixed(2)+'</b></div>';
+    html+='<table class="tbl"><thead><tr><th>Agencia</th><th>Triple</th><th>Terminal</th><th>T+T</th><th>Mas1 ciclo</th><th>Total corte</th></tr></thead><tbody>';
+    d.agencias.forEach(function(a){
+      html+='<tr><td style="color:var(--gold)">'+a.nombre+'</td><td>S/'+a.venta_triple.toFixed(2)+'</td><td>S/'+a.venta_terminal.toFixed(2)+'</td><td>S/'+a.subtotal_triple_terminal.toFixed(2)+'</td><td style="color:#c084fc">S/'+a.venta_mas1_ciclo.toFixed(2)+'</td><td style="font-weight:700">S/'+a.total_corte.toFixed(2)+'</td></tr>';
+    });
+    html+='</tbody></table>';
+    c.innerHTML=html;
+  }).catch(function(){c.innerHTML='<div style="color:var(--red)">Error de conexión</div>';});
+}
+
+function cargarMas1Corte(){
+  var ciclo=document.getElementById('m1c-ciclo').value;
+  var url='/admin/mas1/reporte?ciclo='+ciclo;
+  if(ciclo==='fecha'){var f=document.getElementById('m1c-fecha').value;if(!f){alert('Elige un viernes');return;}url+='&viernes='+f;}
+  var adminSel=document.getElementById('m1c-admin');
+  if(adminSel&&adminSel.value)url+='&admin_id='+adminSel.value;
+  var c=document.getElementById('m1c-resultado');
+  c.innerHTML='<div style="color:var(--text2);padding:10px">Cargando...</div>';
+  fetch(url).then(function(r){return r.json();}).then(function(d){
+    if(d.error){c.innerHTML='<div style="color:var(--red)">'+d.error+'</div>';return;}
+    var html='<div style="color:var(--gold);font-family:Oswald,sans-serif;margin-bottom:8px">Sorteo viernes '+d.viernes+'</div>';
+    var resStr=d.resultado?(d.resultado.digito+' + '+d.resultado.animal+' - '+d.resultado.nombre):'Sin resultado aún';
+    html+='<div style="background:var(--card);border:1px solid #7c3aed;border-radius:4px;padding:8px;margin-bottom:10px;color:#c084fc">Resultado: <b>'+resStr+'</b></div>';
+    html+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px">';
+    html+='<div class="stat-box"><div class="stat-label">VENDIDO</div><div class="stat-val">S/'+d.vendido_total.toFixed(2)+'</div></div>';
+    html+='<div class="stat-box"><div class="stat-label">PREMIO COMPROMETIDO</div><div class="stat-val r">S/'+d.premio_comprometido.toFixed(2)+'</div></div>';
+    html+='<div class="stat-box"><div class="stat-label">BALANCE</div><div class="stat-val '+(d.balance>=0?'g':'r')+'">S/'+d.balance.toFixed(2)+'</div></div>';
+    html+='</div>';
+    var pm=d.pote_mensual;
+    html+='<div style="color:var(--text2);font-size:.66rem;margin-bottom:10px">Pote del mes ('+pm.mes+'): vendido S/'+pm.vendido_mes.toFixed(2)+' · 67% S/'+pm.presupuesto_67.toFixed(2)+' · pagado S/'+pm.pagado_mes.toFixed(2)+' · disponible S/'+pm.disponible.toFixed(2)+'</div>';
+    if(d.origenes){
+      html+='<div style="color:var(--gold);font-family:Oswald,sans-serif;font-size:.7rem;letter-spacing:1px;margin:8px 0 6px">POR ADMINISTRADOR</div>';
+      html+='<table class="tbl"><thead><tr><th>Administrador</th><th>Vendido</th><th>Premio</th></tr></thead><tbody>';
+      d.origenes.forEach(function(o){html+='<tr><td style="color:var(--gold)">'+o.admin_nombre+'</td><td>S/'+o.venta_mas1.toFixed(2)+'</td><td style="color:var(--red)">S/'+o.premio_mas1.toFixed(2)+'</td></tr>';});
+      html+='</tbody></table>';
+    }
+    html+='<div style="color:var(--text2);font-family:Oswald,sans-serif;font-size:.68rem;letter-spacing:1px;margin:10px 0 6px">POR AGENCIA</div>';
+    if(!d.agencias.length)html+='<div style="color:var(--text2);padding:6px">Sin apuestas este ciclo</div>';
+    else{
+      html+='<table class="tbl"><thead><tr><th>Agencia</th><th>Admin</th><th>Vendido</th><th>Premio</th></tr></thead><tbody>';
+      d.agencias.forEach(function(a){html+='<tr><td style="color:var(--gold)">'+a.nombre+'</td><td style="color:var(--text2);font-size:.68rem">'+a.admin_nombre+'</td><td>S/'+a.venta_mas1.toFixed(2)+'</td><td style="color:var(--red)">S/'+a.premio_mas1.toFixed(2)+'</td></tr>';});
+      html+='</tbody></table>';
+    }
+    c.innerHTML=html;
+  }).catch(function(){c.innerHTML='<div style="color:var(--red)">Error de conexión</div>';});
+}
+
+function cargarSchedulerEstado(){
+  var c=document.getElementById('sched-estado');
+  if(!c)return;
+  fetch('/admin/scheduler-estado').then(function(r){return r.json();}).then(function(d){
+    if(d.error){c.innerHTML='<div style="color:var(--red)">'+d.error+'</div>';return;}
+    var estadoStr=d.scheduler_activo?'<span style="color:var(--green);font-weight:700">✅ ACTIVO</span>':'<span style="color:var(--red);font-weight:700">⚠️ CAÍDO / SIN RESPUESTA</span>';
+    var html='<div style="margin-bottom:8px">SCHEDULER: '+estadoStr+' <span style="color:var(--text2);font-size:.65rem">(último heartbeat: '+(d.ultimo_heartbeat_peru||'nunca')+')</span></div>';
+    html+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">';
+    html+='<div class="stat-box"><div class="stat-label">ZOOLO AUTO</div><div class="stat-val '+(d.auto_zoolo==='on'?'g':'r')+'">'+(d.auto_zoolo==='on'?'ON':'OFF')+'</div><div style="font-size:.62rem;color:var(--text2);margin-top:3px">Próx: '+(d.proximo_peru||'—')+'</div></div>';
+    html+='<div class="stat-box"><div class="stat-label">TRIPLE AUTO</div><div class="stat-val '+(d.auto_triple==='on'?'g':'r')+'">'+(d.auto_triple==='on'?'ON':'OFF')+'</div><div style="font-size:.62rem;color:var(--text2);margin-top:3px">Próx: '+(d.proximo_triple||'—')+'</div></div>';
+    html+='</div>';
+    html+='<div style="font-size:.68rem;color:var(--text2);margin-bottom:8px">Plus próx: '+(d.proximo_plus||'—')+' &middot; Más 1 próx: '+(d.proximo_mas1||'—')+'</div>';
+    if(d.pendientes&&d.pendientes.length){
+      html+='<div style="background:rgba(239,68,68,.1);border:1px solid var(--red);border-radius:4px;padding:8px;margin-bottom:8px"><div style="color:var(--red);font-weight:700;margin-bottom:4px">⚠️ RESULTADOS PENDIENTES</div>';
+      d.pendientes.forEach(function(p){html+='<div style="font-size:.7rem;color:var(--text)">• '+p+'</div>';});
+      html+='</div><button class="btn red" onclick="recuperarSorteosPendientes()">🔄 RECUPERAR SORTEOS PENDIENTES</button>';
+    }else{
+      html+='<div style="color:var(--green);font-size:.72rem">✅ Sin sorteos pendientes</div>';
+    }
+    c.innerHTML=html;
+  }).catch(function(){c.innerHTML='<div style="color:var(--red)">Error de conexión</div>';});
+}
+function recuperarSorteosPendientes(){
+  fetch('/admin/recuperar-sorteos',{method:'POST'}).then(function(r){return r.json();}).then(function(d){
+    if(d.status==='ok'){alert(d.mensaje+(d.sistemas&&d.sistemas.length?(' ('+d.sistemas.join(', ')+')'):''));cargarSchedulerEstado();cargarTripleResultados();cargarResultadosAdmin();}
+    else alert(d.error||'Error');
+  }).catch(function(){alert('Error de conexión');});
+}
+
+function poblarSelectsAdminTriple(){
+  if(!ES_SUPER)return;
+  fetch('/admin/lista-admins').then(function(r){return r.json();}).then(function(admins){
+    ['ctb-admin','cte-admin','m1c-admin'].forEach(function(id){
+      var sel=document.getElementById(id);
+      if(!sel||sel.options.length>1)return;
+      admins.forEach(function(a){var o=document.createElement('option');o.value=a.id;o.textContent=a.nombre_agencia;sel.appendChild(o);});
+    });
+  }).catch(function(){});
 }
 function actualizarEstadoToggleTriple(e){var b=document.getElementById('toggle-triple-btn');if(!b)return;if(e==='on'){b.className='toggle-btn on';b.textContent='▶ ACTIVADO';}else{b.className='toggle-btn off';b.textContent='⏸ DESACTIVADO';}}
 function cargarEstadoAutoTriple(){fetch('/admin/estado-autosorteo-triple').then(function(r){return r.json();}).then(function(d){actualizarEstadoToggleTriple(d.estado);}).catch(function(){});}
@@ -5200,7 +6341,33 @@ function toggleAutoTriple(){if(typeof bloquearSiSoloLectura==='function'&&bloque
 function guardarTripleManual(){var f=document.getElementById('tri-fecha').value,h=document.getElementById('tri-hora').value,n=document.getElementById('tri-numero').value.trim();if(!/^[0-9]{1,3}$/.test(n)){showMsg('msg-tri','Número 000-999','err');return;}fetch('/admin/guardar-resultado-triple',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:f,hora:h,numero:n})}).then(function(r){return r.json();}).then(function(d){if(d.status==='ok'){showMsg('msg-tri','✅ '+d.mensaje,'ok');cargarTripleResultados();cargarTripleRiesgo();}else showMsg('msg-tri','❌ '+d.error,'err');}).catch(function(){showMsg('msg-tri','Error de conexión','err');});}
 function guardarMas1Manual(){var f=document.getElementById('m1-fecha').value,dg=document.getElementById('m1-digito').value,an=document.getElementById('m1-animal').value;if(dg===''){showMsg('msg-m1','Dígito 0-9','err');return;}fetch('/admin/guardar-resultado-mas1',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:f,digito:dg,animal:an})}).then(function(r){return r.json();}).then(function(d){if(d.status==='ok'){showMsg('msg-m1','✅ '+d.mensaje,'ok');cargarTripleResultados();}else showMsg('msg-m1','❌ '+d.error,'err');}).catch(function(){showMsg('msg-m1','Error de conexión','err');});}
 function cargarTripleResultados(){var tf=document.getElementById('tri-fecha');var f=tf?tf.value:'';fetch('/admin/resultados-triple-hoy'+(f?('?fecha='+f):'')).then(function(r){return r.json();}).then(function(d){var html='<table class="tbl"><thead><tr><th>Hora</th><th>Triple</th><th>Terminal</th></tr></thead><tbody>';d.triples.forEach(function(t){html+='<tr><td style="color:var(--teal);font-family:Oswald,sans-serif">'+t.hora+'</td><td style="color:var(--gold);font-family:Oswald,sans-serif;font-size:1rem">'+(t.numero||'—')+'</td><td style="color:#4ade80;font-family:Oswald,sans-serif">'+(t.terminal||'—')+'</td></tr>';});html+='</tbody></table><div style="margin-top:10px;padding:8px;background:var(--card);border:1px solid #7c3aed;border-radius:4px;color:#c084fc"><b>MÁS 1</b> (vie '+d.viernes+'): '+(d.mas1?(d.mas1.digito+' + '+d.mas1.animal+' - '+d.mas1.nombre):'Sin resultado')+'</div>';document.getElementById('tri-resultados').innerHTML=html;}).catch(function(){});}
-function cargarTripleRiesgo(){var tf=document.getElementById('tri-fecha');var f=tf?tf.value:'';var rh=document.getElementById('tri-riesgo-hora');var h=rh?rh.value:'09:00 AM';fetch('/admin/riesgo-triple?hora='+encodeURIComponent(h)+(f?('&fecha='+f):'')).then(function(r){return r.json();}).then(function(d){if(d.error){document.getElementById('tri-riesgo').innerHTML='<div style="color:var(--red)">'+d.error+'</div>';return;}var p=d.pote;document.getElementById('tri-pote').innerHTML='<div class="stat-box"><div class="stat-label">VENDIDO MES</div><div class="stat-val">S/'+p.vendido_mes.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PRESUP. 67%</div><div class="stat-val t">S/'+p.presupuesto_67.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PAGADO MES</div><div class="stat-val r">S/'+p.pagado_mes.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">DISPONIBLE</div><div class="stat-val g">S/'+p.disponible.toFixed(2)+'</div></div>';var html='<div style="color:var(--text2);font-size:.68rem;letter-spacing:1px;margin:6px 0;font-family:Oswald,sans-serif">TRIPLE / TERMINAL — '+d.hora+'</div>';if(!d.triple_terminal.length)html+='<div style="color:var(--text2);padding:6px">Sin apuestas</div>';else{html+='<table class="tbl"><thead><tr><th>Tipo</th><th>N°</th><th>Apostado</th><th>Pagaría</th></tr></thead><tbody>';d.triple_terminal.forEach(function(x){html+='<tr><td>'+(x.tipo==='triple'?'Triple':'Terminal')+'</td><td style="color:var(--gold);font-family:Oswald,sans-serif">'+x.sel+'</td><td style="color:var(--teal)">S/'+x.apostado.toFixed(2)+'</td><td style="color:var(--red);font-family:Oswald,sans-serif">S/'+x.pagaria.toFixed(2)+'</td></tr>';});html+='</tbody></table>';}html+='<div style="color:var(--text2);font-size:.68rem;letter-spacing:1px;margin:10px 0 6px;font-family:Oswald,sans-serif">MÁS 1 — vie '+d.viernes+'</div>';if(!d.mas1.length)html+='<div style="color:var(--text2);padding:6px">Sin apuestas</div>';else{html+='<table class="tbl"><thead><tr><th>Dígito+Animal</th><th>Apostado</th><th>Pagaría</th></tr></thead><tbody>';d.mas1.forEach(function(x){var pa=x.sel.split('-');html+='<tr><td style="color:#c084fc;font-family:Oswald,sans-serif">'+x.sel+' ('+(ANIMALES[pa[1]]||'')+')</td><td style="color:var(--teal)">S/'+x.apostado.toFixed(2)+'</td><td style="color:var(--red);font-family:Oswald,sans-serif">S/'+x.pagaria_completo.toFixed(2)+'</td></tr>';});html+='</tbody></table>';}document.getElementById('tri-riesgo').innerHTML=html;}).catch(function(){});}
+function _origenesHtml(id,origenes){
+  if(!origenes||!origenes.length)return '';
+  var rows=origenes.map(function(o){return '<div style="display:flex;justify-content:space-between;padding:3px 8px;font-size:.68rem;border-bottom:1px solid var(--border)"><span style="color:var(--gold)">'+o.admin_nombre+'</span><span style="color:var(--text2)">'+o.agencia_nombre+'</span><span style="color:var(--teal)">S/'+o.monto.toFixed(2)+'</span></div>';}).join('');
+  return '<tr id="'+id+'" style="display:none"><td colspan="5" style="padding:0;background:var(--card)">'+rows+'</td></tr>';
+}
+function toggleOrigen(id){var el=document.getElementById(id);if(el)el.style.display=(el.style.display==='none'?'table-row':'none');}
+function cargarTripleRiesgo(){var tf=document.getElementById('tri-fecha');var f=tf?tf.value:'';var rh=document.getElementById('tri-riesgo-hora');var h=rh?rh.value:'09:00 AM';fetch('/admin/riesgo-triple?hora='+encodeURIComponent(h)+(f?('&fecha='+f):'')).then(function(r){return r.json();}).then(function(d){if(d.error){document.getElementById('tri-riesgo').innerHTML='<div style="color:var(--red)">'+d.error+'</div>';return;}var p=d.pote;document.getElementById('tri-pote').innerHTML='<div class="stat-box"><div class="stat-label">VENDIDO MES</div><div class="stat-val">S/'+p.vendido_mes.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PRESUP. 67%</div><div class="stat-val t">S/'+p.presupuesto_67.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">PAGADO MES</div><div class="stat-val r">S/'+p.pagado_mes.toFixed(2)+'</div></div><div class="stat-box"><div class="stat-label">DISPONIBLE</div><div class="stat-val g">S/'+p.disponible.toFixed(2)+'</div></div>';
+  var html='<div style="color:var(--text2);font-size:.68rem;letter-spacing:1px;margin:6px 0;font-family:Oswald,sans-serif">TRIPLE / TERMINAL — '+d.hora+' <span style="color:#6090c0">(Pago directo = solo esta selección · Responsabilidad total = si ESE número sale ganador, incluyendo vecinos ±1 y terminal)</span></div>';
+  if(!d.triple_terminal.length)html+='<div style="color:var(--text2);padding:6px">Sin apuestas</div>';
+  else{html+='<table class="tbl"><thead><tr><th>Tipo</th><th>N°</th><th>Apostado</th><th>Pago directo</th><th>Responsab. total</th></tr></thead><tbody>';
+    d.triple_terminal.forEach(function(x,i){var rid='trorig-'+i;var hasOrig=x.origenes&&x.origenes.length;
+      html+='<tr'+(hasOrig?' style="cursor:pointer" onclick="toggleOrigen(\''+rid+'\')"':'')+'><td>'+(x.tipo==='triple'?'Triple':'Terminal')+(hasOrig?' <span style="color:#6090c0;font-size:.62rem">▾ origen</span>':'')+'</td><td style="color:var(--gold);font-family:Oswald,sans-serif">'+x.sel+'</td><td style="color:var(--teal)">S/'+x.apostado.toFixed(2)+'</td><td style="color:var(--text2)">S/'+x.pagaria.toFixed(2)+'</td><td style="color:var(--red);font-family:Oswald,sans-serif;font-weight:700">S/'+x.responsabilidad_total.toFixed(2)+'</td></tr>';
+      html+=_origenesHtml(rid,x.origenes);
+    });
+    html+='</tbody></table>';
+  }
+  html+='<div style="color:var(--text2);font-size:.68rem;letter-spacing:1px;margin:10px 0 6px;font-family:Oswald,sans-serif">MÁS 1 — vie '+d.viernes+' <span style="color:#6090c0">(Responsab. total incluye mismo animal con otro dígito ×35)</span></div>';
+  if(!d.mas1.length)html+='<div style="color:var(--text2);padding:6px">Sin apuestas</div>';
+  else{html+='<table class="tbl"><thead><tr><th>Dígito+Animal</th><th>Apostado</th><th>Pago directo</th><th>Responsab. total</th></tr></thead><tbody>';
+    d.mas1.forEach(function(x,i){var pa=x.sel.split('-');var rid='m1orig-'+i;var hasOrig=x.origenes&&x.origenes.length;
+      html+='<tr'+(hasOrig?' style="cursor:pointer" onclick="toggleOrigen(\''+rid+'\')"':'')+'><td style="color:#c084fc;font-family:Oswald,sans-serif">'+x.sel+' ('+(ANIMALES[pa[1]]||'')+')'+(hasOrig?' <span style="color:#6090c0;font-size:.62rem">▾ origen</span>':'')+'</td><td style="color:var(--teal)">S/'+x.apostado.toFixed(2)+'</td><td style="color:var(--text2)">S/'+x.pagaria_completo.toFixed(2)+'</td><td style="color:var(--red);font-family:Oswald,sans-serif;font-weight:700">S/'+x.responsabilidad_total.toFixed(2)+'</td></tr>';
+      html+=_origenesHtml(rid,x.origenes);
+    });
+    html+='</tbody></table>';
+  }
+  document.getElementById('tri-riesgo').innerHTML=html;}).catch(function(){});}
+
 function init(){
   let hoy=new Date().toISOString().split('T')[0];
   document.getElementById('res-fecha').value=hoy;
